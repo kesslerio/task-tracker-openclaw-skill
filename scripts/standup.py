@@ -5,11 +5,91 @@ Daily Standup Generator - Creates a concise summary of today's priorities.
 
 import argparse
 import json
+import os
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
 from utils import load_tasks, check_due_date
+
+
+def get_calendar_events() -> dict:
+    """Fetch today's calendar events via gog CLI.
+    
+    Returns:
+        dict with calendar_id keys, each containing list of events
+        
+    Configuration (optional):
+    Set STANDUP_CALENDARS environment variable with JSON:
+    {
+        "work": {"cmd": "gog-work", "calendar_id": "user@work.com", "account": "user@work.com", "label": "Work"},
+        "personal": {"cmd": "gog", "calendar_id": "user@personal.com", "account": "user@personal.com", "label": null},
+        "family": {"cmd": "gog", "calendar_id": "family_calendar_id", "account": "user@personal.com", "label": "Family"}
+    }
+    
+    If not set, returns empty dict (no calendar integration).
+    """
+    config_str = os.getenv('STANDUP_CALENDARS')
+    if not config_str:
+        return {}
+    
+    try:
+        calendars_config = json.loads(config_str)
+    except json.JSONDecodeError:
+        return {}
+    
+    events = {}
+    
+    for key, config in calendars_config.items():
+        events[key] = []
+        cmd = config.get('cmd', 'gog')
+        calendar_id = config.get('calendar_id')
+        account = config.get('account')
+        label = config.get('label')
+        
+        if not calendar_id or not account:
+            continue
+        
+        try:
+            result = subprocess.run(
+                [cmd, 'calendar', 'list', calendar_id,
+                 '--account', account, '--today', '--json'],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                for event in data.get('events', []):
+                    # Skip birthdays and all-day events without times
+                    if event.get('eventType') == 'birthday':
+                        continue
+                    if 'dateTime' not in event.get('start', {}):
+                        continue
+                    
+                    summary = event.get('summary', 'Untitled')
+                    if label:
+                        summary = f"{summary} ({label})"
+                    
+                    events[key].append({
+                        'summary': summary,
+                        'start': event['start'].get('dateTime'),
+                        'end': event['end'].get('dateTime'),
+                    })
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError):
+            pass
+    
+    return events
+
+
+def format_time(iso_time: str) -> str:
+    """Format ISO datetime to human-readable time (e.g., '2:30 PM')."""
+    try:
+        dt = datetime.fromisoformat(iso_time.replace('Z', '+00:00'))
+        return dt.strftime('%I:%M %p').lstrip('0')
+    except:
+        return iso_time
 
 
 def generate_standup(date_str: str = None, json_output: bool = False) -> str | dict:
@@ -39,6 +119,7 @@ def generate_standup(date_str: str = None, json_output: bool = False) -> str | d
     output = {
         'date': str(standup_date),
         'date_display': date_display,
+        'calendar': get_calendar_events(),
         'priority': None,
         'due_today': [],
         'blocking': [],
@@ -75,6 +156,20 @@ def generate_standup(date_str: str = None, json_output: bool = False) -> str | d
     # Format as markdown
     lines = [f"📋 **Daily Standup — {date_display}**\n"]
     
+    # Calendar events
+    cal = output['calendar']
+    if cal:
+        all_events = []
+        for key in sorted(cal.keys()):
+            all_events.extend(cal[key])
+        
+        if all_events:
+            lines.append("📅 **Today's Calendar:**")
+            for event in all_events:
+                time_str = format_time(event['start'])
+                lines.append(f"  • {time_str} — {event['summary']}")
+            lines.append("")
+    
     if output['priority']:
         priority = output['priority']
         lines.append(f"🎯 **#1 Priority:** {priority['title']}")
@@ -84,31 +179,31 @@ def generate_standup(date_str: str = None, json_output: bool = False) -> str | d
     
     if output['due_today']:
         lines.append("⏰ **Due Today:**")
-        for t in output['due_today'][:5]:
+        for t in output['due_today']:
             lines.append(f"  • {t['title']}")
         lines.append("")
     
     if output['blocking']:
         lines.append("🚧 **Blocking Others:**")
-        for t in output['blocking'][:3]:
+        for t in output['blocking']:
             lines.append(f"  • {t['title']} → {t.get('blocks', '?')}")
         lines.append("")
     
     if output['high_priority']:
         lines.append("🔴 **High Priority:**")
-        for t in output['high_priority'][:3]:
+        for t in output['high_priority']:
             lines.append(f"  • {t['title']}")
         lines.append("")
     
     if output['completed']:
-        lines.append(f"✅ **Recently Completed:** {len(output['completed'])} items")
-        for t in output['completed'][:3]:
+        lines.append(f"✅ **Recently Completed:** ({len(output['completed'])} items)")
+        for t in output['completed']:
             lines.append(f"  • {t['title']}")
         lines.append("")
     
     if output['upcoming']:
         lines.append("📅 **Upcoming:**")
-        for t in output['upcoming'][:3]:
+        for t in output['upcoming']:
             due_str = f" ({t['due']})" if t.get('due') else ""
             lines.append(f"  • {t['title']}{due_str}")
     
