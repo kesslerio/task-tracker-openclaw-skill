@@ -216,6 +216,7 @@ Apache 2.0 - See [LICENSE](LICENSE) file for details.
 
 ## Related Skills
 
-- **finance-news:** Market briefings and portfolio tracking
-- **oura-analytics:** Sleep and health tracking
-- **session-logs:** Search conversation history
+- **[finance-news](https://github.com/kesslerio/clawdbot-finance-news-skill):** Market briefings and portfolio tracking
+- **[oura-analytics](https://github.com/kesslerio/clawdbot-oura-skill):** Sleep and health tracking
+- **[session-logs](https://github.com/kesslerio/clawdbot-session-logs-skill):** Search conversation history
+- **[task-tracker](https://github.com/kesslerio/task-tracker-clawdbot-skill):** This skill
