@@ -92,7 +92,120 @@ def format_time(iso_time: str) -> str:
         return iso_time
 
 
-def generate_standup(date_str: str = None, json_output: bool = False) -> str | dict:
+def group_by_category(tasks):
+    """Group tasks by category."""
+    categories = {}
+    for t in tasks:
+        cat = t.get('category', 'Uncategorized')
+        if cat not in categories:
+            categories[cat] = []
+        categories[cat].append(t)
+    return categories
+
+
+def format_split_standup(output: dict, date_display: str) -> list:
+    """Format standup as 3 separate messages.
+    
+    Returns list of 3 strings:
+    1. Completed items (by category)
+    2. Calendar events
+    3. Active todos (by priority + category)
+    """
+    messages = []
+    
+    # Message 1: Completed items
+    msg1_lines = [f"✅ **Completed — {date_display}**\n"]
+    if output['completed']:
+        by_cat = group_by_category(output['completed'])
+        for cat in sorted(by_cat.keys()):
+            msg1_lines.append(f"**{cat}:**")
+            for t in by_cat[cat]:
+                msg1_lines.append(f"  • {t['title']}")
+            msg1_lines.append("")
+    else:
+        msg1_lines.append("_No completed items_")
+    messages.append('\n'.join(msg1_lines).strip())
+    
+    # Message 2: Calendar events
+    msg2_lines = [f"📅 **Calendar — {date_display}**\n"]
+    cal = output['calendar']
+    if cal:
+        all_events = []
+        for key in sorted(cal.keys()):
+            all_events.extend(cal[key])
+        
+        if all_events:
+            for event in all_events:
+                time_str = format_time(event['start'])
+                msg2_lines.append(f"• {time_str} — {event['summary']}")
+        else:
+            msg2_lines.append("_No calendar events today_")
+    else:
+        msg2_lines.append("_No calendar events today_")
+    messages.append('\n'.join(msg2_lines).strip())
+    
+    # Message 3: Active todos
+    msg3_lines = [f"📋 **Todos — {date_display}**\n"]
+    
+    # #1 Priority
+    if output['priority']:
+        priority = output['priority']
+        msg3_lines.append(f"🎯 **#1 Priority:** {priority['title']}")
+        if priority.get('blocks'):
+            msg3_lines.append(f"   ↳ Blocking: {priority['blocks']}")
+        msg3_lines.append("")
+    
+    # Due today
+    if output['due_today']:
+        msg3_lines.append("⏰ **Due Today:**")
+        for t in output['due_today']:
+            msg3_lines.append(f"  • {t['title']}")
+        msg3_lines.append("")
+    
+    # High priority by category
+    if output['high_priority']:
+        msg3_lines.append("🔴 **High Priority:**")
+        by_cat = group_by_category(output['high_priority'])
+        for cat in sorted(by_cat.keys()):
+            msg3_lines.append(f"  **{cat}:**")
+            for t in by_cat[cat]:
+                msg3_lines.append(f"    • {t['title']}")
+        msg3_lines.append("")
+    
+    # Medium priority by category
+    if output.get('medium_priority'):
+        msg3_lines.append("🟡 **Medium Priority:**")
+        by_cat = group_by_category(output['medium_priority'])
+        for cat in sorted(by_cat.keys()):
+            msg3_lines.append(f"  **{cat}:**")
+            for t in by_cat[cat]:
+                msg3_lines.append(f"    • {t['title']}")
+        msg3_lines.append("")
+    
+    # Delegated by category
+    delegated = output.get('delegated', [])
+    if delegated:
+        msg3_lines.append("🟢 **Delegated / Waiting:**")
+        by_cat = group_by_category(delegated)
+        for cat in sorted(by_cat.keys()):
+            msg3_lines.append(f"  **{cat}:**")
+            for t in by_cat[cat]:
+                msg3_lines.append(f"    • {t['title']}")
+        msg3_lines.append("")
+    
+    # Upcoming
+    if output['upcoming']:
+        msg3_lines.append("📅 **Upcoming:**")
+        for t in output['upcoming']:
+            due_str = f" ({t['due']})" if t.get('due') else ""
+            msg3_lines.append(f"  • {t['title']}{due_str}")
+    
+    messages.append('\n'.join(msg3_lines).strip())
+    
+    return messages
+
+
+def generate_standup(date_str: str = None, json_output: bool = False, split_output: bool = False) -> str | dict | list:
     """Generate daily standup summary.
     
     Args:
@@ -163,7 +276,10 @@ def generate_standup(date_str: str = None, json_output: bool = False) -> str | d
     if json_output:
         return output
     
-    # Format as markdown
+    if split_output:
+        return format_split_standup(output, date_display)
+    
+    # Format as markdown (single message)
     lines = [f"📋 **Daily Standup — {date_display}**\n"]
     
     # Calendar events
@@ -204,17 +320,6 @@ def generate_standup(date_str: str = None, json_output: bool = False) -> str | d
         for t in output['high_priority']:
             lines.append(f"  • {t['title']}")
         lines.append("")
-    
-    # Group and display tasks by category
-    def group_by_category(tasks):
-        """Group tasks by category, return dict."""
-        categories = {}
-        for t in tasks:
-            cat = t.get('category', 'Uncategorized')
-            if cat not in categories:
-                categories[cat] = []
-            categories[cat].append(t)
-        return categories
     
     # High priority by category
     if output['high_priority']:
@@ -269,13 +374,20 @@ def main():
     parser = argparse.ArgumentParser(description='Generate daily standup summary')
     parser.add_argument('--date', help='Date for standup (YYYY-MM-DD)')
     parser.add_argument('--json', action='store_true', help='Output as JSON')
+    parser.add_argument('--split', action='store_true', help='Split into 3 messages (completed/calendar/todos)')
     
     args = parser.parse_args()
     
-    result = generate_standup(date_str=args.date, json_output=args.json)
+    result = generate_standup(date_str=args.date, json_output=args.json, split_output=args.split)
     
     if args.json:
         print(json.dumps(result, indent=2))
+    elif args.split:
+        # Print 3 messages separated by double newlines
+        for i, msg in enumerate(result, 1):
+            print(msg)
+            if i < len(result):
+                print("\n---\n")
     else:
         print(result)
 
