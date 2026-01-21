@@ -112,3 +112,14 @@ See [references/task-format.md](references/task-format.md) for full specificatio
 - **Telegram Journaling group:** Standup/review summaries
 - **Obsidian daily notes:** Logged via `journal-entry.sh`
 - **MEMORY.md:** Patterns promoted from weekly reviews
+
+## Telegram Integration
+
+This skill supports custom slash commands for Telegram. See [TELEGRAM.md](TELEGRAM.md) for setup instructions.
+
+**Quick setup:**
+1. Add `customCommands` to `channels.telegram` in clawdbot.json
+2. Update AGENTS.md with command recognition patterns
+3. Restart gateway
+
+**Available commands:** `/daily`, `/weekly`, `/done24h`, `/done7d`
