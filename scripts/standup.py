@@ -106,7 +106,9 @@ def parse_tasks(content: str) -> dict:
 def generate_standup(date_str: str = None) -> str:
     """Generate daily standup summary."""
     if not TASKS_FILE.exists():
-        return f"❌ Tasks file not found: {TASKS_FILE}"
+        return (f"❌ Tasks file not found: {TASKS_FILE}\n\n"
+                f"To create a new tasks file, run:\n"
+                f"  python3 {Path(__file__).parent / 'init.py'}\n")
     
     content = TASKS_FILE.read_text()
     tasks = parse_tasks(content)

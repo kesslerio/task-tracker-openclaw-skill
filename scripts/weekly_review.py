@@ -129,7 +129,9 @@ def archive_done_tasks(content: str, done_tasks: list) -> str:
 def generate_weekly_review(archive: bool = False) -> str:
     """Generate weekly review summary."""
     if not TASKS_FILE.exists():
-        return f"❌ Tasks file not found: {TASKS_FILE}"
+        return (f"❌ Tasks file not found: {TASKS_FILE}\n\n"
+                f"To create a new tasks file, run:\n"
+                f"  python3 {Path(__file__).parent / 'init.py'}\n")
     
     content = TASKS_FILE.read_text()
     tasks = parse_tasks(content)
