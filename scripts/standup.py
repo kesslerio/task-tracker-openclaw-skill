@@ -75,13 +75,15 @@ def parse_tasks(content: str) -> dict:
                     if current_task not in result['due_today']:
                         result['due_today'].append(current_task)
                 else:
-                    # Try to parse date
-                    for fmt in ['%Y-%m-%d', 'Before %B %d', 'Before %b %d']:
+                    # Try to parse date - strip "Before" prefix first
+                    date_str = due_str
+                    if due_str.lower().startswith('before '):
+                        date_str = due_str[7:].strip()  # Remove "Before " prefix
+                    
+                    # Try various formats (full and abbreviated month names)
+                    for fmt in ['%Y-%m-%d', '%B %d', '%b %d']:
                         try:
-                            if fmt.startswith('Before'):
-                                due_date = datetime.strptime(due_str, fmt).date()
-                            else:
-                                due_date = datetime.strptime(due_str.split()[0], '%Y-%m-%d').date()
+                            due_date = datetime.strptime(date_str, fmt).date()
                             if due_date.year == 1900:
                                 due_date = due_date.replace(year=today.year)
                             

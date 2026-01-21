@@ -109,7 +109,10 @@ def list_tasks(args):
         filtered = [t for t in filtered if target_section.lower() in (t.get('section') or '').lower()]
     
     if args.status:
-        filtered = [t for t in filtered if t.get('status', '').lower() == args.status.lower()]
+        # Normalize status: replace hyphens with spaces for comparison
+        # Handle both "in-progress" (CLI) and "In Progress" (stored)
+        normalized_status = args.status.lower().replace('-', ' ')
+        filtered = [t for t in filtered if t.get('status', '').lower().replace('-', ' ') == normalized_status]
     
     if args.due:
         today = datetime.now().date()
@@ -120,10 +123,15 @@ def list_tasks(args):
             if not due or due.lower() in ['asap', 'immediately']:
                 return args.due == 'today'  # ASAP counts as today
             
-            # Try to parse date
+            # Strip "Before" prefix if present
+            date_str = due
+            if due.lower().startswith('before '):
+                date_str = due[7:].strip()  # Remove "Before " prefix
+            
+            # Try to parse date with various formats
             for fmt in ['%Y-%m-%d', '%B %d', '%b %d']:
                 try:
-                    due_date = datetime.strptime(due.split()[0], fmt).date()
+                    due_date = datetime.strptime(date_str, fmt).date()
                     if due_date.year == 1900:
                         due_date = due_date.replace(year=today.year)
                     
@@ -135,6 +143,8 @@ def list_tasks(args):
                         return due_date < today
                 except ValueError:
                     continue
+            
+            # If we get here, it's a non-date like "Before IMCAS" - treat as future
             return False
         
         filtered = [t for t in filtered if check_due(t)]
