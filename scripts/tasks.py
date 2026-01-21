@@ -84,7 +84,11 @@ def parse_tasks(content: str) -> list[dict]:
 def load_tasks() -> tuple[str, list[dict]]:
     """Load and parse tasks from file."""
     if not TASKS_FILE.exists():
-        print(f"Tasks file not found: {TASKS_FILE}", file=sys.stderr)
+        print(f"\n❌ Tasks file not found: {TASKS_FILE}\n", file=sys.stderr)
+        print("To create a new tasks file, run:")
+        print(f"  cp {Path(__file__).parent.parent / 'assets' / 'templates' / 'TASKS.md'} {TASKS_FILE}")
+        print(f"\nOr create from template:")
+        print(f"  python3 scripts/init.py\n")
         sys.exit(1)
     
     content = TASKS_FILE.read_text()
