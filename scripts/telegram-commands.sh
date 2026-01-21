@@ -9,7 +9,14 @@ case "$1" in
     python3 "$SCRIPT_DIR/standup.py"
     ;;
   weekly)
-    python3 "$SCRIPT_DIR/tasks.py" list --priority high,medium
+    # Show high priority tasks, then medium priority tasks
+    echo "📋 Weekly Priorities"
+    echo ""
+    echo "### High Priority"
+    python3 "$SCRIPT_DIR/tasks.py" list --priority high --status todo
+    echo ""
+    echo "### Medium Priority"
+    python3 "$SCRIPT_DIR/tasks.py" list --priority medium --status todo
     ;;
   done24h)
     # Show completed tasks from last 24 hours
