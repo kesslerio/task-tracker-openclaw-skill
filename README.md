@@ -216,7 +216,7 @@ Apache 2.0 - See [LICENSE](LICENSE) file for details.
 
 ## Related Skills
 
-- **[finance-news](https://github.com/kesslerio/clawdbot-finance-news-skill):** Market briefings and portfolio tracking
+- **[finance-news](https://github.com/kesslerio/finance-news-clawdbot-skill):** AI-powered market briefings with multi-source aggregation (WSJ, Barron's, CNBC), portfolio tracking, and automated WhatsApp delivery in German/English
 - **[oura-analytics](https://github.com/kesslerio/clawdbot-oura-skill):** Sleep and health tracking
 - **[session-logs](https://github.com/kesslerio/clawdbot-session-logs-skill):** Search conversation history
 - **[task-tracker](https://github.com/kesslerio/task-tracker-clawdbot-skill):** This skill
