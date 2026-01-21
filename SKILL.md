@@ -1,6 +1,24 @@
 ---
 name: task-tracker
 description: "Personal task management with daily standups and weekly reviews. Use when: (1) User says 'daily standup' or asks what's on their plate, (2) User says 'weekly review' or asks about last week's progress, (3) User wants to add/update/complete tasks, (4) User asks about blockers or deadlines, (5) User shares meeting notes and wants tasks extracted, (6) User asks 'what's due this week' or similar."
+homepage: https://github.com/kesslerio/task-tracker-clawdbot-skill
+metadata: {"clawdbot":{"emoji":"📋","requires":{"files":["~/clawd/memory/work/TASKS.md"]},"install":[{"id":"init","kind":"script","script":"python3 scripts/init.py","label":"Initialize TASKS.md from template"}]}}
+---
+
+<div align="center">
+
+![Task Tracker](https://img.shields.io/badge/Task_Tracker-Clawdbot_skill-blue?style=for-the-badge&logo=checklist)
+![Python](https://img.shields.io/badge/Python-3.10+-yellow?style=flat-square&logo=python)
+![Status](https://img.shields.io/badge/Status-Production-green?style=flat-square)
+![Issues](https://img.shields.io/badge/Issues-0-black?style=flat-square)
+![Last Updated](https://img.shields.io/badge/Last_Updated-Jan_2026-orange?style=flat-square)
+
+**Personal task management with daily standups and weekly reviews**
+
+[Homepage](https://github.com/kesslerio/task-tracker-clawdbot-skill) • [Trigger Patterns](#what-this-skill-does) • [Commands](#commands-reference)
+
+</div>
+
 ---
 
 # Task Tracker
