@@ -13,11 +13,11 @@ case "$1" in
     ;;
   done24h)
     # Show completed tasks from last 24 hours
-    python3 "$SCRIPT_DIR/tasks.py" list --status done | grep -A 10 "$(date -d '1 day ago' '+%Y-%m-%d')" || echo "No tasks completed in last 24 hours"
+    python3 "$SCRIPT_DIR/tasks.py" list --status done --completed-since 24h
     ;;
   done7d)
     # Show completed tasks from last 7 days
-    python3 "$SCRIPT_DIR/tasks.py" list --status done | grep -A 50 "$(date -d '7 days ago' '+%Y-%m-%d')" || echo "No tasks completed in last 7 days"
+    python3 "$SCRIPT_DIR/tasks.py" list --status done --completed-since 7d
     ;;
   *)
     echo "Usage: $0 {daily|weekly|done24h|done7d}"

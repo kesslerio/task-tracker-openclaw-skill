@@ -53,6 +53,7 @@ def parse_tasks(content: str) -> list[dict]:
                 'owner': 'martin',
                 'due': None,
                 'status': 'Done' if done else 'Todo',
+                'completed': None,
                 'blocks': None,
                 'url': None,
                 'raw_lines': [line],
@@ -70,6 +71,8 @@ def parse_tasks(content: str) -> list[dict]:
                 current_task['due'] = meta_line.split(':', 1)[1].strip()
             elif meta_line.lower().startswith('status:'):
                 current_task['status'] = meta_line.split(':', 1)[1].strip()
+            elif meta_line.lower().startswith('completed:'):
+                current_task['completed'] = meta_line.split(':', 1)[1].strip()
             elif meta_line.lower().startswith('blocks:'):
                 current_task['blocks'] = meta_line.split(':', 1)[1].strip()
             elif meta_line.lower().startswith('location:'):
@@ -152,6 +155,39 @@ def list_tasks(args):
             return False
         
         filtered = [t for t in filtered if check_due(t)]
+    
+    if args.completed_since:
+        # Filter by completion date
+        cutoff_date = None
+        now = datetime.now().date()
+        
+        if args.completed_since == '24h':
+            cutoff_date = now - timedelta(days=1)
+        elif args.completed_since == '7d':
+            cutoff_date = now - timedelta(days=7)
+        elif args.completed_since == '30d':
+            cutoff_date = now - timedelta(days=30)
+        else:
+            try:
+                cutoff_date = datetime.strptime(args.completed_since, '%Y-%m-%d').date()
+            except ValueError:
+                print(f"❌ Invalid date format: {args.completed_since}", file=sys.stderr)
+                sys.exit(1)
+        
+        def has_recent_completion(task):
+            completed = task.get('completed')
+            if not completed:
+                return False
+            try:
+                completed_date = datetime.strptime(completed, '%Y-%m-%d').date()
+                return completed_date >= cutoff_date
+            except ValueError:
+                return False
+        
+        filtered = [t for t in filtered if has_recent_completion(t)]
+    
+    if args.owner:
+        filtered = [t for t in filtered if t.get('owner') == args.owner.lower()]
     
     # Output
     if not filtered:
@@ -243,6 +279,21 @@ def done_task(args):
     
     new_content = content.replace(old_line, new_line)
     
+    # Add completion date if not already present
+    completion_date = datetime.now().strftime('%Y-%m-%d')
+    has_completed = any('completed:' in line.lower() for line in task['raw_lines'])
+    
+    if not has_completed:
+        # Find the task in new_content and add completion date after the first metadata line
+        lines = new_content.split('\n')
+        task_index = next(i for i, line in enumerate(lines) if new_line in line)
+        
+        # Insert completion date after task title
+        indent = '  '
+        completion_line = f'{indent}- Completed: {completion_date}'
+        lines.insert(task_index + 1, completion_line)
+        new_content = '\n'.join(lines)
+    
     # Also update status if present
     for line in task['raw_lines']:
         if 'Status:' in line:
@@ -325,6 +376,8 @@ def main():
     list_parser.add_argument('--priority', choices=['high', 'medium', 'low'])
     list_parser.add_argument('--status', choices=['todo', 'in-progress', 'blocked', 'waiting', 'done'])
     list_parser.add_argument('--due', choices=['today', 'this-week', 'overdue'])
+    list_parser.add_argument('--completed-since', help='Filter done tasks by completion date (24h, 7d, 30d, or YYYY-MM-DD)')
+    list_parser.add_argument('--owner', help='Filter by task owner')
     list_parser.set_defaults(func=list_tasks)
     
     # Add command
