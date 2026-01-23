@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from utils import (
-    TASKS_FILE,
+    get_tasks_file,
     ARCHIVE_DIR,
     get_current_quarter,
     parse_tasks,
@@ -72,43 +72,46 @@ def generate_weekly_review(archive: bool = False) -> str:
             lines.append(f"  • ... and {done_count - 5} more")
     lines.append("")
     
-    # What got pushed (high priority items still open)
-    open_high = [t for t in tasks_data['high_priority'] if not t['done']]
-    if open_high:
-        lines.append(f"⏳ **Still Open (High Priority):** {len(open_high)} items")
-        for t in open_high[:5]:
+    # What got pushed (Q1 items still open)
+    open_q1 = [t for t in tasks_data.get('q1', []) if not t['done']]
+    if open_q1:
+        lines.append(f"⏳ **Still Open (Urgent):** {len(open_q1)} items")
+        for t in open_q1[:5]:
             due_str = f" (due: {t['due']})" if t.get('due') else ""
             lines.append(f"  • {t['title']}{due_str}")
         lines.append("")
     
-    # Blockers
-    blockers = [t for t in tasks_data['blocking'] if not t['done']]
-    if blockers:
-        lines.append(f"🚧 **Blocking Others:** {len(blockers)} items")
-        for t in blockers[:3]:
-            lines.append(f"  • {t['title']} → {t['blocks']}")
+    # Waiting/Blocked
+    waiting = [t for t in tasks_data.get('q3', []) if not t['done']]
+    if waiting:
+        lines.append(f"🟠 **Waiting/Blocked:** {len(waiting)} items")
+        for t in waiting[:3]:
+            blocks_str = f" → {t['blocks']}" if t.get('blocks') else ""
+            lines.append(f"  • {t['title']}{blocks_str}")
         lines.append("")
     
-    # This week's priorities
+    # This week's priorities (Q1 tasks)
     lines.append("🎯 **This Week's Priorities:**")
-    priorities = tasks_data['high_priority'][:5]
+    priorities = tasks_data.get('q1', [])[:5]
     for i, t in enumerate(priorities, 1):
         due_str = f" (due: {t['due']})" if t.get('due') else ""
         lines.append(f"  {i}. {t['title']}{due_str}")
     lines.append("")
     
-    # Upcoming deadlines
-    if tasks_data['upcoming']:
+    # Upcoming deadlines (Q2 tasks with due dates)
+    upcoming = [t for t in tasks_data.get('q2', []) if t.get('due')]
+    if upcoming:
         lines.append("📅 **Upcoming Deadlines:**")
-        for t in tasks_data['upcoming'][:5]:
+        for t in upcoming[:5]:
             due_str = f" — {t['due']}" if t.get('due') else ""
             lines.append(f"  • {t['title']}{due_str}")
     
     # Archive if requested
     if archive and tasks_data['done']:
-        content = TASKS_FILE.read_text()
+        tasks_file, format = get_tasks_file()
+        content = tasks_file.read_text()
         new_content = archive_done_tasks(content, tasks_data['done'])
-        TASKS_FILE.write_text(new_content)
+        tasks_file.write_text(new_content)
         lines.append(f"\n📦 Archived {done_count} completed tasks.")
     
     return '\n'.join(lines)

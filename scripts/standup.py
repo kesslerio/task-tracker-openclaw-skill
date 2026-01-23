@@ -228,50 +228,43 @@ def generate_standup(date_str: str = None, json_output: bool = False, split_outp
     
     date_display = standup_date.strftime("%A, %B %d")
     
-    # Build output
+    # Build output using new task structure (q1, q2, q3, team, backlog)
     output = {
         'date': str(standup_date),
         'date_display': date_display,
         'calendar': get_calendar_events(),
         'priority': None,
         'due_today': [],
-        'blocking': [],
-        'high_priority': [],
-        'medium_priority': [],
-        'delegated': [],
+        'q1': [],  # Urgent & Important
+        'q2': [],  # Important, Not Urgent
+        'q3': [],  # Waiting/Blocked
+        'team': [],  # Team tasks to monitor
         'completed': [],
-        'upcoming': [],
     }
     
-    # #1 Priority (blocking tasks first, then high priority, then medium priority)
-    if tasks_data['blocking']:
-        output['priority'] = tasks_data['blocking'][0]
-    elif tasks_data['high_priority']:
-        output['priority'] = tasks_data['high_priority'][0]
-    elif tasks_data.get('medium_priority'):
-        output['priority'] = tasks_data['medium_priority'][0]
+    # #1 Priority (Q1 first, then Q2)
+    if tasks_data.get('q1'):
+        output['priority'] = tasks_data['q1'][0]
+    elif tasks_data.get('q2'):
+        output['priority'] = tasks_data['q2'][0]
     
     # Due today
-    output['due_today'] = tasks_data['due_today']
+    output['due_today'] = tasks_data.get('due_today', [])
     
-    # Blocking others
-    output['blocking'] = tasks_data['blocking']
+    # Q1 - Urgent & Important
+    output['q1'] = tasks_data.get('q1', [])
     
-    # Other high priority
-    output['high_priority'] = [t for t in tasks_data['high_priority'] 
-                               if t not in tasks_data['blocking']]
+    # Q2 - Important, Not Urgent
+    output['q2'] = tasks_data.get('q2', [])
     
-    # Medium priority (if no high priority tasks)
-    output['medium_priority'] = tasks_data.get('medium_priority', [])
+    # Q3 - Waiting/Blocked
+    output['q3'] = tasks_data.get('q3', [])
     
-    # Delegated
-    output['delegated'] = tasks_data.get('delegated', [])
+    # Team tasks
+    output['team'] = tasks_data.get('team', [])
     
     # Completed
-    output['completed'] = tasks_data['done']
-    
-    # Upcoming
-    output['upcoming'] = tasks_data['upcoming']
+    output['completed'] = tasks_data.get('done', [])
     
     if json_output:
         return output
@@ -309,63 +302,49 @@ def generate_standup(date_str: str = None, json_output: bool = False, split_outp
             lines.append(f"  • {t['title']}")
         lines.append("")
     
-    if output['blocking']:
-        lines.append("🚧 **Blocking Others:**")
-        for t in output['blocking']:
-            lines.append(f"  • {t['title']} → {t.get('blocks', '?')}")
-        lines.append("")
-    
-    if output['high_priority']:
-        lines.append("🔴 **High Priority:**")
-        for t in output['high_priority']:
-            lines.append(f"  • {t['title']}")
-        lines.append("")
-    
-    # High priority by category
-    if output['high_priority']:
-        lines.append("🔴 **High Priority:**")
-        by_cat = group_by_category(output['high_priority'])
+    # Q1 - Urgent & Important
+    if output['q1']:
+        lines.append("🔴 **Urgent & Important (Q1):**")
+        by_cat = group_by_category(output['q1'])
         for cat in sorted(by_cat.keys()):
             lines.append(f"  **{cat}:**")
             for t in by_cat[cat]:
                 lines.append(f"    • {t['title']}")
         lines.append("")
     
-    # Medium priority by category (if no high priority)
-    if output.get('medium_priority'):
-        if not output['high_priority']:
-            lines.append("🟡 **Medium Priority:**")
-        else:
-            lines.append("🟡 **Medium Priority (Other):**")
-        by_cat = group_by_category(output['medium_priority'])
+    # Q2 - Important, Not Urgent
+    if output['q2']:
+        lines.append("🟡 **Important, Not Urgent (Q2):**")
+        by_cat = group_by_category(output['q2'])
         for cat in sorted(by_cat.keys()):
             lines.append(f"  **{cat}:**")
             for t in by_cat[cat]:
-                lines.append(f"    • {t['title']}")
+                due_str = f" (🗓️{t['due']})" if t.get('due') else ""
+                lines.append(f"    • {t['title']}{due_str}")
         lines.append("")
     
-    # Delegated by category
-    delegated = output.get('delegated', [])
-    if delegated:
-        lines.append("🟢 **Delegated / Waiting:**")
-        by_cat = group_by_category(delegated)
-        for cat in sorted(by_cat.keys()):
-            lines.append(f"  **{cat}:**")
-            for t in by_cat[cat]:
-                lines.append(f"    • {t['title']}")
+    # Q3 - Waiting/Blocked
+    if output['q3']:
+        lines.append("🟠 **Waiting/Blocked (Q3):**")
+        for t in output['q3']:
+            blocks_str = f" → {t['blocks']}" if t.get('blocks') else ""
+            lines.append(f"  • {t['title']}{blocks_str}")
+        lines.append("")
+    
+    # Team tasks
+    if output['team']:
+        lines.append("👥 **Team Tasks:**")
+        for t in output['team']:
+            owner_str = f" ({t['owner']})" if t.get('owner') else ""
+            lines.append(f"  • {t['title']}{owner_str}")
         lines.append("")
     
     if output['completed']:
         lines.append(f"✅ **Recently Completed:** ({len(output['completed'])} items)")
-        for t in output['completed']:
+        for t in output['completed'][:5]:  # Limit to 5
             lines.append(f"  • {t['title']}")
-        lines.append("")
-    
-    if output['upcoming']:
-        lines.append("📅 **Upcoming:**")
-        for t in output['upcoming']:
-            due_str = f" ({t['due']})" if t.get('due') else ""
-            lines.append(f"  • {t['title']}{due_str}")
+        if len(output['completed']) > 5:
+            lines.append(f"  • ... and {len(output['completed']) - 5} more")
     
     return '\n'.join(lines)
 
