@@ -92,15 +92,15 @@ def format_time(iso_time: str) -> str:
         return iso_time
 
 
-def group_by_category(tasks):
-    """Group tasks by category."""
-    categories = {}
+def group_by_area(tasks):
+    """Group tasks by area."""
+    areas = {}
     for t in tasks:
-        cat = t.get('category', 'Uncategorized')
-        if cat not in categories:
-            categories[cat] = []
-        categories[cat].append(t)
-    return categories
+        area = t.get('area', 'Uncategorized')
+        if area not in areas:
+            areas[area] = []
+        areas[area].append(t)
+    return areas
 
 
 def format_split_standup(output: dict, date_display: str) -> list:
@@ -116,10 +116,10 @@ def format_split_standup(output: dict, date_display: str) -> list:
     # Message 1: Completed items
     msg1_lines = [f"✅ **Completed — {date_display}**\n"]
     if output['completed']:
-        by_cat = group_by_category(output['completed'])
-        for cat in sorted(by_cat.keys()):
+        by_area = group_by_area(output['completed'])
+        for cat in sorted(by_area.keys()):
             msg1_lines.append(f"**{cat}:**")
-            for t in by_cat[cat]:
+            for t in by_area[cat]:
                 msg1_lines.append(f"  • {t['title']}")
             msg1_lines.append("")
     else:
@@ -162,43 +162,41 @@ def format_split_standup(output: dict, date_display: str) -> list:
             msg3_lines.append(f"  • {t['title']}")
         msg3_lines.append("")
     
-    # High priority by category
-    if output['high_priority']:
-        msg3_lines.append("🔴 **High Priority:**")
-        by_cat = group_by_category(output['high_priority'])
-        for cat in sorted(by_cat.keys()):
-            msg3_lines.append(f"  **{cat}:**")
-            for t in by_cat[cat]:
+    # Q1 - Urgent & Important
+    if output.get('q1'):
+        msg3_lines.append("🔴 **Urgent & Important (Q1):**")
+        by_area = group_by_area(output['q1'])
+        for area in sorted(by_area.keys()):
+            msg3_lines.append(f"  **{area}:**")
+            for t in by_area[area]:
                 msg3_lines.append(f"    • {t['title']}")
         msg3_lines.append("")
     
-    # Medium priority by category
-    if output.get('medium_priority'):
-        msg3_lines.append("🟡 **Medium Priority:**")
-        by_cat = group_by_category(output['medium_priority'])
-        for cat in sorted(by_cat.keys()):
-            msg3_lines.append(f"  **{cat}:**")
-            for t in by_cat[cat]:
-                msg3_lines.append(f"    • {t['title']}")
+    # Q2 - Important, Not Urgent
+    if output.get('q2'):
+        msg3_lines.append("🟡 **Important, Not Urgent (Q2):**")
+        by_area = group_by_area(output['q2'])
+        for area in sorted(by_area.keys()):
+            msg3_lines.append(f"  **{area}:**")
+            for t in by_area[area]:
+                due_str = f" (🗓️{t['due']})" if t.get('due') else ""
+                msg3_lines.append(f"    • {t['title']}{due_str}")
         msg3_lines.append("")
     
-    # Delegated by category
-    delegated = output.get('delegated', [])
-    if delegated:
-        msg3_lines.append("🟢 **Delegated / Waiting:**")
-        by_cat = group_by_category(delegated)
-        for cat in sorted(by_cat.keys()):
-            msg3_lines.append(f"  **{cat}:**")
-            for t in by_cat[cat]:
-                msg3_lines.append(f"    • {t['title']}")
+    # Q3 - Waiting/Blocked
+    if output.get('q3'):
+        msg3_lines.append("🟠 **Waiting/Blocked (Q3):**")
+        for t in output['q3']:
+            blocks_str = f" → {t['blocks']}" if t.get('blocks') else ""
+            msg3_lines.append(f"  • {t['title']}{blocks_str}")
         msg3_lines.append("")
     
-    # Upcoming
-    if output['upcoming']:
-        msg3_lines.append("📅 **Upcoming:**")
-        for t in output['upcoming']:
-            due_str = f" ({t['due']})" if t.get('due') else ""
-            msg3_lines.append(f"  • {t['title']}{due_str}")
+    # Team tasks
+    if output.get('team'):
+        msg3_lines.append("👥 **Team Tasks:**")
+        for t in output['team']:
+            owner_str = f" ({t['owner']})" if t.get('owner') else ""
+            msg3_lines.append(f"  • {t['title']}{owner_str}")
     
     messages.append('\n'.join(msg3_lines).strip())
     
@@ -305,20 +303,20 @@ def generate_standup(date_str: str = None, json_output: bool = False, split_outp
     # Q1 - Urgent & Important
     if output['q1']:
         lines.append("🔴 **Urgent & Important (Q1):**")
-        by_cat = group_by_category(output['q1'])
-        for cat in sorted(by_cat.keys()):
+        by_area = group_by_area(output['q1'])
+        for cat in sorted(by_area.keys()):
             lines.append(f"  **{cat}:**")
-            for t in by_cat[cat]:
+            for t in by_area[cat]:
                 lines.append(f"    • {t['title']}")
         lines.append("")
     
     # Q2 - Important, Not Urgent
     if output['q2']:
         lines.append("🟡 **Important, Not Urgent (Q2):**")
-        by_cat = group_by_category(output['q2'])
-        for cat in sorted(by_cat.keys()):
+        by_area = group_by_area(output['q2'])
+        for cat in sorted(by_area.keys()):
             lines.append(f"  **{cat}:**")
-            for t in by_cat[cat]:
+            for t in by_area[cat]:
                 due_str = f" (🗓️{t['due']})" if t.get('due') else ""
                 lines.append(f"    • {t['title']}{due_str}")
         lines.append("")
