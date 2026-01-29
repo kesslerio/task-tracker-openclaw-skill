@@ -1,13 +1,13 @@
 ---
 name: task-tracker
 description: "Personal task management with daily standups and weekly reviews. Supports both Work and Personal tasks from Obsidian. Use when: (1) User says 'daily standup' or asks what's on my plate, (2) User says 'weekly review' or asks about last week's progress, (3) User wants to add/update/complete tasks, (4) User asks about blockers or deadlines, (5) User shares meeting notes and wants tasks extracted, (6) User asks 'what's due this week' or similar."
-homepage: https://github.com/kesslerio/task-tracker-clawdbot-skill
-metadata: {"clawdbot":{"emoji":"📋","requires":{"env":["TASK_TRACKER_WORK_FILE","TASK_TRACKER_PERSONAL_FILE"]},"install":[{"id":"verify-paths","kind":"check","label":"Verify task file paths are configured"}]}}
+homepage: https://github.com/kesslerio/task-tracker-moltbot-skill
+metadata: {"moltbot":{"emoji":"📋","requires":{"env":["TASK_TRACKER_WORK_FILE","TASK_TRACKER_PERSONAL_FILE"]},"install":[{"id":"verify-paths","kind":"check","label":"Verify task file paths are configured"}]}}
 ---
 
 <div align="center">
 
-![Task Tracker](https://img.shields.io/badge/Task_Tracker-Clawdbot_skill-blue?style=for-the-badge&logo=checklist)
+![Task Tracker](https://img.shields.io/badge/Task_Tracker-Moltbot_skill-blue?style=for-the-badge&logo=checklist)
 ![Python](https://img.shields.io/badge/Python-3.10+-yellow?style=flat-square&logo=python)
 ![Status](https://img.shields.io/badge/Status-Production-green?style=flat-square)
 ![Issues](https://img.shields.io/badge/Issues-0-black?style=flat-square)
@@ -15,7 +15,7 @@ metadata: {"clawdbot":{"emoji":"📋","requires":{"env":["TASK_TRACKER_WORK_FILE
 
 **Personal task management with daily standups and weekly reviews**
 
-[Homepage](https://github.com/kesslerio/task-tracker-clawdbot-skill) • [Trigger Patterns](#what-this-skill-does) • [Commands](#commands-reference)
+[Homepage](https://github.com/kesslerio/task-tracker-moltbot-skill) • [Trigger Patterns](#what-this-skill-does) • [Commands](#commands-reference)
 
 </div>
 
@@ -41,7 +41,7 @@ A personal task management skill for daily standups and weekly reviews. Tracks w
 
 ## Configuration
 
-Configure paths via environment variables in your shell profile or `.clawdbot/.env`:
+Configure paths via environment variables in your shell profile or `.moltbot/.env`:
 
 ```bash
 # Required: Point to your task files
@@ -277,9 +277,9 @@ Set up cron jobs for automated standups:
 | Daily Personal Standup | Daily 8:00 AM | `python3 scripts/personal_standup.py` |
 | Weekly Review | Mondays 9:00 AM | `python3 scripts/weekly_review.py` |
 
-Example Clawdbot cron:
+Example Moltbot cron:
 ```bash
-clawdbot cron add \
+moltbot cron add \
   --name "Daily Work Standup" \
   --cron "30 8 * * 1-5" \
   --tz "America/Los_Angeles" \
