@@ -21,7 +21,7 @@ ENV/
 *.swo
 
 # Clawdbot
-.clawdbot/
+.moltbot/
 memory/work/*.md
 !memory/work/TASKS.md
 !memory/work/ARCHIVE-*.md

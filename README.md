@@ -1,4 +1,4 @@
-# Task Tracker Skill for Clawdbot
+# Task Tracker Skill for Moltbot
 
 Personal task management with daily standups and weekly reviews.
 
@@ -34,9 +34,9 @@ python3 ~/clawd/skills/task-tracker/scripts/weekly_review.py
 
 ## Installation
 
-1. Clone to your Clawdbot skills directory:
+1. Clone to your Moltbot skills directory:
    ```bash
-   git clone https://github.com/kesslerio/task-tracker-clawdbot-skill.git \
+   git clone https://github.com/kesslerio/task-tracker-moltbot-skill.git \
        ~/clawd/skills/task-tracker
    ```
 
@@ -155,14 +155,14 @@ Set up automated standups and reviews:
 
 ```bash
 # Daily standup (8:30 AM PT, weekdays)
-clawdbot cron add \
+moltbot cron add \
   --name "Daily Standup" \
   --schedule "30 8 * * 1-5" \
   --timezone "America/Los_Angeles" \
   --command "python3 ~/clawd/skills/task-tracker/scripts/standup.py"
 
 # Weekly review (9:00 AM PT, Mondays)
-clawdbot cron add \
+moltbot cron add \
   --name "Weekly Review" \
   --schedule "0 9 * * 1" \
   --timezone "America/Los_Angeles" \
@@ -181,7 +181,7 @@ clawdbot cron add \
 ```
 task-tracker/
 ├── README.md              # This file
-├── SKILL.md               # Clawdbot skill documentation
+├── SKILL.md               # Moltbot skill documentation
 ├── TELEGRAM.md            # Telegram integration guide
 ├── scripts/
 │   ├── tasks.py           # Task CRUD operations
@@ -197,7 +197,7 @@ task-tracker/
     └── task-format.md     # Task format specification
 ```
 
-## Integration with Clawdbot
+## Integration with Moltbot
 
 The agent automatically:
 - Recognizes task-related questions ("What's my #1 priority?")
@@ -208,7 +208,7 @@ The agent automatically:
 ## Dependencies
 
 - Python 3.10+
-- Clawdbot (for cron/messaging integration)
+- Moltbot (for cron/messaging integration)
 
 ## License
 
@@ -216,7 +216,7 @@ Apache 2.0 - See [LICENSE](LICENSE) file for details.
 
 ## Related Skills
 
-- **[finance-news](https://github.com/kesslerio/finance-news-clawdbot-skill):** AI-powered market briefings with multi-source aggregation (WSJ, Barron's, CNBC), portfolio tracking, and automated WhatsApp delivery in German/English
-- **[oura-analytics](https://github.com/kesslerio/clawdbot-oura-skill):** Sleep and health tracking
-- **[session-logs](https://github.com/kesslerio/clawdbot-session-logs-skill):** Search conversation history
-- **[task-tracker](https://github.com/kesslerio/task-tracker-clawdbot-skill):** This skill
+- **[finance-news](https://github.com/kesslerio/finance-news-moltbot-skill):** AI-powered market briefings with multi-source aggregation (WSJ, Barron's, CNBC), portfolio tracking, and automated WhatsApp delivery in German/English
+- **[oura-analytics](https://github.com/kesslerio/moltbot-oura-skill):** Sleep and health tracking
+- **[session-logs](https://github.com/kesslerio/moltbot-session-logs-skill):** Search conversation history
+- **[task-tracker](https://github.com/kesslerio/task-tracker-moltbot-skill):** This skill

@@ -4,7 +4,7 @@ This skill supports Telegram slash commands for quick access to task management 
 
 ## Setup
 
-Add these custom commands to your Clawdbot config (`~/.clawdbot/clawdbot.json`):
+Add these custom commands to your Moltbot config (`~/.moltbot/moltbot.json`):
 
 ```json5
 {
@@ -77,10 +77,10 @@ The agent automatically recognizes these patterns and invokes the appropriate sc
 
 ## Restart Required
 
-After updating your config, restart Clawdbot:
+After updating your config, restart Moltbot:
 
 ```bash
-clawdbot daemon restart
+moltbot daemon restart
 # or via the gateway tool
 # gateway call restart --params '{"reason": "Added Telegram slash commands"}'
 ```
