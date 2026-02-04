@@ -11,7 +11,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from utils import load_tasks, check_due_date, get_missed_tasks
+from utils import load_tasks, check_due_date, get_missed_tasks, get_missed_tasks_bucketed
 
 
 def get_calendar_events() -> dict:
@@ -363,9 +363,9 @@ def main():
     args = parser.parse_args()
     
     _, tasks_data = load_tasks()
-    missed_tasks = []
+    missed_buckets = None
     if not args.skip_missed:
-        missed_tasks = get_missed_tasks(tasks_data, reference_date=args.date)
+        missed_buckets = get_missed_tasks_bucketed(tasks_data, reference_date=args.date)
 
     result = generate_standup(
         date_str=args.date,
@@ -375,18 +375,46 @@ def main():
     )
 
     missed_block = ""
-    if missed_tasks and not args.json:
-        missed_lines = ["🔴 **Missed (due yesterday):**"]
-        for task in missed_tasks:
-            title = task.get('title', '')
-            missed_lines.append(f"  • {title} — say \"done {title}\" to mark complete")
-        missed_lines.append("")
-        missed_block = "\n".join(missed_lines)
+    if missed_buckets and not args.json:
+        has_missed = any(missed_buckets.get(k) for k in ['yesterday', 'last7', 'last30', 'older'])
+        if has_missed:
+            missed_lines = ["🔴 **Missed Tasks:**"]
+            
+            # Yesterday
+            if missed_buckets.get('yesterday'):
+                missed_lines.append("\n  **Yesterday:**")
+                for task in missed_buckets['yesterday']:
+                    title = task.get('title', '')
+                    missed_lines.append(f"    • {title} — say \"done {title}\" to mark complete")
+            
+            # Last 7 days (excluding yesterday)
+            if missed_buckets.get('last7'):
+                missed_lines.append("\n  **Last 7 Days:**")
+                for task in missed_buckets['last7']:
+                    title = task.get('title', '')
+                    missed_lines.append(f"    • {title}")
+            
+            # Last 30 days
+            if missed_buckets.get('last30'):
+                missed_lines.append("\n  **Last 30 Days:**")
+                for task in missed_buckets['last30']:
+                    title = task.get('title', '')
+                    missed_lines.append(f"    • {title}")
+            
+            # Older than 30 days
+            if missed_buckets.get('older'):
+                missed_lines.append("\n  **Older than 30 Days:**")
+                for task in missed_buckets['older']:
+                    title = task.get('title', '')
+                    missed_lines.append(f"    • {title}")
+            
+            missed_lines.append("")
+            missed_block = "\n".join(missed_lines)
 
-        if args.split:
-            result = [f"{missed_block}{result[0]}"] + result[1:]
-        else:
-            result = f"{missed_block}{result}"
+            if args.split:
+                result = [f"{missed_block}{result[0]}"] + result[1:]
+            else:
+                result = f"{missed_block}{result}"
     
     if args.json:
         print(json.dumps(result, indent=2))
