@@ -303,6 +303,64 @@ def get_missed_tasks(tasks_data: dict, lookback_days: int = 1, reference_date: s
     return missed
 
 
+def get_missed_tasks_bucketed(tasks_data: dict, reference_date: str = None) -> dict:
+    """Return missed tasks bucketed by age: yesterday, last7, last30, older.
+    
+    Args:
+        tasks_data: Dict containing 'all' key with list of tasks
+        reference_date: Date string (YYYY-MM-DD) to use as "today". If None, uses actual today.
+    
+    Returns:
+        Dict with keys: yesterday, last7, last30, older (each contains list of tasks)
+    """
+    if reference_date:
+        try:
+            today = datetime.strptime(reference_date, '%Y-%m-%d').date()
+        except ValueError:
+            today = datetime.now().date()
+    else:
+        today = datetime.now().date()
+
+    yesterday = today - timedelta(days=1)
+    last_week = today - timedelta(days=7)
+    last_month = today - timedelta(days=30)
+
+    buckets = {
+        'yesterday': [],
+        'last7': [],
+        'last30': [],
+        'older': []
+    }
+
+    for task in tasks_data.get('all', []):
+        if task.get('done'):
+            continue
+        due_str = task.get('due')
+        if not due_str:
+            continue
+
+        try:
+            due_date = datetime.strptime(due_str, '%Y-%m-%d').date()
+        except ValueError:
+            continue
+
+        # Only include overdue tasks (due date < today)
+        if due_date >= today:
+            continue
+
+        # Bucket by age
+        if due_date == yesterday:
+            buckets['yesterday'].append(task)
+        elif due_date >= last_week:
+            buckets['last7'].append(task)
+        elif due_date >= last_month:
+            buckets['last30'].append(task)
+        else:
+            buckets['older'].append(task)
+
+    return buckets
+
+
 def get_section_display_name(section: str, personal: bool = False) -> str:
     """Get human-readable section name."""
     section_names = {
