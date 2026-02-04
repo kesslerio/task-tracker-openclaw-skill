@@ -365,7 +365,7 @@ def main():
     _, tasks_data = load_tasks()
     missed_tasks = []
     if not args.skip_missed:
-        missed_tasks = get_missed_tasks(tasks_data)
+        missed_tasks = get_missed_tasks(tasks_data, reference_date=args.date)
 
     result = generate_standup(
         date_str=args.date,
