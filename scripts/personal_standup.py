@@ -13,7 +13,7 @@ from pathlib import Path
 
 # Add parent directory to path for utils import
 sys.path.insert(0, str(Path(__file__).parent))
-from utils import load_tasks, check_due_date, get_section_display_name
+from utils import load_tasks, check_due_date, get_section_display_name, get_missed_tasks
 
 
 def get_calendar_events() -> dict:
@@ -142,9 +142,14 @@ def format_personal_standup(output: dict, date_display: str) -> str:
     return '\n'.join(lines)
 
 
-def generate_personal_standup(date_str: str = None, json_output: bool = False) -> str | dict:
+def generate_personal_standup(
+    date_str: str = None,
+    json_output: bool = False,
+    tasks_data: dict | None = None,
+) -> str | dict:
     """Generate personal daily standup summary."""
-    _, tasks_data = load_tasks(personal=True)
+    if tasks_data is None:
+        _, tasks_data = load_tasks(personal=True)
     
     today = datetime.now()
     if date_str:
@@ -186,10 +191,30 @@ def main():
     parser = argparse.ArgumentParser(description='Generate personal daily standup')
     parser.add_argument('--date', help='Date for standup (YYYY-MM-DD)')
     parser.add_argument('--json', action='store_true', help='Output as JSON')
+    parser.add_argument('--skip-missed', action='store_true', help='Skip missed tasks section')
     
     args = parser.parse_args()
     
-    result = generate_personal_standup(date_str=args.date, json_output=args.json)
+    _, tasks_data = load_tasks(personal=True)
+    missed_tasks = []
+    if not args.skip_missed:
+        missed_tasks = get_missed_tasks(tasks_data, reference_date=args.date)
+
+    result = generate_personal_standup(
+        date_str=args.date,
+        json_output=args.json,
+        tasks_data=tasks_data,
+    )
+
+    missed_block = ""
+    if missed_tasks and not args.json:
+        missed_lines = ["🔴 **Missed (due yesterday):**"]
+        for task in missed_tasks:
+            title = task.get('title', '')
+            missed_lines.append(f"  • {title} — say \"done {title}\" to mark complete")
+        missed_lines.append("")
+        missed_block = "\n".join(missed_lines)
+        result = f"{missed_block}{result}"
     
     if args.json:
         print(json.dumps(result, indent=2))

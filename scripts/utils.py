@@ -262,6 +262,47 @@ def check_due_date(due: str, check_type: str = 'today') -> bool:
     return False
 
 
+def get_missed_tasks(tasks_data: dict, lookback_days: int = 1, reference_date: str = None) -> list:
+    """Return tasks missed within the lookback window (excluding reference date).
+    
+    Args:
+        tasks_data: Dict containing 'all' key with list of tasks
+        lookback_days: Number of days to look back (default 1 = yesterday only)
+        reference_date: Date string (YYYY-MM-DD) to use as "today". If None, uses actual today.
+    """
+    if lookback_days < 1:
+        return []
+
+    if reference_date:
+        try:
+            today = datetime.strptime(reference_date, '%Y-%m-%d').date()
+        except ValueError:
+            today = datetime.now().date()
+    else:
+        today = datetime.now().date()
+    
+    start_date = today - timedelta(days=lookback_days)
+    end_date = today - timedelta(days=1)
+
+    missed = []
+    for task in tasks_data.get('all', []):
+        if task.get('done'):
+            continue
+        due_str = task.get('due')
+        if not due_str:
+            continue
+
+        try:
+            due_date = datetime.strptime(due_str, '%Y-%m-%d').date()
+        except ValueError:
+            continue
+
+        if start_date <= due_date <= end_date:
+            missed.append(task)
+
+    return missed
+
+
 def get_section_display_name(section: str, personal: bool = False) -> str:
     """Get human-readable section name."""
     section_names = {
