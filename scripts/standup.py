@@ -11,7 +11,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from utils import load_tasks, check_due_date
+from utils import load_tasks, check_due_date, get_missed_tasks
 
 
 def get_calendar_events() -> dict:
@@ -203,7 +203,12 @@ def format_split_standup(output: dict, date_display: str) -> list:
     return messages
 
 
-def generate_standup(date_str: str = None, json_output: bool = False, split_output: bool = False) -> str | dict | list:
+def generate_standup(
+    date_str: str = None,
+    json_output: bool = False,
+    split_output: bool = False,
+    tasks_data: dict | None = None,
+) -> str | dict | list:
     """Generate daily standup summary.
     
     Args:
@@ -213,7 +218,8 @@ def generate_standup(date_str: str = None, json_output: bool = False, split_outp
     Returns:
         String summary (default) or dict if json_output=True
     """
-    _, tasks_data = load_tasks()
+    if tasks_data is None:
+        _, tasks_data = load_tasks()
     
     today = datetime.now()
     if date_str:
@@ -352,10 +358,35 @@ def main():
     parser.add_argument('--date', help='Date for standup (YYYY-MM-DD)')
     parser.add_argument('--json', action='store_true', help='Output as JSON')
     parser.add_argument('--split', action='store_true', help='Split into 3 messages (completed/calendar/todos)')
+    parser.add_argument('--skip-missed', action='store_true', help='Skip missed tasks section')
     
     args = parser.parse_args()
     
-    result = generate_standup(date_str=args.date, json_output=args.json, split_output=args.split)
+    _, tasks_data = load_tasks()
+    missed_tasks = []
+    if not args.skip_missed:
+        missed_tasks = get_missed_tasks(tasks_data)
+
+    result = generate_standup(
+        date_str=args.date,
+        json_output=args.json,
+        split_output=args.split,
+        tasks_data=tasks_data,
+    )
+
+    missed_block = ""
+    if missed_tasks and not args.json:
+        missed_lines = ["🔴 **Missed (due yesterday):**"]
+        for task in missed_tasks:
+            title = task.get('title', '')
+            missed_lines.append(f"  • {title} — say \"done {title}\" to mark complete")
+        missed_lines.append("")
+        missed_block = "\n".join(missed_lines)
+
+        if args.split:
+            result = [f"{missed_block}{result[0]}"] + result[1:]
+        else:
+            result = f"{missed_block}{result}"
     
     if args.json:
         print(json.dumps(result, indent=2))
