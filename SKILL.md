@@ -44,8 +44,10 @@ A personal task management skill for daily standups and weekly reviews. Tracks w
 Configure paths via environment variables in your shell profile or `.openclaw/.env`:
 
 ```bash
-# Required: Point to your task files
+# Required: Work task file (no default fallback)
 export TASK_TRACKER_WORK_FILE="$HOME/Obsidian/03-Areas/Work/Work Tasks.md"
+
+# Optional: Personal task file (required only for --personal commands)
 export TASK_TRACKER_PERSONAL_FILE="$HOME/Obsidian/03-Areas/Personal/Personal Tasks.md"
 
 # Optional: Custom archive location
@@ -55,10 +57,7 @@ export TASK_TRACKER_ARCHIVE_DIR="$HOME/clawd/memory/work"
 export TASK_TRACKER_LEGACY_FILE="$HOME/clawd/memory/work/TASKS.md"
 ```
 
-**Default paths (if not configured):**
-- Work: `~/Obsidian/03-Areas/Work/Work Tasks.md`
-- Personal: `~/Obsidian/03-Areas/Personal/Personal Tasks.md`
-- Legacy: `~/clawd/memory/work/TASKS.md`
+`TASK_TRACKER_WORK_FILE` is required. This skill does not provide a default work file path.
 
 ---
 
@@ -189,6 +188,38 @@ python3 scripts/personal_standup.py
 ### Weekly Review
 ```bash
 python3 scripts/weekly_review.py
+```
+
+---
+
+## Agent Integration
+
+Use explicit paths with a `{baseDir}` variable when invoking scripts from agents.
+
+Example:
+```bash
+python3 {baseDir}/scripts/standup.py
+```
+
+Available direct script commands:
+```bash
+python3 {baseDir}/scripts/standup.py
+python3 {baseDir}/scripts/personal_standup.py
+python3 {baseDir}/scripts/weekly_review.py
+python3 {baseDir}/scripts/tasks.py list
+python3 {baseDir}/scripts/tasks.py --personal list
+python3 {baseDir}/scripts/tasks.py add "Task title" --priority high --due 2026-01-23
+python3 {baseDir}/scripts/tasks.py done "task query"
+python3 {baseDir}/scripts/tasks.py blockers
+python3 {baseDir}/scripts/extract_tasks.py --from-text "Meeting notes"
+```
+
+Available heartbeat wrapper commands:
+```bash
+bash {baseDir}/scripts/task-shortcuts.sh daily
+bash {baseDir}/scripts/task-shortcuts.sh weekly
+bash {baseDir}/scripts/task-shortcuts.sh done24h
+bash {baseDir}/scripts/task-shortcuts.sh done7d
 ```
 
 ---
