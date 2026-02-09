@@ -57,7 +57,12 @@ export TASK_TRACKER_ARCHIVE_DIR="$HOME/clawd/memory/work"
 export TASK_TRACKER_LEGACY_FILE="$HOME/clawd/memory/work/TASKS.md"
 ```
 
-`TASK_TRACKER_WORK_FILE` is required. This skill does not provide a default work file path.
+**Default paths (used when env vars are not set):**
+- Work: `~/Obsidian/03-Areas/Work/Work Tasks.md`
+- Personal: `~/Obsidian/03-Areas/Personal/Personal Tasks.md`
+- Legacy: `~/clawd/memory/work/TASKS.md`
+
+Setting `TASK_TRACKER_WORK_FILE` explicitly is recommended — the defaults assume an Obsidian vault layout.
 
 ---
 
