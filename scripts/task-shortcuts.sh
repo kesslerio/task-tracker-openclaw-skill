@@ -15,27 +15,33 @@ unset _source _dir
 case "${1:-}" in
   daily)
     export STANDUP_CALENDARS="$(cat ~/.config/task-tracker-calendars.json 2>/dev/null || echo '{}')"
+
+    # Create temp files securely
+    _tmpdir="$(mktemp -d)"
+    _split_file="$_tmpdir/standup_split.txt"
+
     # Generate standup and split into 3 messages
-    python3 "$SCRIPT_DIR/standup.py" --split > /tmp/standup_split.txt 2>&1
-    csplit -s /tmp/standup_split.txt '/^---$/' '{*}' -f /tmp/standup_msg_ 2>/dev/null || true
+    python3 "$SCRIPT_DIR/standup.py" --split > "$_split_file" 2>&1
+
+    # Split on message separator
+    csplit -s "$_split_file" '/^---$/' '{*}' -f "$_tmpdir/msg_" 2>&1
 
     # Print each message with separator that Niemand can parse
-    for msg_file in /tmp/standup_msg_*; do
+    for msg_file in "$_tmpdir/msg_"*; do
       [ -s "$msg_file" ] || continue
       cat "$msg_file"
       echo "___SPLIT_MESSAGE___"
     done
 
     # Cleanup
-    rm -f /tmp/standup_split.txt /tmp/standup_msg_*
+    rm -rf "$_tmpdir"
     ;;
   weekly)
     python3 "$SCRIPT_DIR/weekly_review.py"
     ;;
   done24h)
     # Show recently completed tasks (summary view, limited to 20 lines).
-    # Note: Completion timestamps are not tracked in the task format,
-    # so this shows the most recent items from the Done section.
+    # Note: Completion timestamps are not tracked in the task format.
     echo "✅ **Recently Completed**"
     echo ""
     output="$(python3 "$SCRIPT_DIR/tasks.py" list 2>&1)" || {
@@ -46,8 +52,7 @@ case "${1:-}" in
     ;;
   done7d)
     # Show all completed tasks (full view, limited to 50 lines).
-    # Note: Completion timestamps are not tracked in the task format,
-    # so this shows the full Done section.
+    # Note: Completion timestamps are not tracked in the task format.
     echo "✅ **All Completed Tasks**"
     echo ""
     output="$(python3 "$SCRIPT_DIR/tasks.py" list 2>&1)" || {
