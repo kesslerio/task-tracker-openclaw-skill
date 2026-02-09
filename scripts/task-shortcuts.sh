@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 # Task tracker shortcuts for slash commands
+set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# Resolve SCRIPT_DIR (supports symlinks on both GNU/Linux and macOS)
+_source="${BASH_SOURCE[0]}"
+while [ -L "$_source" ]; do
+  _dir="$(cd "$(dirname "$_source")" && pwd)"
+  _source="$(readlink "$_source")"
+  [[ "$_source" != /* ]] && _source="$_dir/$_source"
+done
+SCRIPT_DIR="$(cd "$(dirname "$_source")" && pwd)"
+unset _source _dir
 
 case "$1" in
   daily)
@@ -23,18 +32,28 @@ case "$1" in
     python3 "$SCRIPT_DIR/weekly_review.py"
     ;;
   done24h)
-    # Note: Time-based filtering not yet implemented (completion dates not tracked).
-    # Shows most recent completed tasks (limited to 20 lines).
-    echo "✅ **Recently Completed**"
+    # Show recently completed tasks.
+    # Note: True 24h filtering requires completion timestamps (not yet tracked).
+    # Current approach: show the Done section, limited to 20 lines.
+    echo "✅ **Recently Completed (last 24h)**"
     echo ""
-    python3 "$SCRIPT_DIR/tasks.py" list 2>/dev/null | grep -A100 "✅" | head -20 || echo "No completed tasks found"
+    output="$(python3 "$SCRIPT_DIR/tasks.py" list 2>&1)" || {
+      echo "Error: failed to list tasks" >&2
+      exit 1
+    }
+    echo "$output" | grep -A100 "✅" | tail -n +2 | head -20 || echo "No completed tasks found"
     ;;
   done7d)
-    # Note: Time-based filtering not yet implemented (completion dates not tracked).
-    # Shows all completed tasks (limited to 50 lines).
-    echo "✅ **Completed This Week**"
+    # Show completed tasks for the week.
+    # Note: True 7d filtering requires completion timestamps (not yet tracked).
+    # Current approach: show the full Done section, limited to 50 lines.
+    echo "✅ **Completed This Week (last 7d)**"
     echo ""
-    python3 "$SCRIPT_DIR/tasks.py" list 2>/dev/null | grep -A100 "✅" | head -50 || echo "No completed tasks found"
+    output="$(python3 "$SCRIPT_DIR/tasks.py" list 2>&1)" || {
+      echo "Error: failed to list tasks" >&2
+      exit 1
+    }
+    echo "$output" | grep -A100 "✅" | tail -n +2 | head -50 || echo "No completed tasks found"
     ;;
   *)
     echo "Usage: $0 {daily|weekly|done24h|done7d}"

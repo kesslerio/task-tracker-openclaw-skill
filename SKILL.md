@@ -44,7 +44,7 @@ A personal task management skill for daily standups and weekly reviews. Tracks w
 Configure paths via environment variables in your shell profile or `.openclaw/.env`:
 
 ```bash
-# Required: Work task file (no default fallback)
+# Recommended: Override the default work task file path
 export TASK_TRACKER_WORK_FILE="$HOME/Obsidian/03-Areas/Work/Work Tasks.md"
 
 # Optional: Personal task file (required only for --personal commands)
