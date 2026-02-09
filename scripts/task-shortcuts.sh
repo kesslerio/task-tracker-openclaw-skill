@@ -20,11 +20,23 @@ case "${1:-}" in
     _tmpdir="$(mktemp -d)"
     _split_file="$_tmpdir/standup_split.txt"
 
+    # Cleanup on exit (success or failure)
+    cleanup() { rm -rf "$_tmpdir"; }
+    trap cleanup EXIT
+
     # Generate standup and split into 3 messages
-    python3 "$SCRIPT_DIR/standup.py" --split > "$_split_file" 2>&1
+    if ! python3 "$SCRIPT_DIR/standup.py" --split > "$_split_file" 2>&1; then
+      echo "Error: standup.py failed" >&2
+      cat "$_split_file" >&2 || true
+      exit 1
+    fi
 
     # Split on message separator
-    csplit -s "$_split_file" '/^---$/' '{*}' -f "$_tmpdir/msg_" 2>&1
+    if ! csplit -s "$_split_file" '/^---$/' '{*}' -f "$_tmpdir/msg_" 2>&1; then
+      # If no separators found, output the whole file as one message
+      cat "$_split_file"
+      exit 0
+    fi
 
     # Print each message with separator that Niemand can parse
     for msg_file in "$_tmpdir/msg_"*; do
@@ -32,9 +44,6 @@ case "${1:-}" in
       cat "$msg_file"
       echo "___SPLIT_MESSAGE___"
     done
-
-    # Cleanup
-    rm -rf "$_tmpdir"
     ;;
   weekly)
     python3 "$SCRIPT_DIR/weekly_review.py"
@@ -44,10 +53,10 @@ case "${1:-}" in
     # Note: Completion timestamps are not tracked in the task format.
     echo "✅ **Recently Completed**"
     echo ""
-    output="$(python3 "$SCRIPT_DIR/tasks.py" list 2>&1)" || {
+    if ! output="$(python3 "$SCRIPT_DIR/tasks.py" list 2>&1)"; then
       echo "Error: failed to list tasks" >&2
       exit 1
-    }
+    fi
     echo "$output" | grep -A100 "✅" | tail -n +2 | head -20 || echo "No completed tasks found"
     ;;
   done7d)
@@ -55,10 +64,10 @@ case "${1:-}" in
     # Note: Completion timestamps are not tracked in the task format.
     echo "✅ **All Completed Tasks**"
     echo ""
-    output="$(python3 "$SCRIPT_DIR/tasks.py" list 2>&1)" || {
+    if ! output="$(python3 "$SCRIPT_DIR/tasks.py" list 2>&1)"; then
       echo "Error: failed to list tasks" >&2
       exit 1
-    }
+    fi
     echo "$output" | grep -A100 "✅" | tail -n +2 | head -50 || echo "No completed tasks found"
     ;;
   *)
