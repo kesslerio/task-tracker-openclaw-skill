@@ -49,39 +49,10 @@ case "${1:-}" in
     python3 "$SCRIPT_DIR/weekly_review.py"
     ;;
   done24h)
-    # Show recently completed tasks (summary view, limited to 20 lines).
-    # Note: Completion timestamps are not tracked in the task format.
-    echo "✅ **Recently Completed**"
-    echo ""
-    if ! output="$(python3 "$SCRIPT_DIR/tasks.py" list 2>&1)"; then
-      echo "Error: failed to list tasks" >&2
-      exit 1
-    fi
-    # Extract only lines with ✅ (completed tasks)
-    # Use subshell to avoid SIGPIPE exit with pipefail when head truncates
-    completed="$(echo "$output" | grep "✅" || true)"
-    if [ -n "$completed" ]; then
-      head -20 <<< "$completed"
-    else
-      echo "No completed tasks found"
-    fi
+    python3 "$SCRIPT_DIR/tasks.py" list --status done --completed-since 24h
     ;;
   done7d)
-    # Show all completed tasks (full view, limited to 50 lines).
-    # Note: Completion timestamps are not tracked in the task format.
-    echo "✅ **All Completed Tasks**"
-    echo ""
-    if ! output="$(python3 "$SCRIPT_DIR/tasks.py" list 2>&1)"; then
-      echo "Error: failed to list tasks" >&2
-      exit 1
-    fi
-    # Extract only lines with ✅ (completed tasks)
-    completed="$(echo "$output" | grep "✅" || true)"
-    if [ -n "$completed" ]; then
-      head -50 <<< "$completed"
-    else
-      echo "No completed tasks found"
-    fi
+    python3 "$SCRIPT_DIR/tasks.py" list --status done --completed-since 7d
     ;;
   *)
     echo "Usage: $0 {daily|weekly|done24h|done7d}"
