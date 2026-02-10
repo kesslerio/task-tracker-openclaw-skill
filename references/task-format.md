@@ -4,7 +4,7 @@
 
 ```markdown
 - [ ] **Task title** — Brief description
-  - Owner: martin
+  - Owner: your-name
   - Due: 2026-01-29
   - Status: Todo
   - Blocks: lilla (podcast outreach)
@@ -17,7 +17,7 @@
 |-------|----------|-------------|
 | title | Yes | Brief, actionable (verb + noun) |
 | description | No | Additional context after `—` |
-| Owner | No | Person responsible (default: martin) |
+| Owner | No | Person responsible (default: configurable via TASK_TRACKER_DEFAULT_OWNER) |
 | Due | No | ASAP, YYYY-MM-DD, or "Before [event]" |
 | Status | No | Todo, In Progress, Blocked, Waiting, Done |
 | Blocks | No | Who/what is blocked + reason |
@@ -62,7 +62,7 @@
 ### High Priority (Blocking)
 ```markdown
 - [ ] **Set up Apollo.io access for Lilla** — Restore account for email finding
-  - Owner: Martin
+  - Owner: Sarah
   - Due: ASAP
   - Status: Todo
   - Blocks: Lilla (podcast outreach sequence)
@@ -71,7 +71,7 @@
 ### High Priority (Deadline)
 ```markdown
 - [ ] **Create IMCAS lead capture form** — Signup form + ActiveCampaign sequence
-  - Owner: Martin
+  - Owner: Sarah
   - Due: Before Jan 29
   - Status: Todo
   - Location: https://bysha.pe/imcas
@@ -80,7 +80,7 @@
 ### Medium Priority (Review)
 ```markdown
 - [ ] **Review Q1 promo designs** — Identify which need carousel versions
-  - Owner: Martin
+  - Owner: Sarah
   - Status: Todo
   - Location: https://dropbox.com/...
 ```
@@ -95,6 +95,6 @@
 ### Completed
 ```markdown
 - [x] **Ship IMCAS materials to France** — Completed Friday
-  - Owner: Martin
+  - Owner: Sarah
   - Status: Done
 ```

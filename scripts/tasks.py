@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import os
 import re
 import sys
 from datetime import datetime, timedelta
@@ -127,7 +128,8 @@ def add_task(args):
         task_line += f' 🗓️{args.due}'
     if args.area:
         task_line += f' area:: {args.area}'
-    if args.owner and args.owner not in ('me', 'martin'):
+    default_owner = os.getenv('TASK_TRACKER_DEFAULT_OWNER', 'me')
+    if args.owner and args.owner not in ('me', default_owner):
         task_line += f' owner:: {args.owner}'
     
     # Find section and insert after header
