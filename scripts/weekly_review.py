@@ -465,6 +465,12 @@ def generate_weekly_review(week: str | None = None, archive: bool = False) -> st
         lines.append(f"  • Completed ({len(completed_demos)}): {completed_titles}")
         lines.append(f"  • Upcoming ({len(upcoming_demos)}): {upcoming_titles}")
 
+    # Velocity / Burndown metrics (compute BEFORE archiving to avoid double-count)
+    velocity_lines = generate_velocity_section(
+        tasks_data, week_start, week_end, ARCHIVE_DIR,
+    )
+    lines.extend(velocity_lines)
+
     # Archive if requested
     if archive and done_tasks:
         tasks_file, format = get_tasks_file()
@@ -472,12 +478,6 @@ def generate_weekly_review(week: str | None = None, archive: bool = False) -> st
         new_content = archive_done_tasks(content, done_tasks)
         tasks_file.write_text(new_content)
         lines.append(f"📦 Archived {len(done_tasks)} completed tasks.")
-
-    # Velocity / Burndown metrics
-    velocity_lines = generate_velocity_section(
-        tasks_data, week_start, week_end, ARCHIVE_DIR,
-    )
-    lines.extend(velocity_lines)
 
     lessons = extract_lessons(notes_dir, week_start, week_end) if notes_dir else []
     lines.append("")
