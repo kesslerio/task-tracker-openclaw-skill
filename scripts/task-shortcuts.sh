@@ -61,7 +61,7 @@ case "${1:-}" in
     # Use subshell to avoid SIGPIPE exit with pipefail when head truncates
     completed="$(echo "$output" | grep "✅" || true)"
     if [ -n "$completed" ]; then
-      echo "$completed" | head -20
+      head -20 <<< "$completed"
     else
       echo "No completed tasks found"
     fi
@@ -78,7 +78,7 @@ case "${1:-}" in
     # Extract only lines with ✅ (completed tasks)
     completed="$(echo "$output" | grep "✅" || true)"
     if [ -n "$completed" ]; then
-      echo "$completed" | head -50
+      head -50 <<< "$completed"
     else
       echo "No completed tasks found"
     fi
