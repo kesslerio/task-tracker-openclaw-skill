@@ -17,7 +17,13 @@ from standup_common import (
     get_calendar_events,
     resolve_standup_date,
 )
-from utils import load_tasks, get_missed_tasks_bucketed, regroup_by_effective_priority, escalation_suffix
+from utils import (
+    load_tasks,
+    get_missed_tasks_bucketed,
+    regroup_by_effective_priority,
+    escalation_suffix,
+    recurrence_suffix,
+)
 
 
 def format_personal_standup(output: dict, date_display: str) -> str:
@@ -35,14 +41,16 @@ def format_personal_standup(output: dict, date_display: str) -> str:
     
     # #1 Priority
     if output['priority']:
-        lines.append(f"🎯 **#1 Priority:** {output['priority']['title']}")
+        rec = recurrence_suffix(output['priority'])
+        lines.append(f"🎯 **#1 Priority:** {output['priority']['title']}{rec}")
         lines.append("")
     
     # Due Today
     if output['due_today']:
         lines.append("⏰ **Due Today:**")
         for t in output['due_today']:
-            lines.append(f"  • {t['title']}")
+            rec = recurrence_suffix(t)
+            lines.append(f"  • {t['title']}{rec}")
         lines.append("")
     
     # Q1 Must Do
@@ -50,7 +58,8 @@ def format_personal_standup(output: dict, date_display: str) -> str:
         lines.append("🔴 **Must Do Today:**")
         for t in output['q1']:
             esc = escalation_suffix(t)
-            lines.append(f"  • {t['title']}{esc}")
+            rec = recurrence_suffix(t)
+            lines.append(f"  • {t['title']}{esc}{rec}")
         lines.append("")
     
     # Q2 Should Do
@@ -58,7 +67,8 @@ def format_personal_standup(output: dict, date_display: str) -> str:
         lines.append("🟡 **Should Do This Week:**")
         for t in output['q2']:
             due_str = f" (🗓️{t['due']})" if t.get('due') else ""
-            lines.append(f"  • {t['title']}{due_str}")
+            rec = recurrence_suffix(t)
+            lines.append(f"  • {t['title']}{due_str}{rec}")
         lines.append("")
     
     # Q3 Waiting On
@@ -66,14 +76,16 @@ def format_personal_standup(output: dict, date_display: str) -> str:
         lines.append("🟠 **Waiting On:**")
         for t in output['q3']:
             esc = escalation_suffix(t)
-            lines.append(f"  • {t['title']}{esc}")
+            rec = recurrence_suffix(t)
+            lines.append(f"  • {t['title']}{esc}{rec}")
         lines.append("")
     
     # Completed
     if output['completed']:
         lines.append(f"✅ **Completed:** ({len(output['completed'])} items)")
         for t in output['completed'][:5]:  # Limit to 5
-            lines.append(f"  • {t['title']}")
+            rec = recurrence_suffix(t)
+            lines.append(f"  • {t['title']}{rec}")
         if len(output['completed']) > 5:
             lines.append(f"  • ... and {len(output['completed']) - 5} more")
     

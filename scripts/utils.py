@@ -12,7 +12,8 @@ Configuration via environment variables:
 
 import os
 import re
-from datetime import datetime, timedelta
+import calendar
+from datetime import datetime, timedelta, date
 from pathlib import Path
 import sys
 
@@ -158,6 +159,7 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
             owner = None
             blocks = None
             task_type = None
+            recur = None
             
             if format == 'obsidian':
                 # Parse emoji date
@@ -186,6 +188,10 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 type_match = re.search(r'(?<!\w)type::\s*(?!(\s|\w+::))([^\n]+?)(?=\s+\w+::|$)', rest)
                 if type_match:
                     task_type = type_match.group(2).strip()
+
+                recur_match = re.search(r'(?<!\w)recur::\s*(?!(\s|\w+::))([^\n]+?)(?=\s+\w+::|\s*🗓️|$)', rest)
+                if recur_match:
+                    recur = recur_match.group(2).strip()
             
             current_task = {
                 'title': title,
@@ -197,6 +203,7 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 'owner': owner,
                 'blocks': blocks,
                 'type': task_type,
+                'recur': recur,
                 'completed_date': completed_date,
                 'raw_line': line,
             }
@@ -284,6 +291,61 @@ def check_due_date(due: str, check_type: str = 'today') -> bool:
         pass
     
     return False
+
+
+def next_recurrence_date(recur_value: str, from_date) -> str:
+    """Calculate next due date (YYYY-MM-DD) from recurrence rule and starting date."""
+    if not recur_value:
+        raise ValueError("recurrence value is required")
+
+    recur = recur_value.strip().lower()
+
+    if isinstance(from_date, datetime):
+        base_date = from_date.date()
+    elif isinstance(from_date, date):
+        base_date = from_date
+    elif isinstance(from_date, str):
+        base_date = datetime.strptime(from_date, '%Y-%m-%d').date()
+    else:
+        raise ValueError("from_date must be a date/datetime object or YYYY-MM-DD string")
+
+    if recur == 'daily':
+        next_date = base_date + timedelta(days=1)
+    elif recur == 'weekly':
+        next_date = base_date + timedelta(days=7)
+    elif recur == 'biweekly':
+        next_date = base_date + timedelta(days=14)
+    elif recur == 'monthly':
+        year = base_date.year
+        month = base_date.month + 1
+        if month > 12:
+            year += 1
+            month = 1
+        last_day = calendar.monthrange(year, month)[1]
+        next_date = base_date.replace(year=year, month=month, day=min(base_date.day, last_day))
+    elif recur.startswith('every '):
+        weekday_name = recur.removeprefix('every ').strip()
+        weekday_map = {
+            'monday': 0,
+            'tuesday': 1,
+            'wednesday': 2,
+            'thursday': 3,
+            'friday': 4,
+            'saturday': 5,
+            'sunday': 6,
+        }
+        if weekday_name not in weekday_map:
+            raise ValueError(f"unsupported recurrence pattern: {recur_value}")
+
+        target_weekday = weekday_map[weekday_name]
+        days_ahead = (target_weekday - base_date.weekday()) % 7
+        if days_ahead == 0:
+            days_ahead = 7
+        next_date = base_date + timedelta(days=days_ahead)
+    else:
+        raise ValueError(f"unsupported recurrence pattern: {recur_value}")
+
+    return next_date.strftime('%Y-%m-%d')
 
 
 def get_missed_tasks(tasks_data: dict, lookback_days: int = 1, reference_date: str = None) -> list:
@@ -500,6 +562,12 @@ def escalation_suffix(task: dict) -> str:
     """Return escalation indicator suffix for a task, if any."""
     indicator = task.get('_escalation_indicator', '')
     return f" {indicator}" if indicator else ""
+
+
+def recurrence_suffix(task: dict) -> str:
+    """Return recurrence indicator suffix for a task, if any."""
+    recur = (task.get('recur') or '').strip()
+    return f" 🔄 {recur}" if recur else ""
 
 
 def get_section_display_name(section: str, personal: bool = False) -> str:
