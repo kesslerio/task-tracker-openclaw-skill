@@ -17,6 +17,7 @@ from utils import (
     ARCHIVE_DIR,
     get_current_quarter,
     get_missed_tasks_bucketed,
+    effective_priority,
     load_tasks,
 )
 
@@ -215,15 +216,18 @@ def generate_weekly_review(week: str | None = None, archive: bool = False) -> st
         "No overdue tasks",
     )
 
-    # This Week Priorities: Q1 + Q2 due this week, plus undated tasks
+    # This Week Priorities: Q1 + Q2 due this week, plus undated tasks (with escalation labels)
     priorities: list[dict] = []
     for priority_label, section in (('Q1', 'q1'), ('Q2', 'q2')):
         for task in tasks_data.get(section, []):
             due_raw = task.get('due')
-            due_date = parse_due_date(due_raw)
-            if due_raw and (not due_date or due_date < week_start or due_date > week_end):
+            due_date_val = parse_due_date(due_raw)
+            if due_raw and (not due_date_val or due_date_val < week_start or due_date_val > week_end):
                 continue
-            priorities.append({**task, '_priority': priority_label})
+            eff = effective_priority(task, reference_date)
+            display_label = {'q1': 'Q1', 'q2': 'Q2', 'q3': 'Q3'}.get(eff['section'], priority_label)
+            indicator = f" {eff['indicator']}" if eff['indicator'] else ""
+            priorities.append({**task, '_priority': display_label, '_escalation_indicator': indicator})
 
     format_area_grouped(
         lines,
@@ -232,6 +236,7 @@ def generate_weekly_review(week: str | None = None, archive: bool = False) -> st
         lambda t: (
             f"[{t['_priority']}] {t['title']}"
             + (f" (due {t['due']})" if t.get('due') else "")
+            + t.get('_escalation_indicator', '')
         ),
         "No Q1/Q2 priorities",
     )

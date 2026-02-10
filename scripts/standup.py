@@ -19,7 +19,7 @@ from standup_common import (
     get_calendar_events,
     resolve_standup_date,
 )
-from utils import load_tasks, get_missed_tasks_bucketed
+from utils import load_tasks, get_missed_tasks_bucketed, regroup_by_effective_priority, escalation_suffix
 
 
 def group_by_area(tasks):
@@ -92,7 +92,8 @@ def format_split_standup(output: dict, date_display: str) -> list:
         for area in sorted(by_area.keys()):
             msg3_lines.append(f"  **{area}:**")
             for t in by_area[area]:
-                msg3_lines.append(f"    • {t['title']}")
+                esc = escalation_suffix(t)
+                msg3_lines.append(f"    • {t['title']}{esc}")
         msg3_lines.append("")
     
     # Q2 - Important, Not Urgent
@@ -111,7 +112,8 @@ def format_split_standup(output: dict, date_display: str) -> list:
         msg3_lines.append("🟠 **Waiting/Blocked (Q3):**")
         for t in output['q3']:
             blocks_str = f" → {t['blocks']}" if t.get('blocks') else ""
-            msg3_lines.append(f"  • {t['title']}{blocks_str}")
+            esc = escalation_suffix(t)
+            msg3_lines.append(f"  • {t['title']}{blocks_str}{esc}")
         msg3_lines.append("")
     
     # Team tasks
@@ -161,23 +163,26 @@ def generate_standup(
         'completed': [],
     }
     
-    # #1 Priority (Q1 first, then Q2)
-    if tasks_data.get('q1'):
-        output['priority'] = tasks_data['q1'][0]
-    elif tasks_data.get('q2'):
-        output['priority'] = tasks_data['q2'][0]
+    # Apply display-only priority escalation
+    regrouped = regroup_by_effective_priority(tasks_data, reference_date=standup_date)
+
+    # #1 Priority (escalated Q1 first, then Q2)
+    if regrouped['q1']:
+        output['priority'] = regrouped['q1'][0]
+    elif regrouped['q2']:
+        output['priority'] = regrouped['q2'][0]
     
     # Due today
     output['due_today'] = tasks_data.get('due_today', [])
     
-    # Q1 - Urgent & Important
-    output['q1'] = tasks_data.get('q1', [])
+    # Q1 - Urgent & Important (includes escalated tasks)
+    output['q1'] = regrouped['q1']
     
     # Q2 - Important, Not Urgent
-    output['q2'] = tasks_data.get('q2', [])
+    output['q2'] = regrouped['q2']
     
-    # Q3 - Waiting/Blocked
-    output['q3'] = tasks_data.get('q3', [])
+    # Q3 - Waiting/Blocked (includes escalated tasks)
+    output['q3'] = regrouped['q3']
     
     # Team tasks
     output['team'] = tasks_data.get('team', [])
@@ -223,7 +228,8 @@ def generate_standup(
         for cat in sorted(by_area.keys()):
             lines.append(f"  **{cat}:**")
             for t in by_area[cat]:
-                lines.append(f"    • {t['title']}")
+                esc = escalation_suffix(t)
+                lines.append(f"    • {t['title']}{esc}")
         lines.append("")
     
     # Q2 - Important, Not Urgent
@@ -242,7 +248,8 @@ def generate_standup(
         lines.append("🟠 **Waiting/Blocked (Q3):**")
         for t in output['q3']:
             blocks_str = f" → {t['blocks']}" if t.get('blocks') else ""
-            lines.append(f"  • {t['title']}{blocks_str}")
+            esc = escalation_suffix(t)
+            lines.append(f"  • {t['title']}{blocks_str}{esc}")
         lines.append("")
     
     # Team tasks
