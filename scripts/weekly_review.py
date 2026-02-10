@@ -41,15 +41,18 @@ def _parse_archive_weeks(archive_dir: Path) -> dict[str, list[str]]:
 
         current_week_label: str | None = None
         for line in content.splitlines():
-            # Match both archive header formats:
-            #   "## Week of YYYY-MM-DD"          (weekly_review.py archive)
-            #   "## Archived YYYY-MM-DD (Work)"   (tasks.py archive)
+            # Match both archive header formats (work only):
+            #   "## Week of YYYY-MM-DD"          (weekly_review.py archive — always work)
+            #   "## Archived YYYY-MM-DD (Work)"   (tasks.py archive — explicit work label)
+            # Excludes "## Archived YYYY-MM-DD (Personal)" to avoid inflating work metrics.
             header_match = re.match(
-                r'^## (?:Week of|Archived)\s+(\d{4}-\d{2}-\d{2})', line
+                r'^## (?:Week of\s+(\d{4}-\d{2}-\d{2})|Archived\s+(\d{4}-\d{2}-\d{2})\s+\(Work\))',
+                line,
             )
             if header_match:
+                date_str = header_match.group(1) or header_match.group(2)
                 try:
-                    week_date = datetime.strptime(header_match.group(1), '%Y-%m-%d').date()
+                    week_date = datetime.strptime(date_str, '%Y-%m-%d').date()
                     iso_year, iso_week, _ = week_date.isocalendar()
                     current_week_label = f"{iso_year}-W{iso_week:02d}"
                 except ValueError:
@@ -122,9 +125,9 @@ def generate_velocity_section(
     current_label = f"{iso_year_cur}-W{iso_week_cur:02d}"
     current_archive_count = len(archive_weeks.get(current_label, []))
 
-    # Use the higher of live vs archive (archive may contain tasks already
-    # removed from the active file; live may have tasks not yet archived)
-    completed_this_week = max(live_completed, current_archive_count)
+    # Add live + archive: archived tasks are removed from the active file,
+    # so there is no overlap between the two counts.
+    completed_this_week = live_completed + current_archive_count
 
     # Build 4-week rolling trend: 3 previous weeks + current week
     trend_counts: list[int] = []
