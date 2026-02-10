@@ -155,21 +155,22 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                     due_str = date_match.group(1)
                 
                 # Parse inline fields (handle multi-word values)
-                area_match = re.search(r'area::\s*([^\n]+?)(?=\s+\w+::|$)', rest)
+                # Pattern: field:: value (but not field:: next_field::)
+                area_match = re.search(r'area::\s*(?!(\s|\w+::))([^\n]+?)(?=\s+\w+::|$)', rest)
                 if area_match:
-                    area = area_match.group(1).strip()
+                    area = area_match.group(2).strip()
                 
                 goal_match = re.search(r'goal::\s*(\[\[[^\]]+\]\]|[^\s]+)', rest)
                 if goal_match:
                     goal = goal_match.group(1).strip()
                 
-                owner_match = re.search(r'owner::\s*(\S.*?)(?=\s+\w+::|$)', rest)
+                owner_match = re.search(r'owner::\s*(?!(\s|\w+::))([^\n]+?)(?=\s+\w+::|$)', rest)
                 if owner_match:
-                    owner = owner_match.group(1).strip()
+                    owner = owner_match.group(2).strip()
 
-                blocks_match = re.search(r'blocks::\s*(\S.*?)(?=\s+\w+::|$)', rest)
+                blocks_match = re.search(r'blocks::\s*(?!(\s|\w+::))([^\n]+?)(?=\s+\w+::|$)', rest)
                 if blocks_match:
-                    blocks = blocks_match.group(1).strip()
+                    blocks = blocks_match.group(2).strip()
             
             current_task = {
                 'title': title,

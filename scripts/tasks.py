@@ -3,7 +3,7 @@
 Task Tracker CLI - Supports both Work and Personal tasks.
 
 Usage:
-    tasks.py list [--priority high|medium|low] [--due today|this-week|overdue]
+    tasks.py list [--priority high|medium|low] [--due today|this-week|overdue|due-or-overdue]
     tasks.py --personal list
     tasks.py add "Task title" [--priority high|medium|low] [--due YYYY-MM-DD]
     tasks.py done "task query"
