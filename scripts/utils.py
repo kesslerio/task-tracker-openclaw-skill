@@ -141,6 +141,16 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
             done = task_match.group(1).lower() == 'x'
             title = task_match.group(2).strip()
             rest = task_match.group(3).strip()
+            completed_date = None
+
+            # Parse completion timestamp suffix on done tasks:
+            # "... ✅ YYYY-MM-DD" or "... ✅YYYY-MM-DD"
+            if done:
+                completed_match = re.search(r'✅\s*(\d{4}-\d{2}-\d{2})\s*$', rest)
+                if completed_match:
+                    completed_date = completed_match.group(1)
+                    # Strip completion suffix before parsing inline fields
+                    rest = rest[:completed_match.start()].rstrip()
             
             due_str = None
             area = None
@@ -187,6 +197,7 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 'owner': owner,
                 'blocks': blocks,
                 'type': task_type,
+                'completed_date': completed_date,
                 'raw_line': line,
             }
             

@@ -3,7 +3,7 @@
 Task Tracker CLI - Supports both Work and Personal tasks.
 
 Usage:
-    tasks.py list [--priority high|medium|low] [--due today|this-week|overdue|due-or-overdue]
+    tasks.py list [--priority high|medium|low] [--status open|done] [--completed-since 24h|7d|30d] [--due today|this-week|overdue|due-or-overdue]
     tasks.py --personal list
     tasks.py add "Task title" [--priority high|medium|low] [--due YYYY-MM-DD]
     tasks.py done "task query"
@@ -14,7 +14,7 @@ Usage:
 import argparse
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -36,6 +36,11 @@ def list_tasks(args):
     
     # Apply filters
     filtered = tasks
+
+    if args.status == 'done':
+        filtered = [t for t in filtered if t['done']]
+    elif args.status == 'open':
+        filtered = [t for t in filtered if not t['done']]
     
     if args.priority:
         priority_map = {
@@ -45,10 +50,34 @@ def list_tasks(args):
         }
         target_key = priority_map.get(args.priority.lower())
         if target_key:
-            filtered = tasks_data.get(target_key, [])
+            filtered = [t for t in filtered if t.get('section') == target_key]
     
     if args.due:
         filtered = [t for t in filtered if check_due_date(t.get('due', ''), args.due)]
+
+    if args.completed_since:
+        cutoff_days = {
+            '24h': 1,
+            '7d': 7,
+            '30d': 30,
+        }[args.completed_since]
+        cutoff_date = datetime.now().date() - timedelta(days=cutoff_days)
+
+        # Completion windows only apply to done tasks.
+        filtered = [t for t in filtered if t.get('done')]
+
+        recent_done = []
+        for task in filtered:
+            completed_date = task.get('completed_date')
+            if not completed_date:
+                continue
+            try:
+                parsed_date = datetime.strptime(completed_date, '%Y-%m-%d').date()
+            except ValueError:
+                continue
+            if parsed_date >= cutoff_date:
+                recent_done.append(task)
+        filtered = recent_done
     
     if not filtered:
         task_type = "Personal" if args.personal else "Work"
@@ -156,7 +185,10 @@ def done_task(args):
         print("⚠️ Could not find task line to update.")
         return
     
-    new_line = old_line.replace('- [ ]', '- [x]')
+    new_line = old_line.replace('- [ ]', '- [x]', 1)
+    if not re.search(r'✅\s*\d{4}-\d{2}-\d{2}\s*$', new_line):
+        completed_today = datetime.now().strftime('%Y-%m-%d')
+        new_line = f"{new_line.rstrip()} ✅ {completed_today}"
     
     new_content = content.replace(old_line, new_line)
     tasks_file.write_text(new_content)
@@ -241,7 +273,9 @@ def main():
     # List command
     list_parser = subparsers.add_parser('list', help='List tasks')
     list_parser.add_argument('--priority', choices=['high', 'medium', 'low'])
+    list_parser.add_argument('--status', choices=['open', 'done'])
     list_parser.add_argument('--due', choices=['today', 'this-week', 'overdue', 'due-or-overdue'])
+    list_parser.add_argument('--completed-since', choices=['24h', '7d', '30d'])
     list_parser.set_defaults(func=list_tasks)
     
     # Add command
