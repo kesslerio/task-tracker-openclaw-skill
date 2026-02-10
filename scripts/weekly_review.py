@@ -290,6 +290,22 @@ def generate_weekly_review(week: str | None = None, archive: bool = False) -> st
             lines.append(f"  • {item}")
         lines.append("")
 
+    completed_demos = [
+        task for task in done_tasks
+        if (task.get('type') or '').lower() == 'demo'
+    ]
+    upcoming_demos = [
+        task for task in tasks_data.get('all', [])
+        if not task.get('done') and (task.get('type') or '').lower() == 'demo'
+    ]
+    if completed_demos or upcoming_demos:
+        lines.append("")
+        lines.append("🎬 **Demo Summary**")
+        completed_titles = ', '.join(task['title'] for task in completed_demos) or 'None'
+        upcoming_titles = ', '.join(task['title'] for task in upcoming_demos) or 'None'
+        lines.append(f"  • Completed ({len(completed_demos)}): {completed_titles}")
+        lines.append(f"  • Upcoming ({len(upcoming_demos)}): {upcoming_titles}")
+
     # Archive if requested
     if archive and done_tasks:
         tasks_file, format = get_tasks_file()
