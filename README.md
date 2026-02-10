@@ -56,7 +56,7 @@ Tasks are stored in `~/clawd/memory/work/TASKS.md` using this format:
 ## 🔴 High Priority (This Week)
 
 - [ ] **Task title** — Brief description
-  - Owner: martin
+  - Owner: sarah
   - Due: 2026-01-29
   - Status: Todo
   - Blocks: teammate (reason)
@@ -105,7 +105,7 @@ python3 scripts/tasks.py list --priority high          # High priority only
 python3 scripts/tasks.py list --status done            # Completed tasks
 python3 scripts/tasks.py list --due today              # Due today
 python3 scripts/tasks.py list --due this-week          # Due this week
-python3 scripts/tasks.py list --owner martin           # My tasks
+python3 scripts/tasks.py list --owner your-name           # My tasks
 python3 scripts/tasks.py list --completed-since 24h    # Done last 24h
 python3 scripts/tasks.py list --completed-since 7d     # Done last week
 ```
@@ -115,7 +115,7 @@ python3 scripts/tasks.py list --completed-since 7d     # Done last week
 python3 scripts/tasks.py add "Task description" \
   --priority high \
   --due 2026-01-29 \
-  --owner martin \
+  --owner your-name \
   --blocks "teammate"
 ```
 

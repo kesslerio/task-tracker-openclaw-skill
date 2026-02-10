@@ -38,7 +38,7 @@ case "${1:-}" in
       exit 0
     fi
 
-    # Print each message with separator that Niemand can parse
+    # Print each message with separator that the agent can parse
     for msg_file in "$_tmpdir/msg_"*; do
       [ -s "$msg_file" ] || continue
       cat "$msg_file"

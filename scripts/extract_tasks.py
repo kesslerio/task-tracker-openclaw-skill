@@ -9,12 +9,16 @@ This script can:
 """
 
 import argparse
+import os
 import re
 import shlex
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+
+# Default owner for extracted tasks — override with TASK_TRACKER_DEFAULT_OWNER env var
+DEFAULT_OWNER = os.getenv('TASK_TRACKER_DEFAULT_OWNER', 'me')
 
 # Regex patterns for common meeting note formats
 TASK_PATTERNS = [
@@ -48,7 +52,7 @@ def extract_tasks_local(text: str) -> list[dict]:
         for pattern, default_priority in TASK_PATTERNS:
             match = re.search(pattern, line, re.IGNORECASE)
             if match:
-                owner = 'martin'
+                owner = DEFAULT_OWNER
                 # Assignee pattern captures owner first, then task title.
                 if match.lastindex and match.lastindex >= 2:
                     owner = match.group(1).strip()
@@ -81,7 +85,7 @@ def format_task_command(task: dict) -> str:
     if task.get('priority') and task['priority'] != 'medium':
         parts.extend(['--priority', task['priority']])
     
-    if task.get('owner') and task['owner'] != 'martin':
+    if task.get('owner') and task['owner'] != DEFAULT_OWNER:
         parts.extend(['--owner', task['owner']])
     
     if task.get('due'):
@@ -98,7 +102,7 @@ For each task, determine:
 - title: Brief, actionable title (verb + noun)
 - priority: high (blocking/deadline/revenue), medium (important), low (nice-to-have)
 - due: Date if mentioned, ASAP if urgent, or leave blank
-- owner: Person responsible (default: martin)
+- owner: Person responsible (default: {DEFAULT_OWNER})
 - blocks: Who/what is blocked if this isn't done
 
 Meeting Notes:
