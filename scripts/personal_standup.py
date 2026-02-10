@@ -25,6 +25,8 @@ from utils import (
     recurrence_suffix,
     parse_duration,
     format_duration,
+    dependency_suffix,
+    sprint_suffix,
 )
 
 
@@ -69,7 +71,9 @@ def format_personal_standup(output: dict, date_display: str) -> str:
             esc = escalation_suffix(t)
             rec = recurrence_suffix(t)
             est = f" ({t['estimate']})" if t.get('estimate') else ""
-            lines.append(f"  • {t['title']}{esc}{rec}{est}")
+            dep = dependency_suffix(t)
+            spr = sprint_suffix(t)
+            lines.append(f"  • {t['title']}{esc}{rec}{est}{dep}{spr}")
         lines.append("")
     
     # Q2 Should Do
@@ -81,7 +85,9 @@ def format_personal_standup(output: dict, date_display: str) -> str:
             due_str = f" (🗓️{t['due']})" if t.get('due') else ""
             rec = recurrence_suffix(t)
             est = f" ({t['estimate']})" if t.get('estimate') else ""
-            lines.append(f"  • {t['title']}{due_str}{rec}{est}")
+            dep = dependency_suffix(t)
+            spr = sprint_suffix(t)
+            lines.append(f"  • {t['title']}{due_str}{rec}{est}{dep}{spr}")
         lines.append("")
     
     # Q3 Waiting On
@@ -90,7 +96,8 @@ def format_personal_standup(output: dict, date_display: str) -> str:
         for t in output['q3']:
             esc = escalation_suffix(t)
             rec = recurrence_suffix(t)
-            lines.append(f"  • {t['title']}{esc}{rec}")
+            dep = dependency_suffix(t)
+            lines.append(f"  • {t['title']}{esc}{rec}{dep}")
         lines.append("")
     
     # Completed

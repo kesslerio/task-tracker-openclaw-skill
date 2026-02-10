@@ -161,6 +161,8 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
             task_type = None
             recur = None
             estimate = None
+            depends = None
+            sprint = None
             
             if format == 'obsidian':
                 # Parse emoji date
@@ -197,6 +199,14 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 estimate_match = re.search(r'(?<!\w)estimate::\s*(?!(\s|\w+::))([^\n]+?)(?=\s+\w+::|\s*🗓️|$)', rest)
                 if estimate_match:
                     estimate = estimate_match.group(2).strip()
+
+                depends_match = re.search(r'(?<!\w)depends::\s*(?!(\s|\w+::))([^\n]+?)(?=\s+\w+::|\s*🗓️|$)', rest)
+                if depends_match:
+                    depends = depends_match.group(2).strip()
+
+                sprint_match = re.search(r'(?<!\w)sprint::\s*(?!(\s|\w+::))([^\n]+?)(?=\s+\w+::|\s*🗓️|$)', rest)
+                if sprint_match:
+                    sprint = sprint_match.group(2).strip()
             
             current_task = {
                 'title': title,
@@ -210,6 +220,8 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 'type': task_type,
                 'recur': recur,
                 'estimate': estimate,
+                'depends': depends,
+                'sprint': sprint,
                 'completed_date': completed_date,
                 'raw_line': line,
             }
@@ -621,6 +633,18 @@ def recurrence_suffix(task: dict) -> str:
     """Return recurrence indicator suffix for a task, if any."""
     recur = (task.get('recur') or '').strip()
     return f" 🔄 {recur}" if recur else ""
+
+
+def dependency_suffix(task: dict) -> str:
+    """Return dependency indicator suffix for a task, if any."""
+    depends = (task.get('depends') or '').strip()
+    return f" 🔗 depends: {depends}" if depends else ""
+
+
+def sprint_suffix(task: dict) -> str:
+    """Return sprint indicator suffix for a task, if any."""
+    sprint = (task.get('sprint') or '').strip()
+    return f" 🏃 {sprint}" if sprint else ""
 
 
 def get_section_display_name(section: str, personal: bool = False) -> str:

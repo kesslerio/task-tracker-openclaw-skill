@@ -27,6 +27,8 @@ from utils import (
     recurrence_suffix,
     parse_duration,
     format_duration,
+    dependency_suffix,
+    sprint_suffix,
 )
 
 
@@ -254,7 +256,9 @@ def generate_standup(
                 esc = escalation_suffix(t)
                 rec = recurrence_suffix(t)
                 est = f" ({t['estimate']})" if t.get('estimate') else ""
-                lines.append(f"    • {t['title']}{esc}{rec}{est}")
+                dep = dependency_suffix(t)
+                spr = sprint_suffix(t)
+                lines.append(f"    • {t['title']}{esc}{rec}{est}{dep}{spr}")
         lines.append("")
     
     # Q2 - Important, Not Urgent
@@ -269,7 +273,9 @@ def generate_standup(
                 due_str = f" (🗓️{t['due']})" if t.get('due') else ""
                 rec = recurrence_suffix(t)
                 est = f" ({t['estimate']})" if t.get('estimate') else ""
-                lines.append(f"    • {t['title']}{due_str}{rec}{est}")
+                dep = dependency_suffix(t)
+                spr = sprint_suffix(t)
+                lines.append(f"    • {t['title']}{due_str}{rec}{est}{dep}{spr}")
         lines.append("")
     
     # Q3 - Waiting/Blocked
@@ -279,7 +285,8 @@ def generate_standup(
             blocks_str = f" → {t['blocks']}" if t.get('blocks') else ""
             esc = escalation_suffix(t)
             rec = recurrence_suffix(t)
-            lines.append(f"  • {t['title']}{blocks_str}{esc}{rec}")
+            dep = dependency_suffix(t)
+            lines.append(f"  • {t['title']}{blocks_str}{esc}{rec}{dep}")
         lines.append("")
     
     # Team tasks
