@@ -157,9 +157,15 @@ def extract_lessons(notes_dir: Path, start_date: date, end_date: date) -> list[s
         if note_date < start_date or note_date > end_date:
             continue
 
-        for raw_line in notes_file.read_text().splitlines():
+        try:
+            content = notes_file.read_text()
+        except (PermissionError, UnicodeDecodeError, OSError):
+            # Skip unreadable or non-UTF8 files silently
+            continue
+
+        for raw_line in content.splitlines():
             line = raw_line.strip()
-            match_line = re.search(r"(?:lesson|insight)::\s*(.+)", line, flags=re.IGNORECASE)
+            match_line = re.search(r"\b(?:lesson|insight)::\s*(.+)", line, flags=re.IGNORECASE)
             if match_line:
                 lessons.append(match_line.group(1).strip())
 
