@@ -45,7 +45,13 @@ def extract_tasks_local(text: str) -> list[dict]:
         for pattern, default_priority in TASK_PATTERNS:
             match = re.search(pattern, line, re.IGNORECASE)
             if match:
-                title = match.group(1).strip()
+                owner = 'martin'
+                # Assignee pattern captures owner first, then task title.
+                if match.lastindex and match.lastindex >= 2:
+                    owner = match.group(1).strip()
+                    title = match.group(2).strip()
+                else:
+                    title = match.group(1).strip()
                 # Clean up the title
                 title = re.sub(r'^\-\s*', '', title)  # Remove leading dash
                 title = title.strip('.,;:')
@@ -56,7 +62,7 @@ def extract_tasks_local(text: str) -> list[dict]:
                 tasks.append({
                     'title': title,
                     'priority': default_priority,
-                    'owner': 'martin',
+                    'owner': owner,
                     'due': None,
                     'blocks': None,
                 })
@@ -77,9 +83,6 @@ def format_task_command(task: dict) -> str:
     
     if task.get('due'):
         parts.append(f'--due "{task["due"]}"')
-    
-    if task.get('blocks'):
-        parts.append(f'--blocks "{task["blocks"]}"')
     
     return ' '.join(parts)
 
