@@ -163,9 +163,13 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 if goal_match:
                     goal = goal_match.group(1).strip()
                 
-                owner_match = re.search(r'owner::\s*([^\s]+)', rest)
+                owner_match = re.search(r'owner::\s*([^\n]+?)(?=\s+\w+::|$)', rest)
                 if owner_match:
                     owner = owner_match.group(1).strip()
+
+                blocks_match = re.search(r'blocks::\s*([^\n]+?)(?=\s+\w+::|$)', rest)
+                if blocks_match:
+                    blocks = blocks_match.group(1).strip()
             
             current_task = {
                 'title': title,
@@ -251,9 +255,11 @@ def check_due_date(due: str, check_type: str = 'today') -> bool:
         due_date = datetime.strptime(due, '%Y-%m-%d').date()
         
         if check_type == 'today':
-            return due_date <= today
+            return due_date == today
         elif check_type == 'this-week':
-            return due_date <= week_end
+            return today <= due_date <= week_end
+        elif check_type == 'due-or-overdue':
+            return due_date <= today
         elif check_type == 'overdue':
             return due_date < today
     except ValueError:
