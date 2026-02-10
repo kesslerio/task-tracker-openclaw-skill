@@ -147,6 +147,7 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
             goal = None
             owner = None
             blocks = None
+            task_type = None
             
             if format == 'obsidian':
                 # Parse emoji date
@@ -171,6 +172,10 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 blocks_match = re.search(r'blocks::\s*(?!(\s|\w+::))([^\n]+?)(?=\s+\w+::|$)', rest)
                 if blocks_match:
                     blocks = blocks_match.group(2).strip()
+
+                type_match = re.search(r'type::\s*(?!(\s|\w+::))([^\n]+?)(?=\s+\w+::|$)', rest)
+                if type_match:
+                    task_type = type_match.group(2).strip()
             
             current_task = {
                 'title': title,
@@ -181,6 +186,7 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 'goal': goal,
                 'owner': owner,
                 'blocks': blocks,
+                'type': task_type,
                 'raw_line': line,
             }
             
