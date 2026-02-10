@@ -16,8 +16,8 @@ case "${1:-}" in
   daily)
     export STANDUP_CALENDARS="$(cat ~/.config/task-tracker-calendars.json 2>/dev/null || echo '{}')"
 
-    # Create temp files securely
-    _tmpdir="$(mktemp -d)"
+    # Create temp dir (portable: -t template works on GNU and BSD/macOS)
+    _tmpdir="$(mktemp -d -t task-tracker.XXXXXX)"
     _split_file="$_tmpdir/standup_split.txt"
 
     # Cleanup on exit (success or failure)
@@ -31,8 +31,8 @@ case "${1:-}" in
       exit 1
     fi
 
-    # Split on message separator
-    if ! csplit -s "$_split_file" '/^---$/' '{*}' -f "$_tmpdir/msg_" 2>&1; then
+    # Split on message separator (stderr to /dev/null, not stdout)
+    if ! csplit -s "$_split_file" '/^---$/' '{*}' -f "$_tmpdir/msg_" 2>/dev/null; then
       # If no separators found, output the whole file as one message
       cat "$_split_file"
       exit 0
@@ -57,7 +57,8 @@ case "${1:-}" in
       echo "Error: failed to list tasks" >&2
       exit 1
     fi
-    echo "$output" | grep -A100 "✅" | tail -n +2 | head -20 || echo "No completed tasks found"
+    # Extract only lines with ✅ (completed tasks), not surrounding context
+    echo "$output" | grep "✅" | head -20 || echo "No completed tasks found"
     ;;
   done7d)
     # Show all completed tasks (full view, limited to 50 lines).
@@ -68,7 +69,8 @@ case "${1:-}" in
       echo "Error: failed to list tasks" >&2
       exit 1
     fi
-    echo "$output" | grep -A100 "✅" | tail -n +2 | head -50 || echo "No completed tasks found"
+    # Extract only lines with ✅ (completed tasks), not surrounding context
+    echo "$output" | grep "✅" | head -50 || echo "No completed tasks found"
     ;;
   *)
     echo "Usage: $0 {daily|weekly|done24h|done7d}"
