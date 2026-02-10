@@ -101,6 +101,8 @@ def resolve_standup_date(date_str: str | None) -> date:
 
 def flatten_calendar_events(calendar_events: dict) -> list[dict]:
     """Flatten calendar dict into a single sorted event list."""
+    if not calendar_events:
+        return []
     all_events = []
     for key in sorted(calendar_events.keys()):
         all_events.extend(calendar_events[key])
