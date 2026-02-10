@@ -4,6 +4,7 @@ Weekly Review Generator - Summarizes last week and plans this week.
 """
 
 import argparse
+import os
 import re
 import sys
 from datetime import date, datetime, timedelta
@@ -137,11 +138,47 @@ def format_overdue(task: dict, reference_date: date) -> str:
     return f"{overdue_days} {day_word} overdue"
 
 
+def extract_lessons(notes_dir: Path, start_date: date, end_date: date) -> list[str]:
+    """Extract lesson and insight lines from dated daily notes."""
+    if not notes_dir.exists() or not notes_dir.is_dir():
+        return []
+
+    lessons: list[str] = []
+    for notes_file in sorted(notes_dir.glob("*.md")):
+        match = re.fullmatch(r"(\d{4}-\d{2}-\d{2})\.md", notes_file.name)
+        if not match:
+            continue
+
+        try:
+            note_date = datetime.strptime(match.group(1), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+
+        if note_date < start_date or note_date > end_date:
+            continue
+
+        try:
+            content = notes_file.read_text()
+        except (PermissionError, UnicodeDecodeError, OSError):
+            # Skip unreadable or non-UTF8 files silently
+            continue
+
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            match_line = re.search(r"\b(?:lesson|insight)::\s*(.+)", line, flags=re.IGNORECASE)
+            if match_line:
+                lessons.append(match_line.group(1).strip())
+
+    return lessons
+
+
 def generate_weekly_review(week: str | None = None, archive: bool = False) -> str:
     """Generate weekly review summary."""
     _, tasks_data = load_tasks()
 
     week_start, week_end = parse_iso_week(week)
+    notes_dir_raw = os.getenv("TASK_TRACKER_DAILY_NOTES_DIR", None)
+    notes_dir = Path(notes_dir_raw) if notes_dir_raw else None
     today = datetime.now().date()
     reference_date = week_start if week else today
     iso_year, iso_week, _ = week_start.isocalendar()
@@ -230,6 +267,18 @@ def generate_weekly_review(week: str | None = None, archive: bool = False) -> st
         new_content = archive_done_tasks(content, done_tasks)
         tasks_file.write_text(new_content)
         lines.append(f"📦 Archived {len(done_tasks)} completed tasks.")
+
+    lessons = extract_lessons(notes_dir, week_start, week_end) if notes_dir else []
+    lines.append("")
+    lines.append("📝 **Lessons & Insights**")
+    if lessons:
+        for lesson in lessons:
+            lines.append(f"  • {lesson}")
+    else:
+        lines.append(
+            "  No lessons captured this week. Consider: What worked? What didn't? "
+            "What would you do differently?"
+        )
 
     return '\n'.join(lines)
 
