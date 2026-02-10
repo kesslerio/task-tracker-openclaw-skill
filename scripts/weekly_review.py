@@ -11,6 +11,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+from daily_notes import extract_completed_actions
 from utils import (
     get_tasks_file,
     ARCHIVE_DIR,
@@ -259,6 +260,34 @@ def generate_weekly_review(week: str | None = None, archive: bool = False) -> st
         lambda t: f"{t['title']} (due {t['due']})",
         "No upcoming deadlines in this week",
     )
+
+    untracked_wins: list[str] = []
+    if notes_dir:
+        # Use week_start/week_end for --week, otherwise last 7 days
+        notes_start = week_start if week else (today - timedelta(days=6))
+        notes_end = week_end if week else today
+        notes_actions = extract_completed_actions(
+            notes_dir=notes_dir,
+            start_date=notes_start,
+            end_date=notes_end,
+        )
+        done_titles = [
+            task["title"].strip().casefold()
+            for task in done_tasks
+            if task.get("title")
+        ]
+
+        for action in notes_actions:
+            action_lower = action.casefold()
+            if any(action_lower in title or title in action_lower for title in done_titles):
+                continue
+            untracked_wins.append(action)
+
+    if untracked_wins:
+        lines.append("📌 **Untracked Wins (from daily notes):**")
+        for item in untracked_wins:
+            lines.append(f"  • {item}")
+        lines.append("")
 
     # Archive if requested
     if archive and done_tasks:
