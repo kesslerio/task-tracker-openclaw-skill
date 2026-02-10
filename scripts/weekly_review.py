@@ -22,6 +22,143 @@ from utils import (
 )
 
 
+def _parse_archive_weeks(archive_dir: Path) -> dict[str, list[str]]:
+    """Parse all archive files and return tasks grouped by ISO week.
+
+    Returns:
+        dict mapping ISO week labels (e.g. "2026-W06") to lists of task titles
+        found under each "## Week of YYYY-MM-DD" header.
+    """
+    weeks: dict[str, list[str]] = {}
+    if not archive_dir.exists() or not archive_dir.is_dir():
+        return weeks
+
+    for archive_file in sorted(archive_dir.glob("ARCHIVE-*.md")):
+        try:
+            content = archive_file.read_text()
+        except (PermissionError, OSError):
+            continue
+
+        current_week_label: str | None = None
+        for line in content.splitlines():
+            header_match = re.match(r'^## Week of (\d{4}-\d{2}-\d{2})', line)
+            if header_match:
+                try:
+                    week_date = datetime.strptime(header_match.group(1), '%Y-%m-%d').date()
+                    iso_year, iso_week, _ = week_date.isocalendar()
+                    current_week_label = f"{iso_year}-W{iso_week:02d}"
+                except ValueError:
+                    current_week_label = None
+                continue
+
+            if current_week_label is None:
+                continue
+
+            task_match = re.match(r'^- ✅ \*\*(.+?)\*\*', line)
+            if task_match:
+                if current_week_label not in weeks:
+                    weeks[current_week_label] = []
+                weeks[current_week_label].append(task_match.group(1).strip())
+
+    return weeks
+
+
+def _count_completed_in_range(
+    tasks: list[dict], start: date, end: date
+) -> int:
+    """Count tasks whose completed_date falls within [start, end]."""
+    count = 0
+    for task in tasks:
+        cd = task.get('completed_date')
+        if not cd:
+            continue
+        try:
+            completed = datetime.strptime(cd, '%Y-%m-%d').date()
+        except ValueError:
+            continue
+        if start <= completed <= end:
+            count += 1
+    return count
+
+
+def generate_velocity_section(
+    tasks_data: dict,
+    week_start: date,
+    week_end: date,
+    archive_dir: Path,
+) -> list[str]:
+    """Generate the 📊 Velocity section lines.
+
+    Metrics:
+    - Completed: tasks with completed_date in the review week
+    - Added: new tasks that appeared in the current task list but weren't in
+      the previous week's archive snapshot (approximated from open task count
+      and archive history)
+    - Net: completed - added
+    - 4-week trend: completion counts per week from archive + current
+    """
+    lines: list[str] = []
+
+    # --- Completed this week ---
+    # Count from all tasks (done tasks are a subset of all tasks in parse_tasks)
+    all_tasks = tasks_data.get('all', [])
+    completed_this_week = _count_completed_in_range(all_tasks, week_start, week_end)
+
+    # --- Archive data for trend ---
+    archive_weeks = _parse_archive_weeks(archive_dir)
+
+    # Build 4-week rolling trend: 3 previous weeks + current week
+    trend_counts: list[int] = []
+    for i in range(3, 0, -1):
+        trend_start = week_start - timedelta(weeks=i)
+        iso_year, iso_week, _ = trend_start.isocalendar()
+        label = f"{iso_year}-W{iso_week:02d}"
+        trend_counts.append(len(archive_weeks.get(label, [])))
+
+    # Current week's completion count for the trend
+    iso_year_cur, iso_week_cur, _ = week_start.isocalendar()
+    current_label = f"{iso_year_cur}-W{iso_week_cur:02d}"
+    current_archive_count = len(archive_weeks.get(current_label, []))
+    # Use the higher of live count vs archive count (archive may not be written yet)
+    current_week_count = max(completed_this_week, current_archive_count)
+
+    # --- Added this week (approximation) ---
+    # We can't perfectly track "added" without snapshots. Use archive weeks:
+    # tasks added ≈ current open tasks + completed this week − (open tasks last week + completed last week)
+    # Since we don't have last week's open count, approximate from archive:
+    # just count how many tasks exist now that weren't archived.
+    # Simpler approach: report "—" if we can't determine, or use archive diff.
+    #
+    # Best available heuristic: total open tasks + done this week vs previous week's similar count
+    # For now, we estimate added = 0 if no data, and note it's approximate.
+    added_this_week: int | None = None  # None = unknown
+
+    # --- Build output ---
+    lines.append("")
+    lines.append("📊 **Velocity**")
+    lines.append(f"  Completed: {completed_this_week} task{'s' if completed_this_week != 1 else ''}")
+
+    if added_this_week is not None:
+        lines.append(f"  Added: {added_this_week} task{'s' if added_this_week != 1 else ''}")
+        net = completed_this_week - added_this_week
+        net_str = f"+{net}" if net > 0 else str(net)
+        lines.append(f"  Net: {net_str}")
+    else:
+        lines.append("  Added: — (tracking not available)")
+        lines.append(f"  Net: — (need task snapshots)")
+
+    # 4-week trend (3 previous weeks + current)
+    full_trend = trend_counts + [current_week_count]
+    if any(c > 0 for c in full_trend):
+        trend_str = " → ".join(str(c) for c in full_trend)
+        lines.append(f"  4-week trend: {trend_str}")
+    else:
+        lines.append("  4-week trend: — (no archive data yet)")
+
+    lines.append("")
+    return lines
+
+
 def archive_done_tasks(content: str, done_tasks: list) -> str:
     """Archive done tasks and return updated content."""
     if not done_tasks:
@@ -318,6 +455,12 @@ def generate_weekly_review(week: str | None = None, archive: bool = False) -> st
         new_content = archive_done_tasks(content, done_tasks)
         tasks_file.write_text(new_content)
         lines.append(f"📦 Archived {len(done_tasks)} completed tasks.")
+
+    # Velocity / Burndown metrics
+    velocity_lines = generate_velocity_section(
+        tasks_data, week_start, week_end, ARCHIVE_DIR,
+    )
+    lines.extend(velocity_lines)
 
     lessons = extract_lessons(notes_dir, week_start, week_end) if notes_dir else []
     lines.append("")
