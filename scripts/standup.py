@@ -11,6 +11,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent))
 from utils import load_tasks, check_due_date, get_missed_tasks, get_missed_tasks_bucketed
 
 
