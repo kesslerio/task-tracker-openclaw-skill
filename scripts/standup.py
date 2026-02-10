@@ -5,10 +5,13 @@ Daily Standup Generator - Creates a concise summary of today's priorities.
 
 import argparse
 import json
+import os
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+from daily_notes import extract_completed_actions
 from standup_common import (
     flatten_calendar_events,
     format_missed_tasks_block,
@@ -274,6 +277,17 @@ def main():
     if not args.skip_missed:
         missed_buckets = get_missed_tasks_bucketed(tasks_data, reference_date=args.date)
 
+    completed_from_notes: list[str] = []
+    notes_dir_raw = os.getenv("TASK_TRACKER_DAILY_NOTES_DIR")
+    if notes_dir_raw:
+        standup_date = resolve_standup_date(args.date)
+        yesterday = standup_date - timedelta(days=1)
+        completed_from_notes = extract_completed_actions(
+            notes_dir=Path(notes_dir_raw),
+            start_date=yesterday,
+            end_date=yesterday,
+        )
+
     result = generate_standup(
         date_str=args.date,
         json_output=args.json,
@@ -289,6 +303,17 @@ def main():
                 result = [f"{missed_block}{result[0]}"] + result[1:]
             else:
                 result = f"{missed_block}{result}"
+
+    if not args.json and completed_from_notes:
+        notes_lines = ["📌 **Also Done Yesterday:**"]
+        for action in completed_from_notes:
+            notes_lines.append(f"  • {action}")
+        notes_block = "\n".join(notes_lines)
+
+        if args.split:
+            result = [f"{result[0]}\n\n{notes_block}"] + result[1:]
+        else:
+            result = f"{result}\n\n{notes_block}"
     
     if args.json:
         print(json.dumps(result, indent=2))
