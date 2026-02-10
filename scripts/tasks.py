@@ -56,6 +56,8 @@ def list_tasks(args):
         filtered = [t for t in filtered if check_due_date(t.get('due', ''), args.due)]
 
     if args.completed_since:
+        # Note: timestamps are date-only (YYYY-MM-DD), so "24h" actually
+        # means "yesterday or today" and "7d" means "last 7 calendar days".
         cutoff_days = {
             '24h': 1,
             '7d': 7,
@@ -188,6 +190,8 @@ def done_task(args):
     new_line = old_line.replace('- [ ]', '- [x]', 1)
     if not re.search(r'✅\s*\d{4}-\d{2}-\d{2}\s*$', new_line):
         completed_today = datetime.now().strftime('%Y-%m-%d')
+        # Strip bare ✅ (without date) before appending timestamped one
+        new_line = re.sub(r'\s*✅\s*$', '', new_line)
         new_line = f"{new_line.rstrip()} ✅ {completed_today}"
     
     new_content = content.replace(old_line, new_line)
