@@ -189,7 +189,7 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 if type_match:
                     task_type = type_match.group(2).strip()
 
-                recur_match = re.search(r'(?<!\w)recur::\s*(?!(\s|\w+::))([^\n]+?)(?=\s+\w+::|$)', rest)
+                recur_match = re.search(r'(?<!\w)recur::\s*(?!(\s|\w+::))([^\n]+?)(?=\s+\w+::|\s*🗓️|$)', rest)
                 if recur_match:
                     recur = recur_match.group(2).strip()
             

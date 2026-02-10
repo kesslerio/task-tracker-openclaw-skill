@@ -213,7 +213,13 @@ def done_task(args):
                     count=1,
                 )
             else:
-                next_task_line = f"{next_task_line.rstrip()} 🗓️{next_due}"
+                # Insert date before inline fields to avoid corrupting field values
+                inline_field_match = re.search(r'\s+\w+::', next_task_line)
+                if inline_field_match:
+                    pos = inline_field_match.start()
+                    next_task_line = f"{next_task_line[:pos]} 🗓️{next_due}{next_task_line[pos:]}"
+                else:
+                    next_task_line = f"{next_task_line.rstrip()} 🗓️{next_due}"
 
             done_line_with_nl = f"{new_line}\n"
             if done_line_with_nl in new_content:
