@@ -5,78 +5,19 @@ Personal Daily Standup Generator - Creates a concise summary of personal priorit
 
 import argparse
 import json
-import os
-import subprocess
 import sys
-from datetime import datetime
 from pathlib import Path
 
 # Add parent directory to path for utils import
 sys.path.insert(0, str(Path(__file__).parent))
-from utils import load_tasks, check_due_date, get_section_display_name, get_missed_tasks, get_missed_tasks_bucketed
-
-
-def get_calendar_events() -> dict:
-    """Fetch today's calendar events via gog CLI."""
-    config_str = os.getenv('STANDUP_CALENDARS')
-    if not config_str:
-        return {}
-    
-    try:
-        calendars_config = json.loads(config_str)
-    except json.JSONDecodeError:
-        return {}
-    
-    events = {}
-    
-    for key, config in calendars_config.items():
-        events[key] = []
-        cmd = config.get('cmd', 'gog')
-        calendar_id = config.get('calendar_id')
-        account = config.get('account')
-        label = config.get('label')
-        
-        if not calendar_id or not account:
-            continue
-        
-        try:
-            result = subprocess.run(
-                [cmd, 'calendar', 'list', calendar_id,
-                 '--account', account, '--today', '--json'],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-            if result.returncode == 0:
-                data = json.loads(result.stdout)
-                for event in data.get('events', []):
-                    if event.get('eventType') == 'birthday':
-                        continue
-                    if 'dateTime' not in event.get('start', {}):
-                        continue
-                    
-                    summary = event.get('summary', 'Untitled')
-                    if label:
-                        summary = f"{summary} ({label})"
-                    
-                    events[key].append({
-                        'summary': summary,
-                        'start': event['start'].get('dateTime'),
-                        'end': event['end'].get('dateTime'),
-                    })
-        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError):
-            pass
-    
-    return events
-
-
-def format_time(iso_time: str) -> str:
-    """Format ISO datetime to human-readable time."""
-    try:
-        dt = datetime.fromisoformat(iso_time.replace('Z', '+00:00'))
-        return dt.strftime('%I:%M %p').lstrip('0')
-    except:
-        return iso_time
+from standup_common import (
+    flatten_calendar_events,
+    format_missed_tasks_block,
+    format_time,
+    get_calendar_events,
+    resolve_standup_date,
+)
+from utils import load_tasks, get_missed_tasks_bucketed
 
 
 def format_personal_standup(output: dict, date_display: str) -> str:
@@ -84,18 +25,13 @@ def format_personal_standup(output: dict, date_display: str) -> str:
     lines = [f"🏠 **Personal Daily Standup — {date_display}**\n"]
     
     # Calendar events
-    cal = output['calendar']
-    if cal:
-        all_events = []
-        for key in sorted(cal.keys()):
-            all_events.extend(cal[key])
-        
-        if all_events:
-            lines.append("📅 **Today's Calendar:**")
-            for event in all_events:
-                time_str = format_time(event['start'])
-                lines.append(f"  • {time_str} — {event['summary']}")
-            lines.append("")
+    all_events = flatten_calendar_events(output['calendar'])
+    if all_events:
+        lines.append("📅 **Today's Calendar:**")
+        for event in all_events:
+            time_str = format_time(event['start'])
+            lines.append(f"  • {time_str} — {event['summary']}")
+        lines.append("")
     
     # #1 Priority
     if output['priority']:
@@ -151,15 +87,7 @@ def generate_personal_standup(
     if tasks_data is None:
         _, tasks_data = load_tasks(personal=True)
     
-    today = datetime.now()
-    if date_str:
-        try:
-            standup_date = datetime.strptime(date_str, '%Y-%m-%d').date()
-        except ValueError:
-            standup_date = today.date()
-    else:
-        standup_date = today.date()
-    
+    standup_date = resolve_standup_date(date_str)
     date_display = standup_date.strftime("%A, %B %d")
     
     # Build output using new task structure
@@ -207,41 +135,9 @@ def main():
     )
 
     missed_block = ""
-    if missed_buckets and not args.json:
-        has_missed = any(missed_buckets.get(k) for k in ['yesterday', 'last7', 'last30', 'older'])
-        if has_missed:
-            missed_lines = ["🔴 **Missed Tasks:**"]
-            
-            # Yesterday
-            if missed_buckets.get('yesterday'):
-                missed_lines.append("\n  **Yesterday:**")
-                for task in missed_buckets['yesterday']:
-                    title = task.get('title', '')
-                    missed_lines.append(f"    • {title} — say \"done {title}\" to mark complete")
-            
-            # Last 7 days (excluding yesterday)
-            if missed_buckets.get('last7'):
-                missed_lines.append("\n  **Last 7 Days:**")
-                for task in missed_buckets['last7']:
-                    title = task.get('title', '')
-                    missed_lines.append(f"    • {title}")
-            
-            # Last 30 days
-            if missed_buckets.get('last30'):
-                missed_lines.append("\n  **Last 30 Days:**")
-                for task in missed_buckets['last30']:
-                    title = task.get('title', '')
-                    missed_lines.append(f"    • {title}")
-            
-            # Older than 30 days
-            if missed_buckets.get('older'):
-                missed_lines.append("\n  **Older than 30 Days:**")
-                for task in missed_buckets['older']:
-                    title = task.get('title', '')
-                    missed_lines.append(f"    • {title}")
-            
-            missed_lines.append("")
-            missed_block = "\n".join(missed_lines)
+    if not args.json:
+        missed_block = format_missed_tasks_block(missed_buckets)
+        if missed_block:
             result = f"{missed_block}{result}"
     
     if args.json:
