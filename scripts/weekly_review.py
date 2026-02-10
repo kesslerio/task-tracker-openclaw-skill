@@ -22,6 +22,180 @@ from utils import (
 )
 
 
+def _parse_archive_weeks(archive_dir: Path) -> dict[str, list[str]]:
+    """Parse all archive files and return tasks grouped by ISO week.
+
+    LIMITATION: Archives store task titles but not their original completion
+    dates. Tasks are grouped by the archive header date (when they were
+    archived), not their actual completion date. This means late archiving
+    or archiving backlog tasks may misattribute completions to the wrong week.
+
+    Returns:
+        dict mapping ISO week labels (e.g. "2026-W06") to lists of task titles
+        found under each "## Week of YYYY-MM-DD" or "## Archived ... (Work)"
+        header.
+    """
+    weeks: dict[str, list[str]] = {}
+    if not archive_dir.exists() or not archive_dir.is_dir():
+        return weeks
+
+    for archive_file in sorted(archive_dir.glob("ARCHIVE-*.md")):
+        try:
+            content = archive_file.read_text(encoding='utf-8')
+        except (PermissionError, OSError, UnicodeDecodeError):
+            continue
+
+        current_header_week: str | None = None
+        for line in content.splitlines():
+            # Match both archive header formats (work only):
+            #   "## Week of YYYY-MM-DD"          (weekly_review.py archive — always work)
+            #   "## Archived YYYY-MM-DD (Work)"   (tasks.py archive — explicit work label)
+            # Excludes "## Archived YYYY-MM-DD (Personal)" to avoid inflating work metrics.
+            header_match = re.match(
+                r'^## (?:Week of\s+(\d{4}-\d{2}-\d{2})|Archived\s+(\d{4}-\d{2}-\d{2})\s+\(Work\))',
+                line,
+            )
+            if header_match:
+                date_str = header_match.group(1) or header_match.group(2)
+                try:
+                    week_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+                    iso_year, iso_week, _ = week_date.isocalendar()
+                    current_header_week = f"{iso_year}-W{iso_week:02d}"
+                except ValueError:
+                    current_header_week = None
+                continue
+
+            # Reset on any other ## header to avoid misattribution
+            if line.startswith('## '):
+                current_header_week = None
+                continue
+
+            # Look for completed task line: - ✅ **Title** ... ✅ YYYY-MM-DD
+            task_match = re.match(r'^- ✅ \*\*(.+?)\*\*(.*)$', line)
+            if task_match:
+                title = task_match.group(1).strip()
+                rest = task_match.group(2)
+                
+                # Priority: use completion timestamp if present (more accurate)
+                # Fallback: use header week (archive date)
+                task_week = current_header_week
+                completed_match = re.search(r'✅\s*(\d{4}-\d{2}-\d{2})\s*$', rest)
+                if completed_match:
+                    try:
+                        c_date = datetime.strptime(completed_match.group(1), '%Y-%m-%d').date()
+                        iso_year, iso_week, _ = c_date.isocalendar()
+                        task_week = f"{iso_year}-W{iso_week:02d}"
+                    except ValueError:
+                        pass
+
+                if task_week:
+                    if task_week not in weeks:
+                        weeks[task_week] = []
+                    weeks[task_week].append(title)
+
+    return weeks
+
+
+def _count_completed_in_range(
+    tasks: list[dict], start: date, end: date
+) -> int:
+    """Count tasks whose completed_date falls within [start, end]."""
+    count = 0
+    for task in tasks:
+        cd = task.get('completed_date')
+        if not cd:
+            continue
+        try:
+            completed = datetime.strptime(cd, '%Y-%m-%d').date()
+        except ValueError:
+            continue
+        if start <= completed <= end:
+            count += 1
+    return count
+
+
+def generate_velocity_section(
+    tasks_data: dict,
+    week_start: date,
+    week_end: date,
+    archive_dir: Path,
+) -> list[str]:
+    """Generate the 📊 Velocity section lines.
+
+    Metrics:
+    - Completed: tasks with completed_date in the review week, plus tasks
+      from the current week's archive entry (archive date may differ from
+      actual completion date — see _parse_archive_weeks limitation)
+    - Added: not tracked (requires task snapshots)
+    - Net: not tracked (requires Added count)
+    - 4-week trend: completion counts per week from archive headers
+    """
+    lines: list[str] = []
+
+    # --- Archive data for trend ---
+    archive_weeks = _parse_archive_weeks(archive_dir)
+
+    # --- Completed this week ---
+    # Count from live task data (completed_date timestamps)
+    all_tasks = tasks_data.get('all', [])
+    live_completed = _count_completed_in_range(all_tasks, week_start, week_end)
+
+    # Also check archive for this week (tasks may have been archived already)
+    iso_year_cur, iso_week_cur, _ = week_start.isocalendar()
+    current_label = f"{iso_year_cur}-W{iso_week_cur:02d}"
+    current_archive_count = len(archive_weeks.get(current_label, []))
+
+    # Add live + archive: archived tasks are removed from the active file,
+    # so there is no overlap between the two counts.
+    completed_this_week = live_completed + current_archive_count
+
+    # Build 4-week rolling trend: 3 previous weeks + current week
+    trend_counts: list[int] = []
+    for i in range(3, 0, -1):
+        trend_start = week_start - timedelta(weeks=i)
+        iso_year, iso_week, _ = trend_start.isocalendar()
+        label = f"{iso_year}-W{iso_week:02d}"
+        trend_counts.append(len(archive_weeks.get(label, [])))
+
+    current_week_count = completed_this_week
+
+    # --- Added this week (approximation) ---
+    # We can't perfectly track "added" without snapshots. Use archive weeks:
+    # tasks added ≈ current open tasks + completed this week − (open tasks last week + completed last week)
+    # Since we don't have last week's open count, approximate from archive:
+    # just count how many tasks exist now that weren't archived.
+    # Simpler approach: report "—" if we can't determine, or use archive diff.
+    #
+    # Best available heuristic: total open tasks + done this week vs previous week's similar count
+    # For now, we estimate added = 0 if no data, and note it's approximate.
+    added_this_week: int | None = None  # None = unknown
+
+    # --- Build output ---
+    lines.append("")
+    lines.append("📊 **Velocity**")
+    lines.append(f"  Completed: {completed_this_week} task{'s' if completed_this_week != 1 else ''}")
+
+    if added_this_week is not None:
+        lines.append(f"  Added: {added_this_week} task{'s' if added_this_week != 1 else ''}")
+        net = completed_this_week - added_this_week
+        net_str = f"+{net}" if net > 0 else str(net)
+        lines.append(f"  Net: {net_str}")
+    else:
+        lines.append("  Added: — (tracking not available)")
+        lines.append(f"  Net: — (need task snapshots)")
+
+    # 4-week trend (3 previous weeks + current)
+    full_trend = trend_counts + [current_week_count]
+    if any(c > 0 for c in full_trend):
+        trend_str = " → ".join(str(c) for c in full_trend)
+        lines.append(f"  4-week trend: {trend_str}")
+    else:
+        lines.append("  4-week trend: — (no archive data yet)")
+
+    lines.append("")
+    return lines
+
+
 def archive_done_tasks(content: str, done_tasks: list) -> str:
     """Archive done tasks and return updated content."""
     if not done_tasks:
@@ -310,6 +484,12 @@ def generate_weekly_review(week: str | None = None, archive: bool = False) -> st
         upcoming_titles = ', '.join(task['title'] for task in upcoming_demos) or 'None'
         lines.append(f"  • Completed ({len(completed_demos)}): {completed_titles}")
         lines.append(f"  • Upcoming ({len(upcoming_demos)}): {upcoming_titles}")
+
+    # Velocity / Burndown metrics (compute BEFORE archiving to avoid double-count)
+    velocity_lines = generate_velocity_section(
+        tasks_data, week_start, week_end, ARCHIVE_DIR,
+    )
+    lines.extend(velocity_lines)
 
     # Archive if requested
     if archive and done_tasks:
