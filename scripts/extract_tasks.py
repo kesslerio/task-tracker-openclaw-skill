@@ -10,6 +10,7 @@ This script can:
 
 import argparse
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -17,14 +18,16 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 # Regex patterns for common meeting note formats
 TASK_PATTERNS = [
-    # Markdown checkbox: "- [ ] Task" or "- [x] Task"
-    (r'-\s*\[\s*\]\s*(.+?)$', 'medium'),
+    # Assignee pattern with checkbox: "- [ ] @person: Task" (highest priority, unchecked only)
+    (r'^\s*-\s*\[\s*\]\s*@([\w-]+):\s*(.+?)$', 'medium'),
+    # Assignee pattern: "@person: Task" or "- @person: Task" (line start only)
+    (r'^\s*-?\s*@([\w-]+):\s*(.+?)$', 'medium'),
+    # Markdown checkbox: "- [ ] Task" (unchecked only)
+    (r'^\s*-\s*\[\s*\]\s*(.+?)$', 'medium'),
     # TODO marker: "TODO: Task" or "- TODO: Task"
     (r'(?:^-?\s*)?TODO:\s*(.+?)$', 'medium'),
     # Action marker: "Action: Task" or "- Action: Task"
     (r'(?:^-?\s*)?Action:\s*(.+?)$', 'medium'),
-    # Assignee pattern: "@person: Task" or "- @person: Task"
-    (r'@(\w+):\s*(.+?)$', 'medium'),
     # "Task:" prefix: "Task: Task description"
     (r'(?:^-?\s*)?Task:\s*(.+?)$', 'medium'),
     # Numbered list items that look like tasks (verb + noun)
@@ -45,7 +48,13 @@ def extract_tasks_local(text: str) -> list[dict]:
         for pattern, default_priority in TASK_PATTERNS:
             match = re.search(pattern, line, re.IGNORECASE)
             if match:
-                title = match.group(1).strip()
+                owner = 'martin'
+                # Assignee pattern captures owner first, then task title.
+                if match.lastindex and match.lastindex >= 2:
+                    owner = match.group(1).strip()
+                    title = match.group(2).strip()
+                else:
+                    title = match.group(1).strip()
                 # Clean up the title
                 title = re.sub(r'^\-\s*', '', title)  # Remove leading dash
                 title = title.strip('.,;:')
@@ -56,7 +65,7 @@ def extract_tasks_local(text: str) -> list[dict]:
                 tasks.append({
                     'title': title,
                     'priority': default_priority,
-                    'owner': 'martin',
+                    'owner': owner,
                     'due': None,
                     'blocks': None,
                 })
@@ -67,21 +76,18 @@ def extract_tasks_local(text: str) -> list[dict]:
 
 def format_task_command(task: dict) -> str:
     """Format a task as a tasks.py add command."""
-    parts = [f'tasks.py add "{task["title"]}"']
+    parts = ['tasks.py', 'add', task["title"]]
     
     if task.get('priority') and task['priority'] != 'medium':
-        parts.append(f'--priority {task["priority"]}')
+        parts.extend(['--priority', task['priority']])
     
     if task.get('owner') and task['owner'] != 'martin':
-        parts.append(f'--owner {task["owner"]}')
+        parts.extend(['--owner', task['owner']])
     
     if task.get('due'):
-        parts.append(f'--due "{task["due"]}"')
+        parts.extend(['--due', task['due']])
     
-    if task.get('blocks'):
-        parts.append(f'--blocks "{task["blocks"]}"')
-    
-    return ' '.join(parts)
+    return shlex.join(parts)
 
 
 def extract_prompt(text: str) -> str:
