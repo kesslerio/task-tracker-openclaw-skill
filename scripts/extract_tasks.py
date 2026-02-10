@@ -18,12 +18,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 # Regex patterns for common meeting note formats
 TASK_PATTERNS = [
-    # Assignee pattern with checkbox: "- [ ] @person: Task" (highest priority)
-    (r'-\s*\[\s*\]\s*@([\w.-]+):\s*(.+?)$', 'medium'),
-    # Assignee pattern: "@person: Task" or "- @person: Task"
-    (r'@([\w.-]+):\s*(.+?)$', 'medium'),
-    # Markdown checkbox: "- [ ] Task" or "- [x] Task"
-    (r'-\s*\[\s*\]\s*(.+?)$', 'medium'),
+    # Assignee pattern with checkbox: "- [ ] @person: Task" (highest priority, unchecked only)
+    (r'^\s*-\s*\[\s*\]\s*@([\w-]+):\s*(.+?)$', 'medium'),
+    # Assignee pattern: "@person: Task" or "- @person: Task" (line start only)
+    (r'^\s*-?\s*@([\w-]+):\s*(.+?)$', 'medium'),
+    # Markdown checkbox: "- [ ] Task" (unchecked only)
+    (r'^\s*-\s*\[\s*\]\s*(.+?)$', 'medium'),
     # TODO marker: "TODO: Task" or "- TODO: Task"
     (r'(?:^-?\s*)?TODO:\s*(.+?)$', 'medium'),
     # Action marker: "Action: Task" or "- Action: Task"
