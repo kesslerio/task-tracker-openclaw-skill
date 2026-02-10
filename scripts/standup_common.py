@@ -83,7 +83,7 @@ def format_time(iso_time: str) -> str:
     try:
         dt = datetime.fromisoformat(iso_time.replace("Z", "+00:00"))
         return dt.strftime("%I:%M %p").lstrip("0")
-    except Exception:
+    except (ValueError, TypeError):
         return iso_time
 
 
