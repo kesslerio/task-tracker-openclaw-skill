@@ -25,9 +25,15 @@ from utils import (
 def _parse_archive_weeks(archive_dir: Path) -> dict[str, list[str]]:
     """Parse all archive files and return tasks grouped by ISO week.
 
+    LIMITATION: Archives store task titles but not their original completion
+    dates. Tasks are grouped by the archive header date (when they were
+    archived), not their actual completion date. This means late archiving
+    or archiving backlog tasks may misattribute completions to the wrong week.
+
     Returns:
         dict mapping ISO week labels (e.g. "2026-W06") to lists of task titles
-        found under each "## Week of YYYY-MM-DD" header.
+        found under each "## Week of YYYY-MM-DD" or "## Archived ... (Work)"
+        header.
     """
     weeks: dict[str, list[str]] = {}
     if not archive_dir.exists() or not archive_dir.is_dir():
@@ -103,12 +109,12 @@ def generate_velocity_section(
     """Generate the 📊 Velocity section lines.
 
     Metrics:
-    - Completed: tasks with completed_date in the review week
-    - Added: new tasks that appeared in the current task list but weren't in
-      the previous week's archive snapshot (approximated from open task count
-      and archive history)
-    - Net: completed - added
-    - 4-week trend: completion counts per week from archive + current
+    - Completed: tasks with completed_date in the review week, plus tasks
+      from the current week's archive entry (archive date may differ from
+      actual completion date — see _parse_archive_weeks limitation)
+    - Added: not tracked (requires task snapshots)
+    - Net: not tracked (requires Added count)
+    - 4-week trend: completion counts per week from archive headers
     """
     lines: list[str] = []
 
