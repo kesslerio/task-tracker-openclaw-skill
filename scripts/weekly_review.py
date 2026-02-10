@@ -41,7 +41,12 @@ def _parse_archive_weeks(archive_dir: Path) -> dict[str, list[str]]:
 
         current_week_label: str | None = None
         for line in content.splitlines():
-            header_match = re.match(r'^## Week of (\d{4}-\d{2}-\d{2})', line)
+            # Match both archive header formats:
+            #   "## Week of YYYY-MM-DD"          (weekly_review.py archive)
+            #   "## Archived YYYY-MM-DD (Work)"   (tasks.py archive)
+            header_match = re.match(
+                r'^## (?:Week of|Archived)\s+(\d{4}-\d{2}-\d{2})', line
+            )
             if header_match:
                 try:
                     week_date = datetime.strptime(header_match.group(1), '%Y-%m-%d').date()
@@ -49,6 +54,11 @@ def _parse_archive_weeks(archive_dir: Path) -> dict[str, list[str]]:
                     current_week_label = f"{iso_year}-W{iso_week:02d}"
                 except ValueError:
                     current_week_label = None
+                continue
+
+            # Reset on any other ## header to avoid misattribution
+            if line.startswith('## '):
+                current_week_label = None
                 continue
 
             if current_week_label is None:
@@ -99,13 +109,22 @@ def generate_velocity_section(
     """
     lines: list[str] = []
 
-    # --- Completed this week ---
-    # Count from all tasks (done tasks are a subset of all tasks in parse_tasks)
-    all_tasks = tasks_data.get('all', [])
-    completed_this_week = _count_completed_in_range(all_tasks, week_start, week_end)
-
     # --- Archive data for trend ---
     archive_weeks = _parse_archive_weeks(archive_dir)
+
+    # --- Completed this week ---
+    # Count from live task data (completed_date timestamps)
+    all_tasks = tasks_data.get('all', [])
+    live_completed = _count_completed_in_range(all_tasks, week_start, week_end)
+
+    # Also check archive for this week (tasks may have been archived already)
+    iso_year_cur, iso_week_cur, _ = week_start.isocalendar()
+    current_label = f"{iso_year_cur}-W{iso_week_cur:02d}"
+    current_archive_count = len(archive_weeks.get(current_label, []))
+
+    # Use the higher of live vs archive (archive may contain tasks already
+    # removed from the active file; live may have tasks not yet archived)
+    completed_this_week = max(live_completed, current_archive_count)
 
     # Build 4-week rolling trend: 3 previous weeks + current week
     trend_counts: list[int] = []
@@ -115,12 +134,7 @@ def generate_velocity_section(
         label = f"{iso_year}-W{iso_week:02d}"
         trend_counts.append(len(archive_weeks.get(label, [])))
 
-    # Current week's completion count for the trend
-    iso_year_cur, iso_week_cur, _ = week_start.isocalendar()
-    current_label = f"{iso_year_cur}-W{iso_week_cur:02d}"
-    current_archive_count = len(archive_weeks.get(current_label, []))
-    # Use the higher of live count vs archive count (archive may not be written yet)
-    current_week_count = max(completed_this_week, current_archive_count)
+    current_week_count = completed_this_week
 
     # --- Added this week (approximation) ---
     # We can't perfectly track "added" without snapshots. Use archive weeks:
