@@ -56,6 +56,13 @@ def _resolve_log_dir(log_path: Optional[Union[str, Path]] = None) -> Optional[Pa
     return None
 
 
+class _ContextEncoder(json.JSONEncoder):
+    """JSON encoder that converts non-serializable objects to strings."""
+
+    def default(self, obj: object) -> str:
+        return str(obj)
+
+
 def _format_context(context: Optional[Dict[str, object]]) -> str:
     """Serialize context as a JSON object on an indented line.
 
@@ -71,7 +78,7 @@ def _format_context(context: Optional[Dict[str, object]]) -> str:
     if not cleaned:
         return ""
 
-    rendered = json.dumps(cleaned, ensure_ascii=False, separators=(", ", ": "), sort_keys=True)
+    rendered = json.dumps(cleaned, ensure_ascii=False, separators=(", ", ": "), sort_keys=True, cls=_ContextEncoder)
     # Sanitize to single line in case values contain newlines
     rendered = _sanitize_line(rendered)
     return f"  {rendered}\n"
@@ -161,7 +168,10 @@ def log_email_sent(
 def log_sms_sent(
     recipient: str, summary: Optional[str] = None, context: Optional[Dict[str, object]] = None
 ) -> bool:
-    effective_summary = summary.strip() if summary and summary.strip() else f"Sent SMS to {recipient}"
+    if summary and isinstance(summary, str) and summary.strip():
+        effective_summary = summary.strip()
+    else:
+        effective_summary = f"Sent SMS to {recipient}"
     return log_done(
         action="sms_sent",
         summary=effective_summary,
