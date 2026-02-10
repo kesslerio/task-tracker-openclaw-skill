@@ -10,6 +10,7 @@ This script can:
 
 import argparse
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -17,14 +18,16 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 # Regex patterns for common meeting note formats
 TASK_PATTERNS = [
+    # Assignee pattern with checkbox: "- [ ] @person: Task" (highest priority)
+    (r'-\s*\[\s*\]\s*@([\w.-]+):\s*(.+?)$', 'medium'),
+    # Assignee pattern: "@person: Task" or "- @person: Task"
+    (r'@([\w.-]+):\s*(.+?)$', 'medium'),
     # Markdown checkbox: "- [ ] Task" or "- [x] Task"
     (r'-\s*\[\s*\]\s*(.+?)$', 'medium'),
     # TODO marker: "TODO: Task" or "- TODO: Task"
     (r'(?:^-?\s*)?TODO:\s*(.+?)$', 'medium'),
     # Action marker: "Action: Task" or "- Action: Task"
     (r'(?:^-?\s*)?Action:\s*(.+?)$', 'medium'),
-    # Assignee pattern: "@person: Task" or "- @person: Task"
-    (r'@(\w+):\s*(.+?)$', 'medium'),
     # "Task:" prefix: "Task: Task description"
     (r'(?:^-?\s*)?Task:\s*(.+?)$', 'medium'),
     # Numbered list items that look like tasks (verb + noun)
@@ -73,18 +76,18 @@ def extract_tasks_local(text: str) -> list[dict]:
 
 def format_task_command(task: dict) -> str:
     """Format a task as a tasks.py add command."""
-    parts = [f'tasks.py add "{task["title"]}"']
+    parts = ['tasks.py', 'add', task["title"]]
     
     if task.get('priority') and task['priority'] != 'medium':
-        parts.append(f'--priority {task["priority"]}')
+        parts.extend(['--priority', task['priority']])
     
     if task.get('owner') and task['owner'] != 'martin':
-        parts.append(f'--owner {task["owner"]}')
+        parts.extend(['--owner', task['owner']])
     
     if task.get('due'):
-        parts.append(f'--due "{task["due"]}"')
+        parts.extend(['--due', task['due']])
     
-    return ' '.join(parts)
+    return shlex.join(parts)
 
 
 def extract_prompt(text: str) -> str:
