@@ -23,6 +23,8 @@ from utils import (
     regroup_by_effective_priority,
     escalation_suffix,
     recurrence_suffix,
+    parse_duration,
+    format_duration,
 )
 
 
@@ -41,34 +43,45 @@ def format_personal_standup(output: dict, date_display: str) -> str:
     
     # #1 Priority
     if output['priority']:
-        rec = recurrence_suffix(output['priority'])
-        lines.append(f"🎯 **#1 Priority:** {output['priority']['title']}{rec}")
+        priority = output['priority']
+        rec = recurrence_suffix(priority)
+        est = f" ({priority['estimate']})" if priority.get('estimate') else ""
+        lines.append(f"🎯 **#1 Priority:** {priority['title']}{rec}{est}")
         lines.append("")
     
     # Due Today
     if output['due_today']:
-        lines.append("⏰ **Due Today:**")
+        total_est = sum(parse_duration(t.get('estimate')) for t in output['due_today'])
+        est_str = f" [{format_duration(total_est)}]" if total_est > 0 else ""
+        lines.append(f"⏰ **Due Today:{est_str}**")
         for t in output['due_today']:
             rec = recurrence_suffix(t)
-            lines.append(f"  • {t['title']}{rec}")
+            est = f" ({t['estimate']})" if t.get('estimate') else ""
+            lines.append(f"  • {t['title']}{rec}{est}")
         lines.append("")
     
     # Q1 Must Do
     if output['q1']:
-        lines.append("🔴 **Must Do Today:**")
+        total_est = sum(parse_duration(t.get('estimate')) for t in output['q1'])
+        est_str = f" [{format_duration(total_est)}]" if total_est > 0 else ""
+        lines.append(f"🔴 **Must Do Today:{est_str}**")
         for t in output['q1']:
             esc = escalation_suffix(t)
             rec = recurrence_suffix(t)
-            lines.append(f"  • {t['title']}{esc}{rec}")
+            est = f" ({t['estimate']})" if t.get('estimate') else ""
+            lines.append(f"  • {t['title']}{esc}{rec}{est}")
         lines.append("")
     
     # Q2 Should Do
     if output['q2']:
-        lines.append("🟡 **Should Do This Week:**")
+        total_est = sum(parse_duration(t.get('estimate')) for t in output['q2'])
+        est_str = f" [{format_duration(total_est)}]" if total_est > 0 else ""
+        lines.append(f"🟡 **Should Do This Week:{est_str}**")
         for t in output['q2']:
             due_str = f" (🗓️{t['due']})" if t.get('due') else ""
             rec = recurrence_suffix(t)
-            lines.append(f"  • {t['title']}{due_str}{rec}")
+            est = f" ({t['estimate']})" if t.get('estimate') else ""
+            lines.append(f"  • {t['title']}{due_str}{rec}{est}")
         lines.append("")
     
     # Q3 Waiting On

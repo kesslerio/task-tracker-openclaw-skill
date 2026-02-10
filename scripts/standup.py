@@ -25,6 +25,8 @@ from utils import (
     regroup_by_effective_priority,
     escalation_suffix,
     recurrence_suffix,
+    parse_duration,
+    format_duration,
 )
 
 
@@ -32,7 +34,7 @@ def group_by_area(tasks):
     """Group tasks by area."""
     areas = {}
     for t in tasks:
-        area = t.get('area', 'Uncategorized')
+        area = t.get('area') or 'Uncategorized'
         if area not in areas:
             areas[area] = []
         areas[area].append(t)
@@ -224,40 +226,50 @@ def generate_standup(
     if output['priority']:
         priority = output['priority']
         rec = recurrence_suffix(priority)
-        lines.append(f"🎯 **#1 Priority:** {priority['title']}{rec}")
+        est = f" ({priority['estimate']})" if priority.get('estimate') else ""
+        lines.append(f"🎯 **#1 Priority:** {priority['title']}{rec}{est}")
         if priority.get('blocks'):
             lines.append(f"   ↳ Blocking: {priority['blocks']}")
         lines.append("")
     
     if output['due_today']:
-        lines.append("⏰ **Due Today:**")
+        total_est = sum(parse_duration(t.get('estimate')) for t in output['due_today'])
+        est_str = f" [{format_duration(total_est)}]" if total_est > 0 else ""
+        lines.append(f"⏰ **Due Today:{est_str}**")
         for t in output['due_today']:
             rec = recurrence_suffix(t)
-            lines.append(f"  • {t['title']}{rec}")
+            est = f" ({t['estimate']})" if t.get('estimate') else ""
+            lines.append(f"  • {t['title']}{rec}{est}")
         lines.append("")
     
     # Q1 - Urgent & Important
     if output['q1']:
-        lines.append("🔴 **Urgent & Important (Q1):**")
+        total_est = sum(parse_duration(t.get('estimate')) for t in output['q1'])
+        est_str = f" [{format_duration(total_est)}]" if total_est > 0 else ""
+        lines.append(f"🔴 **Urgent & Important (Q1):{est_str}**")
         by_area = group_by_area(output['q1'])
         for cat in sorted(by_area.keys()):
             lines.append(f"  **{cat}:**")
             for t in by_area[cat]:
                 esc = escalation_suffix(t)
                 rec = recurrence_suffix(t)
-                lines.append(f"    • {t['title']}{esc}{rec}")
+                est = f" ({t['estimate']})" if t.get('estimate') else ""
+                lines.append(f"    • {t['title']}{esc}{rec}{est}")
         lines.append("")
     
     # Q2 - Important, Not Urgent
     if output['q2']:
-        lines.append("🟡 **Important, Not Urgent (Q2):**")
+        total_est = sum(parse_duration(t.get('estimate')) for t in output['q2'])
+        est_str = f" [{format_duration(total_est)}]" if total_est > 0 else ""
+        lines.append(f"🟡 **Important, Not Urgent (Q2):{est_str}**")
         by_area = group_by_area(output['q2'])
         for cat in sorted(by_area.keys()):
             lines.append(f"  **{cat}:**")
             for t in by_area[cat]:
                 due_str = f" (🗓️{t['due']})" if t.get('due') else ""
                 rec = recurrence_suffix(t)
-                lines.append(f"    • {t['title']}{due_str}{rec}")
+                est = f" ({t['estimate']})" if t.get('estimate') else ""
+                lines.append(f"    • {t['title']}{due_str}{rec}{est}")
         lines.append("")
     
     # Q3 - Waiting/Blocked
