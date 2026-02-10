@@ -3,14 +3,15 @@
 Append completion events to a daily markdown log file.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
 import sys
 from datetime import datetime
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent))
+from typing import Dict, List, Optional, Union
 
 KNOWN_ACTIONS = {
     "email_sent",
@@ -21,7 +22,12 @@ KNOWN_ACTIONS = {
 }
 
 
-def _env_path(name: str) -> Path | None:
+def _sanitize_line(text: str) -> str:
+    """Strip newlines and control chars to prevent markdown injection."""
+    return text.replace("\r", "").replace("\n", " ").strip()
+
+
+def _env_path(name: str) -> Optional[Path]:
     raw_value = os.getenv(name)
     if not raw_value:
         return None
@@ -31,7 +37,7 @@ def _env_path(name: str) -> Path | None:
     return Path(cleaned).expanduser()
 
 
-def _resolve_log_dir(log_path: str | Path | None) -> Path | None:
+def _resolve_log_dir(log_path: Optional[Union[str, Path]] = None) -> Optional[Path]:
     if log_path:
         return Path(log_path).expanduser()
 
@@ -50,32 +56,32 @@ def _resolve_log_dir(log_path: str | Path | None) -> Path | None:
     return None
 
 
-def _format_context(context: dict | None) -> str:
+def _format_context(context: Optional[Dict[str, object]]) -> str:
+    """Serialize context as a JSON object on an indented line.
+
+    Uses JSON for unambiguous round-tripping (no delimiter collisions).
+    """
     if not context:
         return ""
 
-    parts: list[str] = []
-    for key in sorted(context.keys()):
-        value = context[key]
-        if value is None:
-            continue
-        if isinstance(value, (dict, list)):
-            rendered = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-        else:
-            rendered = str(value)
-        parts.append(f"{key}={rendered}")
-
-    if not parts:
+    # Filter out None values and coerce keys to str for safe sorting
+    cleaned = {
+        str(k): v for k, v in context.items() if v is not None
+    }
+    if not cleaned:
         return ""
 
-    return f"  details: {', '.join(parts)}\n"
+    rendered = json.dumps(cleaned, ensure_ascii=False, separators=(", ", ": "), sort_keys=True)
+    # Sanitize to single line in case values contain newlines
+    rendered = _sanitize_line(rendered)
+    return f"  {rendered}\n"
 
 
 def log_done(
     action: str,
     summary: str,
-    context: dict | None = None,
-    log_path: str | Path | None = None,
+    context: Optional[Dict[str, object]] = None,
+    log_path: Optional[Union[str, Path]] = None,
 ) -> bool:
     """
     Log a completed action to today's markdown file.
@@ -89,8 +95,8 @@ def log_done(
     if context is not None and not isinstance(context, dict):
         raise ValueError("context must be a dict when provided")
 
-    normalized_action = action.strip()
-    normalized_summary = summary.strip()
+    normalized_action = _sanitize_line(action)
+    normalized_summary = _sanitize_line(summary)
 
     if normalized_action not in KNOWN_ACTIONS:
         print(
@@ -115,14 +121,13 @@ def log_done(
     context_line = _format_context(context)
 
     try:
-        # Open in append mode for safer concurrent writes.
-        with log_file.open("a+", encoding="utf-8") as handle:
-            handle.seek(0, os.SEEK_END)
-            if handle.tell() == 0:
-                handle.write(f"## {date_str}\n\n")
-            handle.write(f"- {timestamp} ✅ {normalized_summary}\n")
-            if context_line:
-                handle.write(context_line)
+        # Build the full entry as a single string so append is atomic-ish
+        entry = f"- {timestamp} ✅ {normalized_summary}\n"
+        if context_line:
+            entry += context_line
+
+        with log_file.open("a", encoding="utf-8") as handle:
+            handle.write(entry)
     except (PermissionError, OSError) as exc:
         print(f"Error: cannot write log file '{log_file}': {exc}", file=sys.stderr)
         return False
@@ -130,7 +135,7 @@ def log_done(
     return True
 
 
-def _merge_context(base: dict | None, extra: dict) -> dict:
+def _merge_context(base: Optional[Dict[str, object]], extra: dict) -> dict:
     merged: dict = {}
     if base:
         merged.update(base)
@@ -138,8 +143,10 @@ def _merge_context(base: dict | None, extra: dict) -> dict:
     return merged
 
 
-def log_email_sent(recipient: str, subject: str | None = None, context: dict | None = None) -> bool:
-    details = {"recipient": recipient}
+def log_email_sent(
+    recipient: str, subject: Optional[str] = None, context: Optional[Dict[str, object]] = None
+) -> bool:
+    details: dict = {"recipient": recipient}
     summary = f"Sent email to {recipient}"
     if subject:
         details["subject"] = subject
@@ -151,8 +158,10 @@ def log_email_sent(recipient: str, subject: str | None = None, context: dict | N
     )
 
 
-def log_sms_sent(recipient: str, summary: str | None = None, context: dict | None = None) -> bool:
-    effective_summary = summary.strip() if summary else f"Sent SMS to {recipient}"
+def log_sms_sent(
+    recipient: str, summary: Optional[str] = None, context: Optional[Dict[str, object]] = None
+) -> bool:
+    effective_summary = summary.strip() if summary and summary.strip() else f"Sent SMS to {recipient}"
     return log_done(
         action="sms_sent",
         summary=effective_summary,
@@ -160,7 +169,9 @@ def log_sms_sent(recipient: str, summary: str | None = None, context: dict | Non
     )
 
 
-def log_crm_update(record: str, action_detail: str, context: dict | None = None) -> bool:
+def log_crm_update(
+    record: str, action_detail: str, context: Optional[Dict[str, object]] = None
+) -> bool:
     summary = f"Updated CRM record {record}: {action_detail}"
     return log_done(
         action="crm_update",
@@ -169,10 +180,12 @@ def log_crm_update(record: str, action_detail: str, context: dict | None = None)
     )
 
 
-def log_deal_update(deal: str, stage: str | None = None, context: dict | None = None) -> bool:
+def log_deal_update(
+    deal: str, stage: Optional[str] = None, context: Optional[Dict[str, object]] = None
+) -> bool:
     if stage:
         summary = f"Updated deal {deal} to stage {stage}"
-        extra = {"deal": deal, "stage": stage}
+        extra: dict = {"deal": deal, "stage": stage}
     else:
         summary = f"Updated deal {deal}"
         extra = {"deal": deal}
@@ -183,7 +196,7 @@ def log_deal_update(deal: str, stage: str | None = None, context: dict | None = 
     )
 
 
-def _parse_context(context_raw: str | None) -> dict | None:
+def _parse_context(context_raw: Optional[str]) -> Optional[dict]:
     if not context_raw:
         return None
     try:
