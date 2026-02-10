@@ -57,8 +57,14 @@ case "${1:-}" in
       echo "Error: failed to list tasks" >&2
       exit 1
     fi
-    # Extract only lines with ✅ (completed tasks), not surrounding context
-    echo "$output" | grep "✅" | head -20 || echo "No completed tasks found"
+    # Extract only lines with ✅ (completed tasks)
+    # Use subshell to avoid SIGPIPE exit with pipefail when head truncates
+    completed="$(echo "$output" | grep "✅" || true)"
+    if [ -n "$completed" ]; then
+      echo "$completed" | head -20
+    else
+      echo "No completed tasks found"
+    fi
     ;;
   done7d)
     # Show all completed tasks (full view, limited to 50 lines).
@@ -69,8 +75,13 @@ case "${1:-}" in
       echo "Error: failed to list tasks" >&2
       exit 1
     fi
-    # Extract only lines with ✅ (completed tasks), not surrounding context
-    echo "$output" | grep "✅" | head -50 || echo "No completed tasks found"
+    # Extract only lines with ✅ (completed tasks)
+    completed="$(echo "$output" | grep "✅" || true)"
+    if [ -n "$completed" ]; then
+      echo "$completed" | head -50
+    else
+      echo "No completed tasks found"
+    fi
     ;;
   *)
     echo "Usage: $0 {daily|weekly|done24h|done7d}"
