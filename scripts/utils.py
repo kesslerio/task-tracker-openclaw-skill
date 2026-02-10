@@ -160,6 +160,7 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
             blocks = None
             task_type = None
             recur = None
+            estimate = None
             
             if format == 'obsidian':
                 # Parse emoji date
@@ -192,6 +193,10 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 recur_match = re.search(r'(?<!\w)recur::\s*(?!(\s|\w+::))([^\n]+?)(?=\s+\w+::|\s*🗓️|$)', rest)
                 if recur_match:
                     recur = recur_match.group(2).strip()
+
+                estimate_match = re.search(r'(?<!\w)estimate::\s*(?!(\s|\w+::))([^\n]+?)(?=\s+\w+::|\s*🗓️|$)', rest)
+                if estimate_match:
+                    estimate = estimate_match.group(2).strip()
             
             current_task = {
                 'title': title,
@@ -204,6 +209,7 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 'blocks': blocks,
                 'type': task_type,
                 'recur': recur,
+                'estimate': estimate,
                 'completed_date': completed_date,
                 'raw_line': line,
             }
@@ -346,6 +352,53 @@ def next_recurrence_date(recur_value: str, from_date) -> str:
         raise ValueError(f"unsupported recurrence pattern: {recur_value}")
 
     return next_date.strftime('%Y-%m-%d')
+
+
+def parse_duration(duration_str: str | None) -> int:
+    """Parse duration string (e.g. '2h', '30m', '1.5h') into minutes."""
+    if not duration_str:
+        return 0
+
+    duration_str = duration_str.lower().strip()
+    total_minutes = 0
+
+    # Match hours and minutes (e.g. '2h 30m', '1.5h')
+    parts = re.findall(r'([\d.]+)([hm])', duration_str)
+    if not parts:
+        # Try pure numbers as minutes
+        try:
+            return int(float(duration_str))
+        except ValueError:
+            return 0
+
+    for val, unit in parts:
+        try:
+            v = float(val)
+            if unit == 'h':
+                total_minutes += int(v * 60)
+            elif unit == 'm':
+                total_minutes += int(v)
+        except ValueError:
+            continue
+
+    return total_minutes
+
+
+def format_duration(minutes: int) -> str:
+    """Format minutes into a human-readable string (e.g. '2h 30m')."""
+    if minutes <= 0:
+        return ""
+
+    h = minutes // 60
+    m = minutes % 60
+
+    parts = []
+    if h > 0:
+        parts.append(f"{h}h")
+    if m > 0:
+        parts.append(f"{m}m")
+
+    return " ".join(parts)
 
 
 def get_missed_tasks(tasks_data: dict, lookback_days: int = 1, reference_date: str = None) -> list:
