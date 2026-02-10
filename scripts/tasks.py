@@ -24,6 +24,7 @@ from utils import (
     parse_tasks,
     load_tasks,
     check_due_date,
+    next_recurrence_date,
     get_current_quarter,
     ARCHIVE_DIR,
 )
@@ -188,13 +189,48 @@ def done_task(args):
         return
     
     new_line = old_line.replace('- [ ]', '- [x]', 1)
+    completed_today = datetime.now().strftime('%Y-%m-%d')
     if not re.search(r'✅\s*\d{4}-\d{2}-\d{2}\s*$', new_line):
-        completed_today = datetime.now().strftime('%Y-%m-%d')
         # Strip bare ✅ (without date) before appending timestamped one
         new_line = re.sub(r'\s*✅\s*$', '', new_line)
         new_line = f"{new_line.rstrip()} ✅ {completed_today}"
-    
-    new_content = content.replace(old_line, new_line)
+
+    new_content = content.replace(old_line, new_line, 1)
+
+    # If this task recurs, create the next instance directly below the completed line.
+    recur_value = (task.get('recur') or '').strip()
+    if recur_value:
+        from_date = task.get('due') or completed_today
+        try:
+            next_due = next_recurrence_date(recur_value, from_date)
+            next_task_line = old_line
+
+            if re.search(r'🗓️\d{4}-\d{2}-\d{2}', next_task_line):
+                next_task_line = re.sub(
+                    r'🗓️\d{4}-\d{2}-\d{2}',
+                    f'🗓️{next_due}',
+                    next_task_line,
+                    count=1,
+                )
+            else:
+                next_task_line = f"{next_task_line.rstrip()} 🗓️{next_due}"
+
+            done_line_with_nl = f"{new_line}\n"
+            if done_line_with_nl in new_content:
+                new_content = new_content.replace(
+                    done_line_with_nl,
+                    f"{new_line}\n{next_task_line}\n",
+                    1,
+                )
+            else:
+                new_content = new_content.replace(
+                    new_line,
+                    f"{new_line}\n{next_task_line}",
+                    1,
+                )
+        except ValueError as e:
+            print(f"⚠️ Could not create recurring task for '{task['title']}': {e}")
+
     tasks_file.write_text(new_content)
     task_type = "Personal" if args.personal else "Work"
     print(f"✅ Completed {task_type} task: {task['title']}")

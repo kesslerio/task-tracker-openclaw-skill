@@ -19,7 +19,13 @@ from standup_common import (
     get_calendar_events,
     resolve_standup_date,
 )
-from utils import load_tasks, get_missed_tasks_bucketed, regroup_by_effective_priority, escalation_suffix
+from utils import (
+    load_tasks,
+    get_missed_tasks_bucketed,
+    regroup_by_effective_priority,
+    escalation_suffix,
+    recurrence_suffix,
+)
 
 
 def group_by_area(tasks):
@@ -50,7 +56,8 @@ def format_split_standup(output: dict, date_display: str) -> list:
         for cat in sorted(by_area.keys()):
             msg1_lines.append(f"**{cat}:**")
             for t in by_area[cat]:
-                msg1_lines.append(f"  • {t['title']}")
+                rec = recurrence_suffix(t)
+                msg1_lines.append(f"  • {t['title']}{rec}")
             msg1_lines.append("")
     else:
         msg1_lines.append("_No completed items_")
@@ -73,7 +80,8 @@ def format_split_standup(output: dict, date_display: str) -> list:
     # #1 Priority
     if output['priority']:
         priority = output['priority']
-        msg3_lines.append(f"🎯 **#1 Priority:** {priority['title']}")
+        rec = recurrence_suffix(priority)
+        msg3_lines.append(f"🎯 **#1 Priority:** {priority['title']}{rec}")
         if priority.get('blocks'):
             msg3_lines.append(f"   ↳ Blocking: {priority['blocks']}")
         msg3_lines.append("")
@@ -82,7 +90,8 @@ def format_split_standup(output: dict, date_display: str) -> list:
     if output['due_today']:
         msg3_lines.append("⏰ **Due Today:**")
         for t in output['due_today']:
-            msg3_lines.append(f"  • {t['title']}")
+            rec = recurrence_suffix(t)
+            msg3_lines.append(f"  • {t['title']}{rec}")
         msg3_lines.append("")
     
     # Q1 - Urgent & Important
@@ -93,7 +102,8 @@ def format_split_standup(output: dict, date_display: str) -> list:
             msg3_lines.append(f"  **{area}:**")
             for t in by_area[area]:
                 esc = escalation_suffix(t)
-                msg3_lines.append(f"    • {t['title']}{esc}")
+                rec = recurrence_suffix(t)
+                msg3_lines.append(f"    • {t['title']}{esc}{rec}")
         msg3_lines.append("")
     
     # Q2 - Important, Not Urgent
@@ -104,7 +114,8 @@ def format_split_standup(output: dict, date_display: str) -> list:
             msg3_lines.append(f"  **{area}:**")
             for t in by_area[area]:
                 due_str = f" (🗓️{t['due']})" if t.get('due') else ""
-                msg3_lines.append(f"    • {t['title']}{due_str}")
+                rec = recurrence_suffix(t)
+                msg3_lines.append(f"    • {t['title']}{due_str}{rec}")
         msg3_lines.append("")
     
     # Q3 - Waiting/Blocked
@@ -113,7 +124,8 @@ def format_split_standup(output: dict, date_display: str) -> list:
         for t in output['q3']:
             blocks_str = f" → {t['blocks']}" if t.get('blocks') else ""
             esc = escalation_suffix(t)
-            msg3_lines.append(f"  • {t['title']}{blocks_str}{esc}")
+            rec = recurrence_suffix(t)
+            msg3_lines.append(f"  • {t['title']}{blocks_str}{esc}{rec}")
         msg3_lines.append("")
     
     # Team tasks
@@ -121,7 +133,8 @@ def format_split_standup(output: dict, date_display: str) -> list:
         msg3_lines.append("👥 **Team Tasks:**")
         for t in output['team']:
             owner_str = f" ({t['owner']})" if t.get('owner') else ""
-            msg3_lines.append(f"  • {t['title']}{owner_str}")
+            rec = recurrence_suffix(t)
+            msg3_lines.append(f"  • {t['title']}{rec}{owner_str}")
     
     messages.append('\n'.join(msg3_lines).strip())
     
@@ -210,7 +223,8 @@ def generate_standup(
     
     if output['priority']:
         priority = output['priority']
-        lines.append(f"🎯 **#1 Priority:** {priority['title']}")
+        rec = recurrence_suffix(priority)
+        lines.append(f"🎯 **#1 Priority:** {priority['title']}{rec}")
         if priority.get('blocks'):
             lines.append(f"   ↳ Blocking: {priority['blocks']}")
         lines.append("")
@@ -218,7 +232,8 @@ def generate_standup(
     if output['due_today']:
         lines.append("⏰ **Due Today:**")
         for t in output['due_today']:
-            lines.append(f"  • {t['title']}")
+            rec = recurrence_suffix(t)
+            lines.append(f"  • {t['title']}{rec}")
         lines.append("")
     
     # Q1 - Urgent & Important
@@ -229,7 +244,8 @@ def generate_standup(
             lines.append(f"  **{cat}:**")
             for t in by_area[cat]:
                 esc = escalation_suffix(t)
-                lines.append(f"    • {t['title']}{esc}")
+                rec = recurrence_suffix(t)
+                lines.append(f"    • {t['title']}{esc}{rec}")
         lines.append("")
     
     # Q2 - Important, Not Urgent
@@ -240,7 +256,8 @@ def generate_standup(
             lines.append(f"  **{cat}:**")
             for t in by_area[cat]:
                 due_str = f" (🗓️{t['due']})" if t.get('due') else ""
-                lines.append(f"    • {t['title']}{due_str}")
+                rec = recurrence_suffix(t)
+                lines.append(f"    • {t['title']}{due_str}{rec}")
         lines.append("")
     
     # Q3 - Waiting/Blocked
@@ -249,7 +266,8 @@ def generate_standup(
         for t in output['q3']:
             blocks_str = f" → {t['blocks']}" if t.get('blocks') else ""
             esc = escalation_suffix(t)
-            lines.append(f"  • {t['title']}{blocks_str}{esc}")
+            rec = recurrence_suffix(t)
+            lines.append(f"  • {t['title']}{blocks_str}{esc}{rec}")
         lines.append("")
     
     # Team tasks
@@ -257,13 +275,15 @@ def generate_standup(
         lines.append("👥 **Team Tasks:**")
         for t in output['team']:
             owner_str = f" ({t['owner']})" if t.get('owner') else ""
-            lines.append(f"  • {t['title']}{owner_str}")
+            rec = recurrence_suffix(t)
+            lines.append(f"  • {t['title']}{rec}{owner_str}")
         lines.append("")
     
     if output['completed']:
         lines.append(f"✅ **Recently Completed:** ({len(output['completed'])} items)")
         for t in output['completed'][:5]:  # Limit to 5
-            lines.append(f"  • {t['title']}")
+            rec = recurrence_suffix(t)
+            lines.append(f"  • {t['title']}{rec}")
         if len(output['completed']) > 5:
             lines.append(f"  • ... and {len(output['completed']) - 5} more")
     
