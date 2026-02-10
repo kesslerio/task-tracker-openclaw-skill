@@ -385,6 +385,123 @@ def get_missed_tasks_bucketed(tasks_data: dict, reference_date: str = None) -> d
     return buckets
 
 
+def effective_priority(task: dict, reference_date=None) -> dict:
+    """Return display priority for a task, escalating overdue tasks.
+
+    Escalation rules (display-only — never modifies the task file):
+    - 🟡 (q2) overdue >3 days  → display as 🟠 (q3)
+    - 🟡 (q2) overdue >7 days  → display as 🔴 (q1)
+    - 🟠 (q3) overdue >14 days → display as 🔴 (q1)
+
+    Args:
+        task: Task dict with at least 'section' and 'due' keys.
+        reference_date: A datetime.date or YYYY-MM-DD string. Defaults to today.
+
+    Returns:
+        dict with keys:
+        - section: the effective display section (e.g. 'q1')
+        - escalated: True if priority was escalated
+        - original_section: the original section from the task
+        - indicator: a human-readable escalation note, or empty string
+    """
+    from datetime import datetime as _dt
+
+    section = task.get('section')
+    due_str = task.get('due')
+    original_section = section
+
+    # Resolve reference date
+    if reference_date is None:
+        ref = _dt.now().date()
+    elif isinstance(reference_date, str):
+        try:
+            ref = _dt.strptime(reference_date, '%Y-%m-%d').date()
+        except ValueError:
+            ref = _dt.now().date()
+    else:
+        ref = reference_date
+
+    # Only escalate open tasks with a due date in eligible sections
+    if task.get('done') or not due_str or section not in ('q2', 'q3'):
+        return {
+            'section': section,
+            'escalated': False,
+            'original_section': original_section,
+            'indicator': '',
+        }
+
+    try:
+        due_date = _dt.strptime(due_str, '%Y-%m-%d').date()
+    except ValueError:
+        return {
+            'section': section,
+            'escalated': False,
+            'original_section': original_section,
+            'indicator': '',
+        }
+
+    overdue_days = (ref - due_date).days
+    if overdue_days <= 0:
+        return {
+            'section': section,
+            'escalated': False,
+            'original_section': original_section,
+            'indicator': '',
+        }
+
+    section_emoji = {'q1': '🔴', 'q2': '🟡', 'q3': '🟠'}
+    original_emoji = section_emoji.get(original_section, '')
+
+    new_section = section  # default: no change
+
+    if section == 'q2':
+        if overdue_days > 7:
+            new_section = 'q1'
+        elif overdue_days > 3:
+            new_section = 'q3'
+    elif section == 'q3':
+        if overdue_days > 14:
+            new_section = 'q1'
+
+    if new_section != section:
+        return {
+            'section': new_section,
+            'escalated': True,
+            'original_section': original_section,
+            'indicator': f'⬆️ escalated from {original_emoji}',
+        }
+
+    return {
+        'section': section,
+        'escalated': False,
+        'original_section': original_section,
+        'indicator': '',
+    }
+
+
+def regroup_by_effective_priority(tasks_data: dict, reference_date=None) -> dict:
+    """Regroup q1/q2/q3 tasks by their effective (escalated) display priority.
+
+    Returns dict with keys 'q1', 'q2', 'q3'. Each task is a shallow copy
+    with a transient '_escalation_indicator' key — original task dicts are
+    not mutated.
+    """
+    regrouped = {'q1': [], 'q2': [], 'q3': []}
+    for section_key in ('q1', 'q2', 'q3'):
+        for task in tasks_data.get(section_key, []):
+            eff = effective_priority(task, reference_date)
+            # Shallow copy to avoid mutating the shared task dict
+            display_task = {**task, '_escalation_indicator': eff['indicator']}
+            regrouped[eff['section']].append(display_task)
+    return regrouped
+
+
+def escalation_suffix(task: dict) -> str:
+    """Return escalation indicator suffix for a task, if any."""
+    indicator = task.get('_escalation_indicator', '')
+    return f" {indicator}" if indicator else ""
+
+
 def get_section_display_name(section: str, personal: bool = False) -> str:
     """Get human-readable section name."""
     section_names = {

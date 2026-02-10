@@ -17,7 +17,7 @@ from standup_common import (
     get_calendar_events,
     resolve_standup_date,
 )
-from utils import load_tasks, get_missed_tasks_bucketed
+from utils import load_tasks, get_missed_tasks_bucketed, regroup_by_effective_priority, escalation_suffix
 
 
 def format_personal_standup(output: dict, date_display: str) -> str:
@@ -49,7 +49,8 @@ def format_personal_standup(output: dict, date_display: str) -> str:
     if output['q1']:
         lines.append("🔴 **Must Do Today:**")
         for t in output['q1']:
-            lines.append(f"  • {t['title']}")
+            esc = escalation_suffix(t)
+            lines.append(f"  • {t['title']}{esc}")
         lines.append("")
     
     # Q2 Should Do
@@ -64,7 +65,8 @@ def format_personal_standup(output: dict, date_display: str) -> str:
     if output['q3']:
         lines.append("🟠 **Waiting On:**")
         for t in output['q3']:
-            lines.append(f"  • {t['title']}")
+            esc = escalation_suffix(t)
+            lines.append(f"  • {t['title']}{esc}")
         lines.append("")
     
     # Completed
@@ -90,6 +92,9 @@ def generate_personal_standup(
     standup_date = resolve_standup_date(date_str)
     date_display = standup_date.strftime("%A, %B %d")
     
+    # Apply display-only priority escalation
+    regrouped = regroup_by_effective_priority(tasks_data, reference_date=standup_date)
+
     # Build output using new task structure
     output = {
         'date': str(standup_date),
@@ -97,17 +102,17 @@ def generate_personal_standup(
         'calendar': get_calendar_events(),
         'priority': None,
         'due_today': tasks_data['due_today'],
-        'q1': tasks_data['q1'],
-        'q2': tasks_data['q2'],
-        'q3': tasks_data['q3'],
+        'q1': regrouped['q1'],
+        'q2': regrouped['q2'],
+        'q3': regrouped['q3'],
         'completed': tasks_data['done'],
     }
     
     # #1 Priority: first Q1 item, or first Q2 if no Q1
-    if tasks_data['q1']:
-        output['priority'] = tasks_data['q1'][0]
-    elif tasks_data['q2']:
-        output['priority'] = tasks_data['q2'][0]
+    if regrouped['q1']:
+        output['priority'] = regrouped['q1'][0]
+    elif regrouped['q2']:
+        output['priority'] = regrouped['q2'][0]
     
     if json_output:
         return output
