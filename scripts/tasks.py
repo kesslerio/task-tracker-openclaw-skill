@@ -241,7 +241,7 @@ def main():
     # List command
     list_parser = subparsers.add_parser('list', help='List tasks')
     list_parser.add_argument('--priority', choices=['high', 'medium', 'low'])
-    list_parser.add_argument('--due', choices=['today', 'this-week', 'overdue'])
+    list_parser.add_argument('--due', choices=['today', 'this-week', 'overdue', 'due-or-overdue'])
     list_parser.set_defaults(func=list_tasks)
     
     # Add command

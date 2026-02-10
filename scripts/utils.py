@@ -163,11 +163,11 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 if goal_match:
                     goal = goal_match.group(1).strip()
                 
-                owner_match = re.search(r'owner::\s*([^\n]+?)(?=\s+\w+::|$)', rest)
+                owner_match = re.search(r'owner::\s*(\S.*?)(?=\s+\w+::|$)', rest)
                 if owner_match:
                     owner = owner_match.group(1).strip()
 
-                blocks_match = re.search(r'blocks::\s*([^\n]+?)(?=\s+\w+::|$)', rest)
+                blocks_match = re.search(r'blocks::\s*(\S.*?)(?=\s+\w+::|$)', rest)
                 if blocks_match:
                     blocks = blocks_match.group(1).strip()
             
