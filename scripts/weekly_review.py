@@ -272,14 +272,15 @@ def generate_weekly_review(week: str | None = None, archive: bool = False) -> st
             end_date=notes_end,
         )
         done_titles = [
-            task["title"].strip().casefold()
+            task["title"].strip()
             for task in done_tasks
             if task.get("title")
         ]
+        done_titles = [t.casefold() for t in done_titles if t]  # Strip then filter empty
 
         for action in notes_actions:
             action_lower = action.casefold()
-            if any(action_lower in title or title in action_lower for title in done_titles):
+            if any(action_lower == title for title in done_titles):
                 continue
             untracked_wins.append(action)
 
