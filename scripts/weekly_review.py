@@ -41,11 +41,11 @@ def _parse_archive_weeks(archive_dir: Path) -> dict[str, list[str]]:
 
     for archive_file in sorted(archive_dir.glob("ARCHIVE-*.md")):
         try:
-            content = archive_file.read_text()
-        except (PermissionError, OSError):
+            content = archive_file.read_text(encoding='utf-8')
+        except (PermissionError, OSError, UnicodeDecodeError):
             continue
 
-        current_week_label: str | None = None
+        current_header_week: str | None = None
         for line in content.splitlines():
             # Match both archive header formats (work only):
             #   "## Week of YYYY-MM-DD"          (weekly_review.py archive — always work)
@@ -60,24 +60,38 @@ def _parse_archive_weeks(archive_dir: Path) -> dict[str, list[str]]:
                 try:
                     week_date = datetime.strptime(date_str, '%Y-%m-%d').date()
                     iso_year, iso_week, _ = week_date.isocalendar()
-                    current_week_label = f"{iso_year}-W{iso_week:02d}"
+                    current_header_week = f"{iso_year}-W{iso_week:02d}"
                 except ValueError:
-                    current_week_label = None
+                    current_header_week = None
                 continue
 
             # Reset on any other ## header to avoid misattribution
             if line.startswith('## '):
-                current_week_label = None
+                current_header_week = None
                 continue
 
-            if current_week_label is None:
-                continue
-
-            task_match = re.match(r'^- ✅ \*\*(.+?)\*\*', line)
+            # Look for completed task line: - ✅ **Title** ... ✅ YYYY-MM-DD
+            task_match = re.match(r'^- ✅ \*\*(.+?)\*\*(.*)$', line)
             if task_match:
-                if current_week_label not in weeks:
-                    weeks[current_week_label] = []
-                weeks[current_week_label].append(task_match.group(1).strip())
+                title = task_match.group(1).strip()
+                rest = task_match.group(2)
+                
+                # Priority: use completion timestamp if present (more accurate)
+                # Fallback: use header week (archive date)
+                task_week = current_header_week
+                completed_match = re.search(r'✅\s*(\d{4}-\d{2}-\d{2})\s*$', rest)
+                if completed_match:
+                    try:
+                        c_date = datetime.strptime(completed_match.group(1), '%Y-%m-%d').date()
+                        iso_year, iso_week, _ = c_date.isocalendar()
+                        task_week = f"{iso_year}-W{iso_week:02d}"
+                    except ValueError:
+                        pass
+
+                if task_week:
+                    if task_week not in weeks:
+                        weeks[task_week] = []
+                    weeks[task_week].append(title)
 
     return weeks
 
