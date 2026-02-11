@@ -19,6 +19,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+from daily_notes import extract_completed_tasks
+from log_done import log_task_completed
 from utils import (
     get_tasks_file,
     get_section_display_name,
@@ -81,6 +83,20 @@ def list_tasks(args):
                 continue
             if parsed_date >= cutoff_date:
                 recent_done.append(task)
+
+        # Augment with daily notes completions
+        notes_dir_raw = os.getenv("TASK_TRACKER_DAILY_NOTES_DIR")
+        if notes_dir_raw:
+            notes_tasks = extract_completed_tasks(
+                notes_dir=Path(notes_dir_raw),
+                start_date=cutoff_date,
+                end_date=datetime.now().date(),
+            )
+            board_titles = {t['title'].casefold() for t in recent_done}
+            for nt in notes_tasks:
+                if nt['title'].casefold() not in board_titles:
+                    recent_done.append(nt)
+
         filtered = recent_done
     
     if not filtered:
@@ -156,52 +172,70 @@ def add_task(args):
         print(f"⚠️ Could not find section matching '{priority_pattern}'. Add manually.")
 
 
+def _remove_task_line(content: str, raw_line: str) -> str:
+    """Remove a task line and any indented continuation lines below it."""
+    lines = content.split('\n')
+    result: list[str] = []
+    skip_continuations = False
+    for line in lines:
+        if skip_continuations:
+            if line.startswith('  ') and not re.match(r'^- \[', line):
+                continue  # skip continuation line
+            skip_continuations = False
+        if line == raw_line:
+            skip_continuations = True
+            continue
+        result.append(line)
+    return '\n'.join(result)
+
+
 def done_task(args):
-    """Mark a task as done using fuzzy matching."""
+    """Complete a task: log to daily notes and remove from the board."""
     tasks_file, format = get_tasks_file(args.personal)
-    
+
     if not tasks_file.exists():
         print(f"❌ Tasks file not found: {tasks_file}")
         return
-    
+
     content = tasks_file.read_text()
     tasks_data = parse_tasks(content, args.personal, format)
     tasks = tasks_data['all']
-    
+
     query = args.query.lower()
     matches = [t for t in tasks if query in t['title'].lower() and not t['done']]
-    
+
     if not matches:
         print(f"No matching task found for: {args.query}")
         return
-    
+
     if len(matches) > 1:
         print(f"Multiple matches found:")
         for i, t in enumerate(matches, 1):
             print(f"  {i}. {t['title']}")
         print("\nBe more specific.")
         return
-    
+
     task = matches[0]
-    
-    # Update in content - use raw_line (single line)
+
     old_line = task.get('raw_line', '')
     if not old_line:
         print("⚠️ Could not find task line to update.")
         return
-    
-    new_line = old_line.replace('- [ ]', '- [x]', 1)
+
+    # Log completion to daily notes
+    log_task_completed(
+        title=task['title'],
+        section=task.get('section'),
+        area=task.get('area'),
+        due=task.get('due'),
+        recur=task.get('recur'),
+    )
+
     completed_today = datetime.now().strftime('%Y-%m-%d')
-    if not re.search(r'✅\s*\d{4}-\d{2}-\d{2}\s*$', new_line):
-        # Strip bare ✅ (without date) before appending timestamped one
-        new_line = re.sub(r'\s*✅\s*$', '', new_line)
-        new_line = f"{new_line.rstrip()} ✅ {completed_today}"
-
-    new_content = content.replace(old_line, new_line, 1)
-
-    # If this task recurs, create the next instance directly below the completed line.
     recur_value = (task.get('recur') or '').strip()
+
     if recur_value:
+        # Recurring: replace with next instance (no completed line on board)
         from_date = task.get('due') or completed_today
         try:
             next_due = next_recurrence_date(recur_value, from_date)
@@ -215,7 +249,6 @@ def done_task(args):
                     count=1,
                 )
             else:
-                # Insert date before inline fields to avoid corrupting field values
                 inline_field_match = re.search(r'\s+\w+::', next_task_line)
                 if inline_field_match:
                     pos = inline_field_match.start()
@@ -223,21 +256,13 @@ def done_task(args):
                 else:
                     next_task_line = f"{next_task_line.rstrip()} 🗓️{next_due}"
 
-            done_line_with_nl = f"{new_line}\n"
-            if done_line_with_nl in new_content:
-                new_content = new_content.replace(
-                    done_line_with_nl,
-                    f"{new_line}\n{next_task_line}\n",
-                    1,
-                )
-            else:
-                new_content = new_content.replace(
-                    new_line,
-                    f"{new_line}\n{next_task_line}",
-                    1,
-                )
+            new_content = content.replace(old_line, next_task_line, 1)
         except ValueError as e:
             print(f"⚠️ Could not create recurring task for '{task['title']}': {e}")
+            new_content = _remove_task_line(content, old_line)
+    else:
+        # Non-recurring: remove the task line entirely
+        new_content = _remove_task_line(content, old_line)
 
     tasks_file.write_text(new_content)
     task_type = "Personal" if args.personal else "Work"
@@ -267,49 +292,82 @@ def show_blockers(args):
 
 
 def archive_done(args):
-    """Archive completed tasks to quarterly file."""
-    tasks_file, format = get_tasks_file(args.personal)
-    
-    if not tasks_file.exists():
-        print(f"❌ Tasks file not found: {tasks_file}")
+    """Archive completed tasks from daily notes into quarterly file.
+
+    Also cleans any stale [x] lines still on the board (backward compat).
+    """
+    notes_dir_raw = os.getenv("TASK_TRACKER_DAILY_NOTES_DIR")
+    if not notes_dir_raw:
+        print(
+            "❌ TASK_TRACKER_DAILY_NOTES_DIR is not set. "
+            "Set it to the directory containing your daily notes (YYYY-MM-DD.md).",
+            file=sys.stderr,
+        )
         return
-    
-    content = tasks_file.read_text()
-    tasks_data = parse_tasks(content, args.personal, format)
-    done_tasks = tasks_data['done']
-    
-    if not done_tasks:
+
+    # Collect completions from daily notes (last 30 days by default)
+    today = datetime.now().date()
+    start = today - timedelta(days=30)
+    notes_tasks = extract_completed_tasks(
+        notes_dir=Path(notes_dir_raw),
+        start_date=start,
+        end_date=today,
+    )
+
+    # Also collect any stale [x] items still on the board
+    tasks_file, format = get_tasks_file(args.personal)
+    stale_board: list[dict] = []
+    if tasks_file.exists():
+        content = tasks_file.read_text()
+        tasks_data = parse_tasks(content, args.personal, format)
+        stale_board = tasks_data.get('done', [])
+
+    # Merge (deduplicate by title)
+    all_done: list[dict] = list(notes_tasks)
+    seen = {t['title'].casefold() for t in all_done}
+    for bt in stale_board:
+        if bt['title'].casefold() not in seen:
+            seen.add(bt['title'].casefold())
+            all_done.append(bt)
+
+    if not all_done:
         print("No completed tasks to archive.")
         return
-    
-    # Create archive entry
+
+    # Write to quarterly archive
     quarter = get_current_quarter()
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
     archive_file = ARCHIVE_DIR / f"ARCHIVE-{quarter}.md"
-    
+
     task_type = "Personal" if args.personal else "Work"
-    archive_entry = f"\n## Archived {datetime.now().strftime('%Y-%m-%d')} ({task_type})\n\n"
-    for task in done_tasks:
-        archive_entry += f"- ✅ **{task['title']}**\n"
-    
-    # Append to archive
+    archive_entry = f"\n## Archived {today.strftime('%Y-%m-%d')} ({task_type})\n\n"
+    for task in all_done:
+        date_suffix = f" ✅ {task['completed_date']}" if task.get('completed_date') else ""
+        area_suffix = f" [{task.get('area')}]" if task.get('area') else ""
+        archive_entry += f"- ✅ **{task['title']}**{area_suffix}{date_suffix}\n"
+
     if archive_file.exists():
         archive_content = archive_file.read_text()
     else:
         archive_content = f"# Task Archive - {quarter}\n"
-    
+
     archive_content += archive_entry
     archive_file.write_text(archive_content)
-    
-    # Remove done tasks from main file
-    new_content = content
-    for task in done_tasks:
-        raw_line = task.get('raw_line', '')
-        if raw_line:
-            new_content = new_content.replace(raw_line + '\n', '')
-    
-    tasks_file.write_text(new_content)
-    print(f"✅ Archived {len(done_tasks)} {task_type} tasks to {archive_file.name}")
+
+    # Clean stale [x] lines from the board
+    removed = 0
+    if stale_board and tasks_file.exists():
+        board_content = tasks_file.read_text()
+        for task in stale_board:
+            raw_line = task.get('raw_line', '')
+            if raw_line and raw_line in board_content:
+                board_content = _remove_task_line(board_content, raw_line)
+                removed += 1
+        tasks_file.write_text(board_content)
+
+    total = len(all_done)
+    extra = f" (cleaned {removed} stale lines from board)" if removed else ""
+    print(f"✅ Archived {total} {task_type} tasks to {archive_file.name}{extra}")
 
 
 def main():
