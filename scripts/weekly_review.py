@@ -11,7 +11,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from daily_notes import extract_completed_actions
+from daily_notes import extract_completed_actions, extract_completed_tasks
 from utils import (
     get_tasks_file,
     ARCHIVE_DIR,
@@ -119,70 +119,54 @@ def generate_velocity_section(
     week_start: date,
     week_end: date,
     archive_dir: Path,
+    notes_dir: Path | None = None,
 ) -> list[str]:
     """Generate the 📊 Velocity section lines.
 
-    Metrics:
-    - Completed: tasks with completed_date in the review week, plus tasks
-      from the current week's archive entry (archive date may differ from
-      actual completion date — see _parse_archive_weeks limitation)
-    - Added: not tracked (requires task snapshots)
-    - Net: not tracked (requires Added count)
-    - 4-week trend: completion counts per week from archive headers
+    When notes_dir is available, counts completions from daily notes
+    (authoritative). Falls back to archive + board data otherwise.
     """
     lines: list[str] = []
 
-    # --- Archive data for trend ---
-    archive_weeks = _parse_archive_weeks(archive_dir)
+    if notes_dir:
+        # Count from daily notes (authoritative)
+        notes_tasks = extract_completed_tasks(notes_dir, week_start, week_end)
+        completed_this_week = len(notes_tasks)
 
-    # --- Completed this week ---
-    # Count from live task data (completed_date timestamps)
-    all_tasks = tasks_data.get('all', [])
-    live_completed = _count_completed_in_range(all_tasks, week_start, week_end)
+        # Build 4-week rolling trend from daily notes
+        trend_counts: list[int] = []
+        for i in range(3, 0, -1):
+            trend_start = week_start - timedelta(weeks=i)
+            trend_end = trend_start + timedelta(days=6)
+            trend_tasks = extract_completed_tasks(notes_dir, trend_start, trend_end)
+            trend_counts.append(len(trend_tasks))
+    else:
+        # Fallback: archive data for trend
+        archive_weeks = _parse_archive_weeks(archive_dir)
 
-    # Also check archive for this week (tasks may have been archived already)
-    iso_year_cur, iso_week_cur, _ = week_start.isocalendar()
-    current_label = f"{iso_year_cur}-W{iso_week_cur:02d}"
-    current_archive_count = len(archive_weeks.get(current_label, []))
+        all_tasks = tasks_data.get('all', [])
+        live_completed = _count_completed_in_range(all_tasks, week_start, week_end)
 
-    # Add live + archive: archived tasks are removed from the active file,
-    # so there is no overlap between the two counts.
-    completed_this_week = live_completed + current_archive_count
+        iso_year_cur, iso_week_cur, _ = week_start.isocalendar()
+        current_label = f"{iso_year_cur}-W{iso_week_cur:02d}"
+        current_archive_count = len(archive_weeks.get(current_label, []))
 
-    # Build 4-week rolling trend: 3 previous weeks + current week
-    trend_counts: list[int] = []
-    for i in range(3, 0, -1):
-        trend_start = week_start - timedelta(weeks=i)
-        iso_year, iso_week, _ = trend_start.isocalendar()
-        label = f"{iso_year}-W{iso_week:02d}"
-        trend_counts.append(len(archive_weeks.get(label, [])))
+        completed_this_week = live_completed + current_archive_count
+
+        trend_counts = []
+        for i in range(3, 0, -1):
+            trend_start = week_start - timedelta(weeks=i)
+            iso_year, iso_week, _ = trend_start.isocalendar()
+            label = f"{iso_year}-W{iso_week:02d}"
+            trend_counts.append(len(archive_weeks.get(label, [])))
 
     current_week_count = completed_this_week
 
-    # --- Added this week (approximation) ---
-    # We can't perfectly track "added" without snapshots. Use archive weeks:
-    # tasks added ≈ current open tasks + completed this week − (open tasks last week + completed last week)
-    # Since we don't have last week's open count, approximate from archive:
-    # just count how many tasks exist now that weren't archived.
-    # Simpler approach: report "—" if we can't determine, or use archive diff.
-    #
-    # Best available heuristic: total open tasks + done this week vs previous week's similar count
-    # For now, we estimate added = 0 if no data, and note it's approximate.
-    added_this_week: int | None = None  # None = unknown
-
-    # --- Build output ---
     lines.append("")
     lines.append("📊 **Velocity**")
     lines.append(f"  Completed: {completed_this_week} task{'s' if completed_this_week != 1 else ''}")
-
-    if added_this_week is not None:
-        lines.append(f"  Added: {added_this_week} task{'s' if added_this_week != 1 else ''}")
-        net = completed_this_week - added_this_week
-        net_str = f"+{net}" if net > 0 else str(net)
-        lines.append(f"  Net: {net_str}")
-    else:
-        lines.append("  Added: — (tracking not available)")
-        lines.append(f"  Net: — (need task snapshots)")
+    lines.append("  Added: — (tracking not available)")
+    lines.append("  Net: — (need task snapshots)")
 
     # 4-week trend (3 previous weeks + current)
     full_trend = trend_counts + [current_week_count]
@@ -196,38 +180,50 @@ def generate_velocity_section(
     return lines
 
 
-def archive_done_tasks(content: str, done_tasks: list) -> str:
-    """Archive done tasks and return updated content."""
+def _archive_to_quarterly(done_tasks: list[dict]) -> str | None:
+    """Write completed tasks to quarterly archive file.
+
+    Returns the archive filename on success, None if nothing to archive.
+    """
     if not done_tasks:
-        return content
-    
-    # Create archive entry
+        return None
+
     quarter = get_current_quarter()
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
     archive_file = ARCHIVE_DIR / f"ARCHIVE-{quarter}.md"
-    
+
     archive_entry = f"\n## Week of {datetime.now().strftime('%Y-%m-%d')}\n\n"
     for task in done_tasks:
-        archive_entry += f"- ✅ **{task['title']}**\n"
-    
-    # Append to archive
+        date_suffix = f" ✅ {task['completed_date']}" if task.get('completed_date') else ""
+        area_suffix = f" [{task.get('area')}]" if task.get('area') else ""
+        archive_entry += f"- ✅ **{task['title']}**{area_suffix}{date_suffix}\n"
+
     if archive_file.exists():
         archive_content = archive_file.read_text()
     else:
         archive_content = f"# Task Archive - {quarter}\n"
-    
+
     archive_content += archive_entry
     archive_file.write_text(archive_content)
-    
-    # Clear done section in original content
-    done_section_pattern = r'(## ✅ Done.*?\n\n).*?(\n## |\n---|\Z)'
-    new_content = re.sub(
-        done_section_pattern,
-        r'\1_Move completed items here during daily standup_\n\n\2',
-        content,
-        flags=re.DOTALL
-    )
-    
-    return new_content
+    return archive_file.name
+
+
+def _clean_stale_done_lines(tasks_file: Path, done_tasks: list[dict]) -> int:
+    """Remove stale [x] lines from the board. Returns count removed."""
+    if not done_tasks or not tasks_file.exists():
+        return 0
+
+    content = tasks_file.read_text()
+    removed = 0
+    for task in done_tasks:
+        raw_line = task.get('raw_line', '')
+        if raw_line and raw_line in content:
+            content = content.replace(raw_line + '\n', '', 1)
+            removed += 1
+
+    if removed:
+        tasks_file.write_text(content)
+    return removed
 
 
 def group_by_area(tasks: list[dict]) -> dict[str, list[dict]]:
@@ -362,21 +358,37 @@ def generate_weekly_review(week: str | None = None, archive: bool = False) -> st
 
     lines = [f"📊 **Weekly Review — {week_label} ({week_start.strftime('%B %d')} to {week_end.strftime('%B %d')})**\n"]
 
-    if week:
-        lines.append(
-            "_Note: `--week` changes the reporting window, but `Recently Completed` cannot be time-filtered "
-            "because completed tasks do not store completion timestamps._"
+    # Completed This Week: daily notes primary, board [x] fallback
+    if notes_dir:
+        notes_start = week_start if week else (today - timedelta(days=6))
+        notes_end = week_end if week else today
+        done_tasks = extract_completed_tasks(
+            notes_dir=notes_dir,
+            start_date=notes_start,
+            end_date=notes_end,
         )
-        lines.append("")
+        # Merge stale board [x] items
+        board_done = tasks_data.get('done', [])
+        seen = {t['title'].casefold() for t in done_tasks}
+        for bt in board_done:
+            if bt['title'].casefold() not in seen:
+                seen.add(bt['title'].casefold())
+                done_tasks.append(bt)
+    else:
+        done_tasks = tasks_data.get('done', [])
+        if week:
+            lines.append(
+                "_Note: `--week` changes the reporting window, but completions cannot be time-filtered "
+                "without TASK_TRACKER_DAILY_NOTES_DIR._"
+            )
+            lines.append("")
 
-    # Recently Completed (cannot be time-filtered with current task model)
-    done_tasks = tasks_data.get('done', [])
     format_area_grouped(
         lines,
-        "✅ **Recently Completed**",
+        "✅ **Completed This Week**",
         done_tasks,
         lambda t: t['title'],
-        "No completed tasks in ✅ Done",
+        "No completed tasks",
     )
 
     # Carried Over (Misses): overdue tasks bucketed from utils and then grouped by area
@@ -440,35 +452,6 @@ def generate_weekly_review(week: str | None = None, archive: bool = False) -> st
         "No upcoming deadlines in this week",
     )
 
-    untracked_wins: list[str] = []
-    if notes_dir:
-        # Use week_start/week_end for --week, otherwise last 7 days
-        notes_start = week_start if week else (today - timedelta(days=6))
-        notes_end = week_end if week else today
-        notes_actions = extract_completed_actions(
-            notes_dir=notes_dir,
-            start_date=notes_start,
-            end_date=notes_end,
-        )
-        done_titles = [
-            task["title"].strip()
-            for task in done_tasks
-            if task.get("title")
-        ]
-        done_titles = [t.casefold() for t in done_titles if t]  # Strip then filter empty
-
-        for action in notes_actions:
-            action_lower = action.casefold()
-            if any(action_lower == title for title in done_titles):
-                continue
-            untracked_wins.append(action)
-
-    if untracked_wins:
-        lines.append("📌 **Untracked Wins (from daily notes):**")
-        for item in untracked_wins:
-            lines.append(f"  • {item}")
-        lines.append("")
-
     completed_demos = [
         task for task in done_tasks
         if (task.get('type') or '').lower() == 'demo'
@@ -487,17 +470,20 @@ def generate_weekly_review(week: str | None = None, archive: bool = False) -> st
 
     # Velocity / Burndown metrics (compute BEFORE archiving to avoid double-count)
     velocity_lines = generate_velocity_section(
-        tasks_data, week_start, week_end, ARCHIVE_DIR,
+        tasks_data, week_start, week_end, ARCHIVE_DIR, notes_dir=notes_dir,
     )
     lines.extend(velocity_lines)
 
     # Archive if requested
     if archive and done_tasks:
-        tasks_file, format = get_tasks_file()
-        content = tasks_file.read_text()
-        new_content = archive_done_tasks(content, done_tasks)
-        tasks_file.write_text(new_content)
-        lines.append(f"📦 Archived {len(done_tasks)} completed tasks.")
+        archive_name = _archive_to_quarterly(done_tasks)
+        # Clean stale [x] lines from the board
+        tasks_file, fmt = get_tasks_file()
+        board_done = tasks_data.get('done', [])
+        cleaned = _clean_stale_done_lines(tasks_file, board_done)
+        extra = f" (cleaned {cleaned} stale lines)" if cleaned else ""
+        if archive_name:
+            lines.append(f"📦 Archived {len(done_tasks)} completed tasks to {archive_name}{extra}.")
 
     lessons = extract_lessons(notes_dir, week_start, week_end) if notes_dir else []
     lines.append("")
@@ -518,10 +504,7 @@ def main():
     parser = argparse.ArgumentParser(description='Generate weekly review summary')
     parser.add_argument(
         '--week',
-        help=(
-            'ISO week to review (YYYY-WNN). Limitation: completed tasks in "Recently Completed" '
-            'cannot be time-filtered because completion timestamps are not stored.'
-        ),
+        help='ISO week to review (YYYY-WNN).',
     )
     parser.add_argument('--archive', action='store_true', help='Archive completed tasks')
 
