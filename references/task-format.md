@@ -36,7 +36,6 @@
 | Medium Priority | 🟡 | Important but not urgent, reviews/feedback |
 | Delegated/Waiting | 🟢 | Someone else owns, monitoring only |
 | Upcoming | 📅 | Future deadlines, scheduled events |
-| Done | ✅ | Completed (pending archive) |
 
 ## Status Definitions
 
@@ -90,11 +89,4 @@
 - [ ] **JGO release form signature** — Lilla following up
   - Owner: Lilla
   - Status: Waiting
-```
-
-### Completed
-```markdown
-- [x] **Ship IMCAS materials to France** — Completed Friday
-  - Owner: Sarah
-  - Status: Done
 ```

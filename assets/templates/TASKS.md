@@ -57,14 +57,6 @@ _Tasks owned by others, monitoring only_
 
 ---
 
-## ✅ Done (Week of YYYY-MM-DD)
-
-_Move completed items here during daily standup_
-- [x] **Set up shared calendar** — Completed Jan 15
-- [x] **Update documentation** — Completed Jan 18
-
----
-
 ## 📝 Notes
 
 _Context, meeting links, reference material_
