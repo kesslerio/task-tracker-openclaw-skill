@@ -30,5 +30,8 @@ memory/work/*.md
 .DS_Store
 Thumbs.db
 
+# Local docs
+docs/LOCAL-SETUP.md
+
 # Logs
 *.log
