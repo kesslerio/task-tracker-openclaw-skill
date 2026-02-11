@@ -19,6 +19,7 @@ KNOWN_ACTIONS = {
     "crm_update",
     "calendar_update",
     "deal_update",
+    "task_completed",
 }
 
 
@@ -203,6 +204,31 @@ def log_deal_update(
         action="deal_update",
         summary=summary,
         context=_merge_context(context, extra),
+    )
+
+
+def log_task_completed(
+    title: str,
+    section: Optional[str] = None,
+    area: Optional[str] = None,
+    due: Optional[str] = None,
+    recur: Optional[str] = None,
+    context: Optional[Dict[str, object]] = None,
+) -> bool:
+    """Log a completed task to daily notes."""
+    extra: dict = {}
+    if section:
+        extra["section"] = section
+    if area:
+        extra["area"] = area
+    if due:
+        extra["due"] = due
+    if recur:
+        extra["recur"] = recur
+    return log_done(
+        action="task_completed",
+        summary=title,
+        context=_merge_context(context, extra) if extra else context,
     )
 
 
