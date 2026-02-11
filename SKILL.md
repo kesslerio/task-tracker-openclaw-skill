@@ -33,7 +33,7 @@ A personal task management skill for daily standups and weekly reviews. Tracks w
 2. **Daily standup** - Shows today's #1 priority, blockers, and what was completed (Work & Personal)
 3. **Weekly review** - Summarizes last week, archives done items, plans this week
 4. **Add tasks** - Create new tasks with priority and due date
-5. **Complete tasks** - Mark tasks as done
+5. **Complete tasks** - Mark tasks as done (logged to daily notes, removed from board)
 6. **Extract from notes** - Pull action items from meeting notes
 7. **Dual support** - Separate Work and Personal task workflows
 
@@ -55,6 +55,9 @@ export TASK_TRACKER_ARCHIVE_DIR="$HOME/clawd/memory/work"
 
 # Optional: Legacy fallback (if Obsidian files don't exist)
 export TASK_TRACKER_LEGACY_FILE="$HOME/clawd/memory/work/TASKS.md"
+
+# Optional: Daily notes directory for completion logging (YYYY-MM-DD.md files)
+export TASK_TRACKER_DAILY_NOTES_DIR="$HOME/Obsidian/06-Daily"
 ```
 
 **Default paths (used when env vars are not set):**
@@ -131,10 +134,6 @@ Tasks use the **emoji date format** for Dataview compatibility:
 > Low priority, not scheduled.
 
 - [ ] **Future idea**
-
-## ✅ Done
-
-- [x] **Completed task** (Jan 22)
 ```
 
 ### Personal Tasks Structure
@@ -153,9 +152,6 @@ Tasks use the **emoji date format** for Dataview compatibility:
 
 ## ⚪ Backlog
 - [ ] **Someday task**
-
-## ✅ Done
-- [x] **Completed** (Jan 22)
 ```
 
 ---

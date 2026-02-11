@@ -137,7 +137,7 @@ python3 scripts/tasks.py blockers --person lilla # Blocking specific person
 python3 scripts/tasks.py archive
 ```
 
-Moves done tasks to `ARCHIVE-YYYY-QN.md` and clears the Done section.
+Aggregates completions from daily notes into quarterly `ARCHIVE-YYYY-QN.md`.
 
 ## Telegram Slash Commands
 

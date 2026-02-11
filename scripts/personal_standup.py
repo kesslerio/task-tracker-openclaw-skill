@@ -5,11 +5,14 @@ Personal Daily Standup Generator - Creates a concise summary of personal priorit
 
 import argparse
 import json
+import os
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 # Add parent directory to path for utils import
 sys.path.insert(0, str(Path(__file__).parent))
+from daily_notes import extract_completed_tasks
 from standup_common import (
     flatten_calendar_events,
     format_missed_tasks_block,
@@ -116,16 +119,34 @@ def generate_personal_standup(
     date_str: str = None,
     json_output: bool = False,
     tasks_data: dict | None = None,
+    notes_dir: Path | None = None,
 ) -> str | dict:
     """Generate personal daily standup summary."""
     if tasks_data is None:
         _, tasks_data = load_tasks(personal=True)
-    
+
     standup_date = resolve_standup_date(date_str)
     date_display = standup_date.strftime("%A, %B %d")
-    
+
     # Apply display-only priority escalation
     regrouped = regroup_by_effective_priority(tasks_data, reference_date=standup_date)
+
+    # Completed: daily notes primary, board [x] fallback
+    yesterday = standup_date - timedelta(days=1)
+    if notes_dir:
+        completed = extract_completed_tasks(
+            notes_dir=notes_dir,
+            start_date=yesterday,
+            end_date=standup_date,
+        )
+        board_done = tasks_data.get('done', [])
+        seen = {t['title'].casefold() for t in completed}
+        for bt in board_done:
+            if bt['title'].casefold() not in seen:
+                seen.add(bt['title'].casefold())
+                completed.append(bt)
+    else:
+        completed = tasks_data.get('done', [])
 
     # Build output using new task structure
     output = {
@@ -137,18 +158,18 @@ def generate_personal_standup(
         'q1': regrouped['q1'],
         'q2': regrouped['q2'],
         'q3': regrouped['q3'],
-        'completed': tasks_data['done'],
+        'completed': completed,
     }
-    
+
     # #1 Priority: first Q1 item, or first Q2 if no Q1
     if regrouped['q1']:
         output['priority'] = regrouped['q1'][0]
     elif regrouped['q2']:
         output['priority'] = regrouped['q2'][0]
-    
+
     if json_output:
         return output
-    
+
     return format_personal_standup(output, date_display)
 
 
@@ -157,18 +178,22 @@ def main():
     parser.add_argument('--date', help='Date for standup (YYYY-MM-DD)')
     parser.add_argument('--json', action='store_true', help='Output as JSON')
     parser.add_argument('--skip-missed', action='store_true', help='Skip missed tasks section')
-    
+
     args = parser.parse_args()
-    
+
     _, tasks_data = load_tasks(personal=True)
     missed_buckets = None
     if not args.skip_missed:
         missed_buckets = get_missed_tasks_bucketed(tasks_data, reference_date=args.date)
 
+    notes_dir_raw = os.getenv("TASK_TRACKER_DAILY_NOTES_DIR")
+    notes_dir = Path(notes_dir_raw) if notes_dir_raw else None
+
     result = generate_personal_standup(
         date_str=args.date,
         json_output=args.json,
         tasks_data=tasks_data,
+        notes_dir=notes_dir,
     )
 
     missed_block = ""
@@ -176,7 +201,7 @@ def main():
         missed_block = format_missed_tasks_block(missed_buckets)
         if missed_block:
             result = f"{missed_block}{result}"
-    
+
     if args.json:
         print(json.dumps(result, indent=2))
     else:

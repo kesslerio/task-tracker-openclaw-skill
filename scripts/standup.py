@@ -11,7 +11,7 @@ from datetime import timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from daily_notes import extract_completed_actions
+from daily_notes import extract_completed_actions, extract_completed_tasks
 from standup_common import (
     flatten_calendar_events,
     format_missed_tasks_block,
@@ -150,22 +150,24 @@ def generate_standup(
     json_output: bool = False,
     split_output: bool = False,
     tasks_data: dict | None = None,
+    notes_dir: Path | None = None,
 ) -> str | dict | list:
     """Generate daily standup summary.
-    
+
     Args:
         date_str: Optional date string (YYYY-MM-DD) for standup
         json_output: If True, return dict instead of markdown
-    
+        notes_dir: Path to daily notes directory for completion data
+
     Returns:
         String summary (default) or dict if json_output=True
     """
     if tasks_data is None:
         _, tasks_data = load_tasks()
-    
+
     standup_date = resolve_standup_date(date_str)
     date_display = standup_date.strftime("%A, %B %d")
-    
+
     # Build output using new task structure (q1, q2, q3, team, backlog)
     output = {
         'date': str(standup_date),
@@ -179,7 +181,7 @@ def generate_standup(
         'team': [],  # Team tasks to monitor
         'completed': [],
     }
-    
+
     # Apply display-only priority escalation
     regrouped = regroup_by_effective_priority(tasks_data, reference_date=standup_date)
 
@@ -188,24 +190,40 @@ def generate_standup(
         output['priority'] = regrouped['q1'][0]
     elif regrouped['q2']:
         output['priority'] = regrouped['q2'][0]
-    
+
     # Due today
     output['due_today'] = tasks_data.get('due_today', [])
-    
+
     # Q1 - Urgent & Important (includes escalated tasks)
     output['q1'] = regrouped['q1']
-    
+
     # Q2 - Important, Not Urgent
     output['q2'] = regrouped['q2']
-    
+
     # Q3 - Waiting/Blocked (includes escalated tasks)
     output['q3'] = regrouped['q3']
-    
+
     # Team tasks
     output['team'] = tasks_data.get('team', [])
-    
-    # Completed
-    output['completed'] = tasks_data.get('done', [])
+
+    # Completed: daily notes primary, board [x] fallback
+    yesterday = standup_date - timedelta(days=1)
+    if notes_dir:
+        notes_completed = extract_completed_tasks(
+            notes_dir=notes_dir,
+            start_date=yesterday,
+            end_date=standup_date,
+        )
+        # Merge any stale [x] items from the board (deduplicate)
+        board_done = tasks_data.get('done', [])
+        seen = {t['title'].casefold() for t in notes_completed}
+        for bt in board_done:
+            if bt['title'].casefold() not in seen:
+                seen.add(bt['title'].casefold())
+                notes_completed.append(bt)
+        output['completed'] = notes_completed
+    else:
+        output['completed'] = tasks_data.get('done', [])
     
     if json_output:
         return output
@@ -315,30 +333,23 @@ def main():
     parser.add_argument('--json', action='store_true', help='Output as JSON')
     parser.add_argument('--split', action='store_true', help='Split into 3 messages (completed/calendar/todos)')
     parser.add_argument('--skip-missed', action='store_true', help='Skip missed tasks section')
-    
+
     args = parser.parse_args()
-    
+
     _, tasks_data = load_tasks()
     missed_buckets = None
     if not args.skip_missed:
         missed_buckets = get_missed_tasks_bucketed(tasks_data, reference_date=args.date)
 
-    completed_from_notes: list[str] = []
     notes_dir_raw = os.getenv("TASK_TRACKER_DAILY_NOTES_DIR")
-    if notes_dir_raw:
-        standup_date = resolve_standup_date(args.date)
-        yesterday = standup_date - timedelta(days=1)
-        completed_from_notes = extract_completed_actions(
-            notes_dir=Path(notes_dir_raw),
-            start_date=yesterday,
-            end_date=yesterday,
-        )
+    notes_dir = Path(notes_dir_raw) if notes_dir_raw else None
 
     result = generate_standup(
         date_str=args.date,
         json_output=args.json,
         split_output=args.split,
         tasks_data=tasks_data,
+        notes_dir=notes_dir,
     )
 
     missed_block = ""
@@ -350,21 +361,9 @@ def main():
             else:
                 result = f"{missed_block}{result}"
 
-    if not args.json and completed_from_notes:
-        notes_lines = ["📌 **Also Done Yesterday:**"]
-        for action in completed_from_notes:
-            notes_lines.append(f"  • {action}")
-        notes_block = "\n".join(notes_lines)
-
-        if args.split:
-            result = [f"{result[0]}\n\n{notes_block}"] + result[1:]
-        else:
-            result = f"{result}\n\n{notes_block}"
-    
     if args.json:
         print(json.dumps(result, indent=2))
     elif args.split:
-        # Print 3 messages separated by double newlines
         for i, msg in enumerate(result, 1):
             print(msg)
             if i < len(result):
