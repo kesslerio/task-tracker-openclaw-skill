@@ -354,15 +354,22 @@ def archive_done(args):
     else:
         archive_content = f"# Task Archive - {quarter}\n"
 
-    # Build set of titles already archived (case-insensitive) to prevent
-    # duplicate entries across repeated runs.
-    already_archived: set[str] = set()
+    # Build set of (title, completed_date) already archived to prevent
+    # duplicate entries across repeated runs while preserving recurring
+    # tasks completed on different dates.
+    already_archived: set[tuple[str, str]] = set()
     for line in archive_content.splitlines():
         m = re.match(r'^- ✅ \*\*(.+?)\*\*', line)
         if m:
-            already_archived.add(m.group(1).strip().casefold())
+            title_key = m.group(1).strip().casefold()
+            date_m = re.search(r'✅\s*(\d{4}-\d{2}-\d{2})\s*$', line)
+            date_key = date_m.group(1) if date_m else ''
+            already_archived.add((title_key, date_key))
 
-    new_tasks = [t for t in all_done if t['title'].casefold() not in already_archived]
+    new_tasks = [
+        t for t in all_done
+        if (t['title'].casefold(), t.get('completed_date') or '') not in already_archived
+    ]
     if not new_tasks:
         print("All completed tasks are already archived.")
         return

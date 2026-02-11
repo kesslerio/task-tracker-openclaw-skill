@@ -183,6 +183,9 @@ def generate_velocity_section(
 def _archive_to_quarterly(done_tasks: list[dict]) -> str | None:
     """Write completed tasks to quarterly archive file.
 
+    Idempotent: skips tasks already present in the archive (matched by
+    title + completion date) so re-running is safe.
+
     Returns the archive filename on success, None if nothing to archive.
     """
     if not done_tasks:
@@ -192,16 +195,33 @@ def _archive_to_quarterly(done_tasks: list[dict]) -> str | None:
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
     archive_file = ARCHIVE_DIR / f"ARCHIVE-{quarter}.md"
 
-    archive_entry = f"\n## Week of {datetime.now().strftime('%Y-%m-%d')}\n\n"
-    for task in done_tasks:
-        date_suffix = f" ✅ {task['completed_date']}" if task.get('completed_date') else ""
-        area_suffix = f" [{task.get('area')}]" if task.get('area') else ""
-        archive_entry += f"- ✅ **{task['title']}**{area_suffix}{date_suffix}\n"
-
     if archive_file.exists():
         archive_content = archive_file.read_text()
     else:
         archive_content = f"# Task Archive - {quarter}\n"
+
+    # Build set of (title, completed_date) already archived
+    already_archived: set[tuple[str, str]] = set()
+    for line in archive_content.splitlines():
+        m = re.match(r'^- ✅ \*\*(.+?)\*\*', line)
+        if m:
+            title_key = m.group(1).strip().casefold()
+            date_m = re.search(r'✅\s*(\d{4}-\d{2}-\d{2})\s*$', line)
+            date_key = date_m.group(1) if date_m else ''
+            already_archived.add((title_key, date_key))
+
+    new_tasks = [
+        t for t in done_tasks
+        if (t['title'].casefold(), t.get('completed_date') or '') not in already_archived
+    ]
+    if not new_tasks:
+        return None
+
+    archive_entry = f"\n## Week of {datetime.now().strftime('%Y-%m-%d')}\n\n"
+    for task in new_tasks:
+        date_suffix = f" ✅ {task['completed_date']}" if task.get('completed_date') else ""
+        area_suffix = f" [{task.get('area')}]" if task.get('area') else ""
+        archive_entry += f"- ✅ **{task['title']}**{area_suffix}{date_suffix}\n"
 
     archive_content += archive_entry
     archive_file.write_text(archive_content)
