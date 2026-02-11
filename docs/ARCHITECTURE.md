@@ -220,8 +220,9 @@ sequenceDiagram
     standup->>utils: regroup_by_effective_priority(tasks)
     utils-->>standup: escalated display groups
 
-    standup->>sc: get_calendar_events(date)
+    standup->>sc: get_calendar_events()
     sc->>cal: gog calendar list --today --json
+    Note right of sc: Always fetches today's events,<br/>ignores --date flag
     cal-->>sc: events JSON
     sc-->>standup: formatted events
 
@@ -258,13 +259,21 @@ sequenceDiagram
 
 **Global flag:** `--personal` switches from Work to Personal task file.
 
-### standup.py / personal_standup.py
+### standup.py
 
 | Flag | Description |
 |------|-------------|
 | `--date YYYY-MM-DD` | Standup for specific date (default: today) |
 | `--json` | Output as JSON dict |
 | `--split` | Split into 3 messages (completed / calendar / todos) |
+| `--skip-missed` | Omit missed tasks section |
+
+### personal_standup.py
+
+| Flag | Description |
+|------|-------------|
+| `--date YYYY-MM-DD` | Standup for specific date (default: today) |
+| `--json` | Output as JSON dict |
 | `--skip-missed` | Omit missed tasks section |
 
 ### weekly_review.py
