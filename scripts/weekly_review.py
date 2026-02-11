@@ -359,13 +359,12 @@ def generate_weekly_review(week: str | None = None, archive: bool = False) -> st
     lines = [f"📊 **Weekly Review — {week_label} ({week_start.strftime('%B %d')} to {week_end.strftime('%B %d')})**\n"]
 
     # Completed This Week: daily notes primary, board [x] fallback
+    # Always use the ISO week range so the data matches the header label
     if notes_dir:
-        notes_start = week_start if week else (today - timedelta(days=6))
-        notes_end = week_end if week else today
         done_tasks = extract_completed_tasks(
             notes_dir=notes_dir,
-            start_date=notes_start,
-            end_date=notes_end,
+            start_date=week_start,
+            end_date=week_end,
         )
         # Merge stale board [x] items
         board_done = tasks_data.get('done', [])

@@ -128,8 +128,9 @@ def extract_completed_tasks(
     area, priority, due, recur.  Metadata is recovered from the JSON
     context line that log_done() writes directly below the action line.
 
-    Returns a deduplicated list (by title, case-insensitive) preserving
-    first-seen order.
+    Returns a deduplicated list preserving first-seen order.
+    Deduplicates by (title, completed_date) so recurring tasks completed
+    on different days are counted separately.
     """
     if start_date > end_date:
         start_date, end_date = end_date, start_date
@@ -138,7 +139,7 @@ def extract_completed_tasks(
         return []
 
     results: list[dict] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()  # (title_casefolded, date)
 
     for notes_file in sorted(notes_dir.glob("*.md")):
         match = NOTES_DATE_RE.fullmatch(notes_file.name)
@@ -166,7 +167,7 @@ def extract_completed_tasks(
                 if _is_completed_action_line(lines[i]):
                     title = _clean_action_line(lines[i])
                     if title:
-                        dedupe_key = title.casefold()
+                        dedupe_key = (title.casefold(), match.group(1))
                         if dedupe_key not in seen:
                             seen.add(dedupe_key)
                             results.append({
@@ -198,7 +199,7 @@ def extract_completed_tasks(
                 except (json.JSONDecodeError, ValueError):
                     pass
 
-            dedupe_key = title.casefold()
+            dedupe_key = (title.casefold(), match.group(1))
             if dedupe_key not in seen:
                 seen.add(dedupe_key)
                 results.append({

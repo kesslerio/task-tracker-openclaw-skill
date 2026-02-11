@@ -222,14 +222,23 @@ def done_task(args):
         print("⚠️ Could not find task line to update.")
         return
 
-    # Log completion to daily notes
-    log_task_completed(
+    # Log completion to daily notes — abort board changes if this fails
+    logged = log_task_completed(
         title=task['title'],
         section=task.get('section'),
         area=task.get('area'),
         due=task.get('due'),
         recur=task.get('recur'),
     )
+    if not logged:
+        print(
+            "❌ Could not log completion to daily notes. "
+            "Task was NOT removed from the board to prevent data loss.\n"
+            "Check that TASK_TRACKER_DAILY_NOTES_DIR (or TASK_TRACKER_DONE_LOG_DIR) "
+            "is set and writable.",
+            file=sys.stderr,
+        )
+        return
 
     completed_today = datetime.now().strftime('%Y-%m-%d')
     recur_value = (task.get('recur') or '').strip()
@@ -322,34 +331,48 @@ def archive_done(args):
         tasks_data = parse_tasks(content, args.personal, format)
         stale_board = tasks_data.get('done', [])
 
-    # Merge (deduplicate by title)
+    # Merge (deduplicate by title + date)
     all_done: list[dict] = list(notes_tasks)
-    seen = {t['title'].casefold() for t in all_done}
+    seen = {(t['title'].casefold(), t.get('completed_date', '')) for t in all_done}
     for bt in stale_board:
-        if bt['title'].casefold() not in seen:
-            seen.add(bt['title'].casefold())
+        key = (bt['title'].casefold(), bt.get('completed_date', ''))
+        if key not in seen:
+            seen.add(key)
             all_done.append(bt)
 
     if not all_done:
         print("No completed tasks to archive.")
         return
 
-    # Write to quarterly archive
+    # Write to quarterly archive, skipping entries already present
     quarter = get_current_quarter()
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
     archive_file = ARCHIVE_DIR / f"ARCHIVE-{quarter}.md"
-
-    task_type = "Personal" if args.personal else "Work"
-    archive_entry = f"\n## Archived {today.strftime('%Y-%m-%d')} ({task_type})\n\n"
-    for task in all_done:
-        date_suffix = f" ✅ {task['completed_date']}" if task.get('completed_date') else ""
-        area_suffix = f" [{task.get('area')}]" if task.get('area') else ""
-        archive_entry += f"- ✅ **{task['title']}**{area_suffix}{date_suffix}\n"
 
     if archive_file.exists():
         archive_content = archive_file.read_text()
     else:
         archive_content = f"# Task Archive - {quarter}\n"
+
+    # Build set of titles already archived (case-insensitive) to prevent
+    # duplicate entries across repeated runs.
+    already_archived: set[str] = set()
+    for line in archive_content.splitlines():
+        m = re.match(r'^- ✅ \*\*(.+?)\*\*', line)
+        if m:
+            already_archived.add(m.group(1).strip().casefold())
+
+    new_tasks = [t for t in all_done if t['title'].casefold() not in already_archived]
+    if not new_tasks:
+        print("All completed tasks are already archived.")
+        return
+
+    task_type = "Personal" if args.personal else "Work"
+    archive_entry = f"\n## Archived {today.strftime('%Y-%m-%d')} ({task_type})\n\n"
+    for task in new_tasks:
+        date_suffix = f" ✅ {task['completed_date']}" if task.get('completed_date') else ""
+        area_suffix = f" [{task.get('area')}]" if task.get('area') else ""
+        archive_entry += f"- ✅ **{task['title']}**{area_suffix}{date_suffix}\n"
 
     archive_content += archive_entry
     archive_file.write_text(archive_content)
@@ -365,7 +388,7 @@ def archive_done(args):
                 removed += 1
         tasks_file.write_text(board_content)
 
-    total = len(all_done)
+    total = len(new_tasks)
     extra = f" (cleaned {removed} stale lines from board)" if removed else ""
     print(f"✅ Archived {total} {task_type} tasks to {archive_file.name}{extra}")
 
