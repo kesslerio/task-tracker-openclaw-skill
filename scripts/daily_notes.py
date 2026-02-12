@@ -35,7 +35,9 @@ def _clean_action_line(line: str) -> str:
     cleaned = re.sub(r"^(?:\[[xX]\]\s*)*", "", cleaned)
     cleaned = re.sub(r"^(?:✅\s*)*", "", cleaned)
     cleaned = re.sub(r"^\s*(?:[-*+•]\s*)*", "", cleaned)
-    return cleaned.strip()
+    cleaned = re.sub(r"(?:\s*-\s*\[[ xX]\]\s*)+$", "", cleaned)
+    cleaned = re.sub(r"\s*✅\s*\d{4}-\d{2}-\d{2}\s*$", "", cleaned)
+    return cleaned.rstrip()
 
 
 def _is_completed_action_line(line: str) -> bool:
