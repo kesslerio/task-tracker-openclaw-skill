@@ -66,6 +66,90 @@ def get_tasks_file(personal: bool = False, force_legacy: bool = False) -> tuple[
     return obsidian_file, 'obsidian'
 
 
+DEPARTMENT_TAGS = {
+    'hr': 'HR',
+    'sales': 'Sales',
+    'finance': 'Finance',
+    'ops': 'Ops',
+    'marketing': 'Marketing',
+    'dev': 'Dev',
+    'product': 'Product',
+    'bizdev': 'BizDev',
+    'legal': 'Legal',
+}
+
+PRIORITY_TAGS = {
+    'urgent': 'urgent',
+    'high': 'high',
+    'medium': 'medium',
+    'low': 'low',
+}
+
+PRIORITY_TO_SECTION = {
+    'urgent': 'q1',
+    'high': 'q1',
+    'medium': 'q2',
+    'low': 'backlog',
+}
+
+
+def detect_format(content: str, fallback: str = 'obsidian') -> str:
+    """Detect task format from content.
+
+    'objectives' is always auto-detected (highest priority).
+    Otherwise respects the caller's fallback hint so that legacy
+    callers are not silently reclassified as obsidian.
+    """
+    if re.search(r'^\s*##\s+Objectives\b', content, re.IGNORECASE | re.MULTILINE):
+        return 'objectives'
+    if fallback not in ('obsidian', 'objectives') and re.search(
+        r'^\s*##\s+🔴(?:\s|$)', content, re.MULTILINE
+    ):
+        # Caller explicitly requested a non-default format (e.g. 'legacy').
+        # Don't override it just because 🔴 is present — both obsidian and
+        # legacy use that emoji.
+        return fallback
+    if re.search(r'^\s*##\s+🔴(?:\s|$)', content, re.MULTILINE):
+        return 'obsidian'
+    return fallback
+
+
+def _extract_tags_from_title(title: str) -> tuple[str, str | None, str | None]:
+    """Extract supported #tags from title and return cleaned title + metadata."""
+    department = None
+    priority = None
+
+    def _replace(match):
+        nonlocal department, priority
+        prefix = match.group(1)
+        raw_tag = match.group(2)
+        tag = raw_tag.lower()
+        if tag in DEPARTMENT_TAGS:
+            if department is None:
+                department = DEPARTMENT_TAGS[tag]
+            return prefix
+        if tag in PRIORITY_TAGS:
+            if priority is None:
+                priority = PRIORITY_TAGS[tag]
+            return prefix
+        return match.group(0)
+
+    cleaned = re.sub(r'(^|\s)#([A-Za-z][A-Za-z0-9_-]*)', _replace, title)
+    cleaned = re.sub(r'\s{2,}', ' ', cleaned).strip()
+    return cleaned, department, priority
+
+
+def _split_plain_task_body(task_body: str) -> tuple[str, str]:
+    """Split plain task body into title and metadata suffix."""
+    marker_match = re.search(
+        r'\s+(🗓️\d{4}-\d{2}-\d{2}|(?:area|goal|owner|blocks|type|recur|estimate|depends|sprint)::)',
+        task_body,
+    )
+    if marker_match:
+        return task_body[:marker_match.start()].strip(), task_body[marker_match.start():].strip()
+    return task_body.strip(), ''
+
+
 def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') -> dict:
     """Parse tasks content into categorized task lists.
     
@@ -90,6 +174,9 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
         'q3': [],
         'team': [],
         'backlog': [],
+        'objectives': [],
+        'today': [],
+        'parking_lot': [],
         'done': [],
         'due_today': [],
         'all': [],
@@ -114,44 +201,76 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
     }
     
     mapping = personal_section_mapping if personal else section_mapping
+    parsed_format = detect_format(content, format)
     
     current_section = None
     current_task = None
+    current_objective = None
     today = datetime.now().date()
     
     for line in content.split('\n'):
         # Detect section headers
         if line.startswith('## '):
-            if format == 'obsidian':
+            current_task = None
+            if parsed_format == 'objectives':
+                if re.match(r'##\s+Objectives\b', line, re.IGNORECASE):
+                    current_section = 'objectives'
+                    current_objective = None
+                elif re.match(r'##\s+Today(?::.*)?$', line, re.IGNORECASE):
+                    current_section = 'today'
+                    current_objective = None
+                elif re.match(r'##\s+🅿️\s*Parking Lot\b', line, re.IGNORECASE) or re.match(
+                    r'##\s+Parking Lot\b',
+                    line,
+                    re.IGNORECASE,
+                ):
+                    current_section = 'parking_lot'
+                    current_objective = None
+                else:
+                    section_match = re.match(r'## ([🔴🟡🟠👥⚪✅])', line)
+                    current_section = mapping.get(section_match.group(1)) if section_match else None
+                    current_objective = None
+            elif parsed_format == 'obsidian':
                 # Match emoji at start of section name
                 section_match = re.match(r'## ([🔴🟡🟠👥⚪✅])', line)
+                if section_match:
+                    emoji = section_match.group(1)
+                    current_section = mapping.get(emoji)
             else:
                 # Legacy format: ## 🔴 High Priority
                 section_match = re.match(r'## ([🔴🟡🟢📅✅])', line)
-            
-            if section_match:
-                emoji = section_match.group(1)
-                current_section = mapping.get(emoji)
+                if section_match:
+                    emoji = section_match.group(1)
+                    current_section = mapping.get(emoji)
             continue
         
         # Detect task line
-        # Format: - [ ] **Task name** 🗓️2026-01-22 area:: Sales
-        task_match = re.match(r'^- \[([ xX])\] \*\*(.+?)\*\*(.*)$', line)
+        # Format examples:
+        # - [ ] **Task name** 🗓️2026-01-22 area:: Sales
+        # - [ ] Task name #HR #high
+        task_match = re.match(r'^(\s*)- \[([ xX])\] (.+)$', line)
         
         if task_match:
-            done = task_match.group(1).lower() == 'x'
-            title = task_match.group(2).strip()
-            rest = task_match.group(3).strip()
+            indent = task_match.group(1)
+            done = task_match.group(2).lower() == 'x'
+            body = task_match.group(3).strip()
             completed_date = None
 
             # Parse completion timestamp suffix on done tasks:
             # "... ✅ YYYY-MM-DD" or "... ✅YYYY-MM-DD"
             if done:
-                completed_match = re.search(r'✅\s*(\d{4}-\d{2}-\d{2})\s*$', rest)
+                completed_match = re.search(r'✅\s*(\d{4}-\d{2}-\d{2})\s*$', body)
                 if completed_match:
                     completed_date = completed_match.group(1)
                     # Strip completion suffix before parsing inline fields
-                    rest = rest[:completed_match.start()].rstrip()
+                    body = body[:completed_match.start()].rstrip()
+
+            bold_match = re.match(r'^\*\*(.+?)\*\*(.*)$', body)
+            if bold_match:
+                title = bold_match.group(1).strip()
+                rest = bold_match.group(2).strip()
+            else:
+                title, rest = _split_plain_task_body(body)
             
             due_str = None
             area = None
@@ -163,8 +282,24 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
             estimate = None
             depends = None
             sprint = None
-            
-            if format == 'obsidian':
+
+            department = None
+            priority = None
+            parent_objective = None
+            is_objective = False
+
+            if parsed_format == 'objectives':
+                title, department, priority = _extract_tags_from_title(title)
+                if current_section == 'objectives':
+                    if len(indent) >= 2:
+                        parent_objective = current_objective
+                    else:
+                        is_objective = True
+                        current_objective = title
+                else:
+                    current_objective = None
+
+            if parsed_format in ('obsidian', 'objectives'):
                 # Parse emoji date
                 date_match = re.search(r'🗓️(\d{4}-\d{2}-\d{2})', rest)
                 if date_match:
@@ -212,6 +347,10 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 'title': title,
                 'done': done,
                 'section': current_section,
+                'parent_objective': parent_objective,
+                'is_objective': is_objective,
+                'department': department,
+                'priority': priority,
                 'due': due_str,
                 'area': area,
                 'goal': goal,
@@ -230,8 +369,13 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
             
             if done:
                 result['done'].append(current_task)
-            elif current_section:
+            elif current_section and current_section in result:
                 result[current_section].append(current_task)
+
+            if not done and priority:
+                mapped_section = PRIORITY_TO_SECTION.get(priority)
+                if mapped_section and current_task not in result[mapped_section]:
+                    result[mapped_section].append(current_task)
             
             # Check if due today (only for tasks WITH a due date)
             if due_str and not done:
@@ -245,7 +389,7 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
             continue
         
         # Handle task continuation (indented lines)
-        if current_task and line.startswith('  '):
+        if current_task and line.startswith('  ') and not re.match(r'^\s*- \[([ xX])\] ', line):
             meta_line = line.strip()
             
             # Remove leading "- " if present
@@ -655,6 +799,9 @@ def get_section_display_name(section: str, personal: bool = False) -> str:
         'q3': '🟠 Q3: Waiting / Blocked',
         'team': '👥 Team Tasks',
         'backlog': '⚪ Backlog',
+        'objectives': '🎯 Objectives',
+        'today': '📌 Today',
+        'parking_lot': '🅿️ Parking Lot',
         'done': '✅ Done',
     }
     

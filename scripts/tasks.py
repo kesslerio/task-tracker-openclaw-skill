@@ -48,13 +48,16 @@ def list_tasks(args):
     
     if args.priority:
         priority_map = {
-            'high': 'q1',
-            'medium': 'q2',
-            'low': 'backlog',
+            'high': {'section': 'q1', 'tags': {'high', 'urgent'}},
+            'medium': {'section': 'q2', 'tags': {'medium'}},
+            'low': {'section': 'backlog', 'tags': {'low'}},
         }
-        target_key = priority_map.get(args.priority.lower())
-        if target_key:
-            filtered = [t for t in filtered if t.get('section') == target_key]
+        target = priority_map.get(args.priority.lower())
+        if target:
+            filtered = [
+                t for t in filtered
+                if t.get('section') == target['section'] or t.get('priority') in target['tags']
+            ]
     
     if args.due:
         filtered = [t for t in filtered if check_due_date(t.get('due', ''), args.due)]
@@ -173,20 +176,39 @@ def add_task(args):
 
 
 def _remove_task_line(content: str, raw_line: str) -> str:
-    """Remove a task line and any indented continuation lines below it."""
+    """Remove a task line and its child/continuation lines."""
     lines = content.split('\n')
-    result: list[str] = []
-    skip_continuations = False
-    for line in lines:
-        if skip_continuations:
-            if line.startswith('  ') and not re.match(r'^- \[', line):
-                continue  # skip continuation line
-            skip_continuations = False
-        if line == raw_line:
-            skip_continuations = True
+    try:
+        target_index = lines.index(raw_line)
+    except ValueError:
+        return content
+
+    target_indent = len(raw_line) - len(raw_line.lstrip(' '))
+    remove_until = target_index + 1
+
+    while remove_until < len(lines):
+        line = lines[remove_until]
+
+        if line.strip() == '':
+            lookahead = remove_until + 1
+            while lookahead < len(lines) and lines[lookahead].strip() == '':
+                lookahead += 1
+
+            if lookahead < len(lines):
+                next_line = lines[lookahead]
+                next_indent = len(next_line) - len(next_line.lstrip(' '))
+                if next_indent > target_indent:
+                    remove_until += 1
+                    continue
+            break
+
+        indent = len(line) - len(line.lstrip(' '))
+        if indent > target_indent:
+            remove_until += 1
             continue
-        result.append(line)
-    return '\n'.join(result)
+        break
+
+    return '\n'.join(lines[:target_index] + lines[remove_until:])
 
 
 def done_task(args):
