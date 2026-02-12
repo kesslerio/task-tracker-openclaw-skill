@@ -178,42 +178,37 @@ def add_task(args):
 def _remove_task_line(content: str, raw_line: str) -> str:
     """Remove a task line and its child/continuation lines."""
     lines = content.split('\n')
-    result: list[str] = []
-    skip_nested = False
-    target_indent = 0
-    target_found = False
-
-    for line in lines:
-        if skip_nested:
-            indent = len(line) - len(line.lstrip(' '))
-            is_task_line = bool(re.match(r'^\s*- \[[ xX]\] ', line))
-
-            if line.strip() == '':
-                continue
-
-            if indent > target_indent:
-                continue
-
-            if is_task_line and indent <= target_indent:
-                skip_nested = False
-            elif not is_task_line:
-                skip_nested = False
-
-            if skip_nested:
-                continue
-
-        if line == raw_line:
-            target_found = True
-            target_indent = len(line) - len(line.lstrip(' '))
-            skip_nested = True
-            continue
-
-        result.append(line)
-
-    if not target_found:
+    try:
+        target_index = lines.index(raw_line)
+    except ValueError:
         return content
 
-    return '\n'.join(result)
+    target_indent = len(raw_line) - len(raw_line.lstrip(' '))
+    remove_until = target_index + 1
+
+    while remove_until < len(lines):
+        line = lines[remove_until]
+
+        if line.strip() == '':
+            lookahead = remove_until + 1
+            while lookahead < len(lines) and lines[lookahead].strip() == '':
+                lookahead += 1
+
+            if lookahead < len(lines):
+                next_line = lines[lookahead]
+                next_indent = len(next_line) - len(next_line.lstrip(' '))
+                if next_indent > target_indent:
+                    remove_until += 1
+                    continue
+            break
+
+        indent = len(line) - len(line.lstrip(' '))
+        if indent > target_indent:
+            remove_until += 1
+            continue
+        break
+
+    return '\n'.join(lines[:target_index] + lines[remove_until:])
 
 
 def done_task(args):

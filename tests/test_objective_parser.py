@@ -3,6 +3,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
+from tasks import _remove_task_line
 from utils import detect_format, parse_tasks
 
 
@@ -128,3 +129,44 @@ def test_plain_and_bold_task_patterns_are_both_parsed():
 
     assert bold["area"] == "Sales"
     assert plain["area"] == "Marketing"
+
+
+def test_remove_task_line_removes_parent_and_subtasks():
+    content = """## Objectives
+- [ ] Parent objective
+  - [ ] Child one
+
+  - [ ] Child two
+- [ ] Sibling objective
+"""
+
+    updated = _remove_task_line(content, "- [ ] Parent objective")
+
+    assert updated == """## Objectives
+- [ ] Sibling objective
+"""
+
+
+def test_remove_task_line_preserves_sibling_tasks():
+    content = """- [ ] Parent A
+  - [ ] Child A1
+- [ ] Parent B
+  - [ ] Child B1
+"""
+
+    updated = _remove_task_line(content, "- [ ] Parent A")
+
+    assert updated == """- [ ] Parent B
+  - [ ] Child B1
+"""
+
+
+def test_remove_task_line_handles_flat_task():
+    content = """- [ ] Task one
+- [ ] Task two
+"""
+
+    updated = _remove_task_line(content, "- [ ] Task one")
+
+    assert updated == """- [ ] Task two
+"""
