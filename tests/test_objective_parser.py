@@ -34,7 +34,8 @@ def test_detect_format_prefers_objectives_header():
 def test_detect_format_handles_existing_obsidian_header():
     content = "## 🔴 Q1: Urgent & Important\n- [ ] **Ship release**"
     assert detect_format(content) == "obsidian"
-    assert detect_format(content, fallback="legacy") == "obsidian"
+    # Legacy hint is respected even when 🔴 is present (both formats use it)
+    assert detect_format(content, fallback="legacy") == "legacy"
 
 
 def test_parse_objectives_format_nested_tasks_and_tags():

@@ -94,9 +94,21 @@ PRIORITY_TO_SECTION = {
 
 
 def detect_format(content: str, fallback: str = 'obsidian') -> str:
-    """Detect task format from content."""
+    """Detect task format from content.
+
+    'objectives' is always auto-detected (highest priority).
+    Otherwise respects the caller's fallback hint so that legacy
+    callers are not silently reclassified as obsidian.
+    """
     if re.search(r'^\s*##\s+Objectives\b', content, re.IGNORECASE | re.MULTILINE):
         return 'objectives'
+    if fallback not in ('obsidian', 'objectives') and re.search(
+        r'^\s*##\s+🔴(?:\s|$)', content, re.MULTILINE
+    ):
+        # Caller explicitly requested a non-default format (e.g. 'legacy').
+        # Don't override it just because 🔴 is present — both obsidian and
+        # legacy use that emoji.
+        return fallback
     if re.search(r'^\s*##\s+🔴(?:\s|$)', content, re.MULTILINE):
         return 'obsidian'
     return fallback
