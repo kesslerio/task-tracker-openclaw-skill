@@ -48,13 +48,16 @@ def list_tasks(args):
     
     if args.priority:
         priority_map = {
-            'high': 'q1',
-            'medium': 'q2',
-            'low': 'backlog',
+            'high': {'section': 'q1', 'tags': {'high', 'urgent'}},
+            'medium': {'section': 'q2', 'tags': {'medium'}},
+            'low': {'section': 'backlog', 'tags': {'low'}},
         }
-        target_key = priority_map.get(args.priority.lower())
-        if target_key:
-            filtered = [t for t in filtered if t.get('section') == target_key]
+        target = priority_map.get(args.priority.lower())
+        if target:
+            filtered = [
+                t for t in filtered
+                if t.get('section') == target['section'] or t.get('priority') in target['tags']
+            ]
     
     if args.due:
         filtered = [t for t in filtered if check_due_date(t.get('due', ''), args.due)]
@@ -173,19 +176,43 @@ def add_task(args):
 
 
 def _remove_task_line(content: str, raw_line: str) -> str:
-    """Remove a task line and any indented continuation lines below it."""
+    """Remove a task line and its child/continuation lines."""
     lines = content.split('\n')
     result: list[str] = []
-    skip_continuations = False
+    skip_nested = False
+    target_indent = 0
+    target_found = False
+
     for line in lines:
-        if skip_continuations:
-            if line.startswith('  ') and not re.match(r'^- \[', line):
-                continue  # skip continuation line
-            skip_continuations = False
+        if skip_nested:
+            indent = len(line) - len(line.lstrip(' '))
+            is_task_line = bool(re.match(r'^\s*- \[[ xX]\] ', line))
+
+            if line.strip() == '':
+                continue
+
+            if indent > target_indent:
+                continue
+
+            if is_task_line and indent <= target_indent:
+                skip_nested = False
+            elif not is_task_line:
+                skip_nested = False
+
+            if skip_nested:
+                continue
+
         if line == raw_line:
-            skip_continuations = True
+            target_found = True
+            target_indent = len(line) - len(line.lstrip(' '))
+            skip_nested = True
             continue
+
         result.append(line)
+
+    if not target_found:
+        return content
+
     return '\n'.join(result)
 
 
