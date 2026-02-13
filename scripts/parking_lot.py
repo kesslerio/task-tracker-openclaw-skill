@@ -122,6 +122,14 @@ def _parse_items(lines: list[str], start: int, end: int) -> list[dict]:
     return items
 
 
+def _item_block_end(lines: list[str], line_num: int) -> int:
+    """Return exclusive end index for a task line and its indented child lines."""
+    end = line_num + 1
+    while end < len(lines) and lines[end].startswith(('  ', '\t')):
+        end += 1
+    return end
+
+
 def _days_since(date_str: str | None) -> int | None:
     """Return days since a YYYY-MM-DD date string, or None."""
     if not date_str:
@@ -244,13 +252,16 @@ def promote_item(tasks_file: Path, item_id: int) -> str:
         return f"❌ Item #{item_id} not found in Parking Lot."
 
     # Remove from parking lot
-    removed_line = lines.pop(target['line_num'])
+    block_end = _item_block_end(lines, target['line_num'])
+    removed_block = lines[target['line_num']:block_end]
+    del lines[target['line_num']:block_end]
 
     # Clean the line: strip created/stale fields
-    promoted = removed_line
+    promoted = removed_block[0]
     promoted = re.sub(r'\s*created::\S+', '', promoted)
     promoted = re.sub(r'\s*stale::\S+', '', promoted)
     promoted = promoted.rstrip()
+    promoted_block = [promoted] + removed_block[1:]
 
     # Find insertion target: Objectives header > 🔴 header > before parking lot
     insert_at = None
@@ -275,7 +286,7 @@ def promote_item(tasks_file: Path, item_id: int) -> str:
         if insert_at is None:
             insert_at = len(lines)
 
-    lines.insert(insert_at, promoted)
+    lines[insert_at:insert_at] = promoted_block
     _atomic_write(tasks_file, '\n'.join(lines))
     return f"✅ Promoted from Parking Lot: {target['title']}"
 
@@ -295,15 +306,16 @@ def drop_item(tasks_file: Path, item_id: int,
     if not target:
         return f"❌ Item #{item_id} not found in Parking Lot."
 
-    lines.pop(target['line_num'])
+    block_end = _item_block_end(lines, target['line_num'])
+    del lines[target['line_num']:block_end]
     _atomic_write(tasks_file, '\n'.join(lines))
 
     # Append to weekly archive if dir provided
     if archive_dir:
         archive_dir.mkdir(parents=True, exist_ok=True)
         today = date.today()
-        week_num = today.isocalendar()[1]
-        archive_file = archive_dir / f"{today.year}-W{week_num:02d}.md"
+        iso_year, week_num, _ = today.isocalendar()
+        archive_file = archive_dir / f"{iso_year}-W{week_num:02d}.md"
 
         if archive_file.exists():
             arc = archive_file.read_text()

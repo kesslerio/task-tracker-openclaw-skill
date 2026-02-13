@@ -145,13 +145,21 @@ def consolidate_month(archive_dir: Path, month: str, delete_weekly: bool = False
         return {'error': f"Archive directory not found: {archive_dir}"}
     
     weekly_files = []
-    for week_file in sorted(archive_dir.glob(f"{year}-W*.md")):
+    candidates = {
+        *archive_dir.glob(f"{year}-W*.md"),
+        *archive_dir.glob(f"{year - 1}-W*.md"),
+    }
+    for week_file in sorted(candidates):
         match = re.match(r'(\d{4})-W(\d{2})\.md', week_file.name)
         if not match:
             continue
         w_year, w_week = int(match.group(1)), int(match.group(2))
         week_start = get_week_start(w_year, w_week)
-        if week_start.month == month_num or (week_start + timedelta(days=6)).month == month_num:
+        if any(
+            (week_start + timedelta(days=offset)).year == year
+            and (week_start + timedelta(days=offset)).month == month_num
+            for offset in range(7)
+        ):
             weekly_files.append(week_file)
     
     if not weekly_files:
@@ -232,7 +240,7 @@ def archive_stats(archive_dir: Path, period: str) -> dict:
     counts = defaultdict(int)
     total = 0
     
-    for archive_file in archive_dir.glob("*.md"):
+    for archive_file in archive_dir.glob("[0-9][0-9][0-9][0-9]-W[0-9][0-9].md"):
         content = archive_file.read_text()
         current_dept = None
         for line in content.splitlines():
