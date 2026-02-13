@@ -21,6 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from daily_notes import extract_completed_tasks
 from log_done import log_task_completed
+import delegation
 from utils import (
     get_tasks_file,
     get_section_display_name,
@@ -422,6 +423,69 @@ def archive_done(args):
     print(f"✅ Archived {total} {task_type} tasks to {archive_file.name}{extra}")
 
 
+def cmd_delegated(args):
+    """Dispatch delegated subcommands."""
+    import delegation
+
+    sub = args.del_command
+    path = delegation.resolve_delegation_file()
+    delegation.ensure_file(path)
+
+    if sub == 'list':
+        if getattr(args, 'json', False):
+            print(delegation.list_items_json(path, overdue_only=getattr(args, 'overdue', False)))
+        else:
+            items = delegation.list_items(path, overdue_only=getattr(args, 'overdue', False))
+            if not items:
+                print("No delegated tasks.")
+                return
+            for it in items:
+                icon = '⏰' if it.get('status') == 'overdue' else '📋'
+                dept = f" #{it['department']}" if it.get('department') else ''
+                fu = f" [followup::{it['followup']}]" if it.get('followup') else ''
+                print(f"{it['id']:2d}. {icon} {it['title']} → {it.get('assignee', '?')}{dept}{fu}")
+    elif sub == 'add':
+        item = delegation.add_item(path, args.task, args.to, args.followup, args.dept)
+        print(f"✅ Delegated: {item['title']} → {item['assignee']} [followup::{item['followup']}]")
+    elif sub == 'complete':
+        try:
+            item = delegation.complete_item(path, args.id)
+            print(f"✅ Completed: {item['title']} → {item.get('assignee', '?')}")
+        except ValueError as e:
+            print(f"❌ {e}")
+            sys.exit(1)
+    elif sub == 'extend':
+        try:
+            item = delegation.extend_item(path, args.id, args.followup)
+            print(f"✅ Extended: {item['title']} [new followup::{item['followup']}]")
+        except ValueError as e:
+            print(f"❌ {e}")
+            sys.exit(1)
+    elif sub == 'take-back':
+        try:
+            item = delegation.take_back_item(path, args.id)
+            # Re-insert into work tasks
+            tasks_file, _ = get_tasks_file(personal=False)
+            content = tasks_file.read_text()
+            dept_tag = f" #{item.get('department')}" if item.get('department') else ''
+            task_line = f"- [ ] **{item['title']}**{dept_tag}"
+            # Insert at beginning of first section
+            lines = content.split('\n')
+            insert_at = 0
+            for i, line in enumerate(lines):
+                if re.match(r'^- \[', line):
+                    insert_at = i
+                    break
+                if line.startswith('## '):
+                    insert_at = i + 1
+            lines.insert(insert_at, task_line)
+            tasks_file.write_text('\n'.join(lines))
+            print(f"✅ Took back: {item['title']} (added to {tasks_file.name})")
+        except ValueError as e:
+            print(f"❌ {e}")
+            sys.exit(1)
+
+
 def cmd_parking_lot(args):
     """Dispatch parking-lot subcommands."""
     from parking_lot import list_items, list_stale, add_item, promote_item, drop_item
@@ -504,6 +568,35 @@ def main():
     pl_drop.add_argument('id', type=int, help='Item ID from list')
     pl_drop.set_defaults(func=cmd_parking_lot)
 
+    # Delegated subcommands
+    del_parser = subparsers.add_parser('delegated', help='Manage delegated tasks')
+    del_sub = del_parser.add_subparsers(dest='del_command', required=True)
+
+    del_list = del_sub.add_parser('list', help='List delegated items')
+    del_list.add_argument('--overdue', action='store_true', help='Show only overdue items')
+    del_list.add_argument('--json', action='store_true', help='JSON output')
+    del_list.set_defaults(func=cmd_delegated)
+
+    del_add = del_sub.add_parser('add', help='Delegate a task')
+    del_add.add_argument('task', help='Task title')
+    del_add.add_argument('--to', required=True, help='Person to delegate to')
+    del_add.add_argument('--followup', required=True, help='Follow-up date (YYYY-MM-DD)')
+    del_add.add_argument('--dept', help='Department tag')
+    del_add.set_defaults(func=cmd_delegated)
+
+    del_complete = del_sub.add_parser('complete', help='Mark delegation as complete')
+    del_complete.add_argument('id', type=int, help='Item ID from list')
+    del_complete.set_defaults(func=cmd_delegated)
+
+    del_extend = del_sub.add_parser('extend', help='Extend follow-up date')
+    del_extend.add_argument('id', type=int, help='Item ID from list')
+    del_extend.add_argument('--followup', required=True, help='New follow-up date (YYYY-MM-DD)')
+    del_extend.set_defaults(func=cmd_delegated)
+
+    del_takeback = del_sub.add_parser('take-back', help='Take back delegated task')
+    del_takeback.add_argument('id', type=int, help='Item ID from list')
+    del_takeback.set_defaults(func=cmd_delegated)
+
     args = parser.parse_args()
     args.func(args)
 
@@ -511,98 +604,3 @@ def main():
 if __name__ == '__main__':
     main()
 
-
-# === Delegation CLI Wrappers ===
-
-def cmd_delegated_list(args):
-    """List delegated tasks."""
-    delegation_file = delegation.resolve_delegation_file()
-    delegation.ensure_delegation_file(delegation_file)
-    
-    if args.json:
-        print(delegation.list_items_json(delegation_file, overdue_only=args.overdue))
-    else:
-        items = delegation.list_items(delegation_file, overdue_only=args.overdue)
-        if not items:
-            print("No delegated tasks.")
-            return
-        
-        for item in items:
-            if item.get('id') is None:
-                status_icon = "✅"
-                assignee = item.get('assignee', 'Unknown')
-                title = item.get('title', '')
-                dept = f" #{item.get('department')}" if item.get('department') else ""
-                delegated_date = item.get('delegated', '')
-                completed_date = item.get('completed', '')
-                print(f"  {status_icon} {title} → {assignee}{dept} [delegated::{delegated_date}] [completed::{completed_date}]")
-            else:
-                item_id = item['id']
-                status = item.get('status', 'active')
-                status_icon = "⏰" if status == "awaiting_followup" else "📋"
-                assignee = item.get('assignee', 'Unknown')
-                title = item.get('title', '')
-                dept = f" #{item.get('department')}" if item.get('department') else ""
-                followup_date = item.get('followup', '')
-                print(f"{item_id:2d}. {status_icon} {title} → {assignee}{dept} [followup::{followup_date}]")
-
-
-def cmd_delegated_add(args):
-    """Add a delegated task."""
-    delegation_file = delegation.resolve_delegation_file()
-    delegation.ensure_delegation_file(delegation_file)
-    
-    item = delegation.add_item(
-        path=delegation_file,
-        title=args.task,
-        assignee=args.assignee,
-        followup=args.followup,
-        department=args.dept,
-    )
-    print(f"✅ Delegated task added: {item['title']} → {item['assignee']} [followup::{item['followup']}]")
-
-
-def cmd_delegated_complete(args):
-    """Mark delegated task as complete."""
-    delegation_file = delegation.resolve_delegation_file()
-    delegation.ensure_delegation_file(delegation_file)
-    
-    try:
-        item = delegation.complete_item(delegation_file, args.id)
-        print(f"✅ Completed delegated task: {item['title']} → {item['assignee']}")
-    except ValueError as e:
-        print(f"❌ {e}")
-        sys.exit(1)
-
-
-def cmd_delegated_extend(args):
-    """Extend follow-up date for delegated task."""
-    delegation_file = delegation.resolve_delegation_file()
-    delegation.ensure_delegation_file(delegation_file)
-    
-    try:
-        item = delegation.extend_item(delegation_file, args.id, args.followup)
-        print(f"✅ Extended follow-up date for: {item['title']} → {item['assignee']} [new followup::{item['followup']}]")
-    except ValueError as e:
-        print(f"❌ {e}")
-        sys.exit(1)
-
-
-def cmd_delegated_take_back(args):
-    """Take back a delegated task and add it to objectives."""
-    delegation_file = delegation.resolve_delegation_file()
-    delegation.ensure_delegation_file(delegation_file)
-    
-    try:
-        item = delegation.take_back_item(delegation_file, args.id)
-        
-        work_file, _ = get_tasks_file(personal=False)
-        delegation.insert_taken_back_task(
-            tasks_file=work_file,
-            title=item['title'],
-            department=item.get('department'),
-        )
-        print(f"✅ Took back delegated task: {item['title']} (added to {work_file.name})")
-    except ValueError as e:
-        print(f"❌ {e}")
-        sys.exit(1)
