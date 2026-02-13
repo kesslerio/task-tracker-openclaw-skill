@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -23,6 +24,7 @@ from daily_notes import extract_completed_tasks
 from log_done import log_task_completed
 import delegation
 from utils import (
+    detect_format,
     get_tasks_file,
     get_section_display_name,
     parse_tasks,
@@ -31,6 +33,7 @@ from utils import (
     next_recurrence_date,
     get_current_quarter,
     ARCHIVE_DIR,
+    get_objective_progress,
 )
 
 
@@ -510,6 +513,50 @@ def cmd_parking_lot(args):
         print(drop_item(tasks_file, args.id, archive_dir=archive_dir))
 
 
+def _format_completion_pct(value: float) -> str:
+    """Format completion percentage for human-readable output."""
+    if float(value).is_integer():
+        return str(int(value))
+    return f"{value:.1f}"
+
+
+def cmd_objectives(args):
+    """Show objective-level completion status."""
+    content, tasks_data = load_tasks(args.personal)
+    parsed_format = detect_format(content)
+    if parsed_format != 'objectives':
+        print("Objective tracking is only available for Objectives format files.")
+        return
+
+    objectives = get_objective_progress(tasks_data)
+    if args.at_risk:
+        objectives = [
+            objective for objective in objectives
+            if objective['total_tasks'] > 0 and objective['completed_tasks'] == 0
+        ]
+
+    if args.json:
+        print(json.dumps(objectives, indent=2))
+        return
+
+    if not objectives:
+        print("No objectives found.")
+        return
+
+    for objective in objectives:
+        pct = _format_completion_pct(objective['completion_pct'])
+        dept = f" #{objective['department']}" if objective.get('department') else ""
+        priority = f" #{objective['priority']}" if objective.get('priority') else ""
+        print(
+            f"🎯 {objective['title']} — {pct}% "
+            f"({objective['completed_tasks']}/{objective['total_tasks']}){dept}{priority}"
+        )
+        for task in objective['tasks']:
+            mark = "✅" if task['done'] else "⬜"
+            print(f"  {mark} {task['title']}")
+        print()
+
+
 def main():
     parser = argparse.ArgumentParser(description='Task Tracker CLI (Work & Personal)')
     parser.add_argument('--personal', action='store_true', help='Use Personal Tasks instead of Work Tasks')
@@ -546,6 +593,15 @@ def main():
     # Archive command
     archive_parser = subparsers.add_parser('archive', help='Archive completed tasks')
     archive_parser.set_defaults(func=archive_done)
+
+    objectives_parser = subparsers.add_parser('objectives', help='Show objective progress')
+    objectives_parser.add_argument('--json', action='store_true', help='Output as JSON')
+    objectives_parser.add_argument(
+        '--at-risk',
+        action='store_true',
+        help='Show only objectives with 0% completion',
+    )
+    objectives_parser.set_defaults(func=cmd_objectives)
     
     # Parking Lot subcommands
     pl_parser = subparsers.add_parser('parking-lot', help='Manage parking lot (backlog)')

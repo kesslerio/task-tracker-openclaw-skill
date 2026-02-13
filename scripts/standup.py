@@ -23,6 +23,7 @@ from utils import (
     load_tasks,
     get_missed_tasks_bucketed,
     regroup_by_effective_priority,
+    summarize_objective_progress,
     escalation_suffix,
     recurrence_suffix,
     parse_duration,
@@ -139,6 +140,22 @@ def format_split_standup(output: dict, date_display: str) -> list:
             owner_str = f" ({t['owner']})" if t.get('owner') else ""
             rec = recurrence_suffix(t)
             msg3_lines.append(f"  • {t['title']}{rec}{owner_str}")
+        msg3_lines.append("")
+
+    objective_progress = output.get('objective_progress') or {}
+    if objective_progress.get('total_objectives', 0) > 0:
+        msg3_lines.append("🎯 **Objective Progress:**")
+        msg3_lines.append(
+            "  • On track: "
+            f"{objective_progress['on_track_objectives']}/{objective_progress['total_objectives']}"
+        )
+        at_risk = objective_progress.get('at_risk_objectives', [])
+        if at_risk:
+            msg3_lines.append("  • At risk (0%):")
+            for objective in at_risk:
+                msg3_lines.append(f"    • {objective['title']}")
+        else:
+            msg3_lines.append("  • At risk (0%): none")
     
     messages.append('\n'.join(msg3_lines).strip())
     
@@ -180,6 +197,7 @@ def generate_standup(
         'q3': [],  # Waiting/Blocked
         'team': [],  # Team tasks to monitor
         'completed': [],
+        'objective_progress': {},
     }
 
     # Apply display-only priority escalation
@@ -224,6 +242,8 @@ def generate_standup(
         output['completed'] = notes_completed
     else:
         output['completed'] = tasks_data.get('done', [])
+
+    output['objective_progress'] = summarize_objective_progress(tasks_data)
     
     if json_output:
         return output
@@ -323,7 +343,23 @@ def generate_standup(
             lines.append(f"  • {t['title']}{rec}")
         if len(output['completed']) > 5:
             lines.append(f"  • ... and {len(output['completed']) - 5} more")
-    
+
+    objective_progress = output.get('objective_progress') or {}
+    if objective_progress.get('total_objectives', 0) > 0:
+        lines.append("")
+        lines.append("🎯 **Objective Progress:**")
+        lines.append(
+            "  • On track: "
+            f"{objective_progress['on_track_objectives']}/{objective_progress['total_objectives']}"
+        )
+        at_risk = objective_progress.get('at_risk_objectives', [])
+        if at_risk:
+            lines.append("  • At risk (0%):")
+            for objective in at_risk:
+                lines.append(f"    • {objective['title']}")
+        else:
+            lines.append("  • At risk (0%): none")
+
     return '\n'.join(lines)
 
 
