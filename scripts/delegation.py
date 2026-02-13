@@ -296,6 +296,20 @@ def extend_item(path: Path, item_id: int, new_followup: str) -> dict:
     return target
 
 
+def get_active_item(path: Path, item_id: int) -> dict:
+    """Return an active delegated item without modifying the file."""
+    content = path.read_text()
+    lines = content.split('\n')
+
+    active_start, active_end = _find_section(lines, 'Active')
+    items = _parse_section_items(lines, active_start, active_end) if active_start >= 0 else []
+    target = next((it for it in items if it['id'] == item_id), None)
+    if not target:
+        raise ValueError(f"Item #{item_id} not found in Active section.")
+
+    return dict(target)
+
+
 def take_back_item(path: Path, item_id: int) -> dict:
     """Remove a delegated item and return it for re-insertion into tasks file."""
     content = path.read_text()

@@ -463,8 +463,8 @@ def cmd_delegated(args):
             sys.exit(1)
     elif sub == 'take-back':
         try:
-            item = delegation.take_back_item(path, args.id)
-            # Re-insert into work tasks
+            item = delegation.get_active_item(path, args.id)
+            # Re-insert into work tasks first; only delete delegated entry after write succeeds.
             tasks_file, _ = get_tasks_file(personal=False)
             content = tasks_file.read_text()
             dept_tag = f" #{item.get('department')}" if item.get('department') else ''
@@ -480,6 +480,7 @@ def cmd_delegated(args):
                     insert_at = i + 1
             lines.insert(insert_at, task_line)
             tasks_file.write_text('\n'.join(lines))
+            delegation.take_back_item(path, args.id)
             print(f"✅ Took back: {item['title']} (added to {tasks_file.name})")
         except ValueError as e:
             print(f"❌ {e}")
@@ -603,4 +604,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
