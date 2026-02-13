@@ -791,6 +791,85 @@ def sprint_suffix(task: dict) -> str:
     return f" 🏃 {sprint}" if sprint else ""
 
 
+def get_objective_progress(tasks_data: dict) -> list[dict]:
+    """Build objective-level progress rows from parsed tasks."""
+    objective_rows: dict[str, dict] = {}
+    objective_order: list[str] = []
+
+    for task in tasks_data.get('all', []):
+        if task.get('is_objective'):
+            title = task.get('title')
+            if not title:
+                continue
+            if title not in objective_rows:
+                objective_order.append(title)
+                objective_rows[title] = {
+                    'title': title,
+                    'department': task.get('department'),
+                    'priority': task.get('priority'),
+                    'tasks': [],
+                }
+            else:
+                if not objective_rows[title].get('department'):
+                    objective_rows[title]['department'] = task.get('department')
+                if not objective_rows[title].get('priority'):
+                    objective_rows[title]['priority'] = task.get('priority')
+
+        parent = task.get('parent_objective')
+        if parent:
+            if parent not in objective_rows:
+                objective_order.append(parent)
+                objective_rows[parent] = {
+                    'title': parent,
+                    'department': None,
+                    'priority': None,
+                    'tasks': [],
+                }
+            objective_rows[parent]['tasks'].append(
+                {
+                    'title': task.get('title', ''),
+                    'done': bool(task.get('done')),
+                }
+            )
+
+    progress = []
+    for title in objective_order:
+        row = objective_rows[title]
+        total_tasks = len(row['tasks'])
+        completed_tasks = sum(1 for task in row['tasks'] if task['done'])
+        completion_pct = round((completed_tasks / total_tasks) * 100, 1) if total_tasks else 0.0
+
+        progress.append(
+            {
+                'title': row['title'],
+                'department': row.get('department'),
+                'priority': row.get('priority'),
+                'total_tasks': total_tasks,
+                'completed_tasks': completed_tasks,
+                'completion_pct': completion_pct,
+                'tasks': row['tasks'],
+            }
+        )
+
+    return progress
+
+
+def summarize_objective_progress(tasks_data: dict) -> dict:
+    """Return objective progress summary counts and at-risk objective list."""
+    objectives = get_objective_progress(tasks_data)
+    at_risk = [
+        objective for objective in objectives
+        if objective['total_tasks'] > 0 and objective['completed_tasks'] == 0
+    ]
+    on_track = sum(1 for objective in objectives if objective['completion_pct'] > 0)
+
+    return {
+        'total_objectives': len(objectives),
+        'on_track_objectives': on_track,
+        'at_risk_objectives': at_risk,
+    }
+
+
 def get_section_display_name(section: str, personal: bool = False) -> str:
     """Get human-readable section name."""
     section_names = {
