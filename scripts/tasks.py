@@ -422,6 +422,29 @@ def archive_done(args):
     print(f"✅ Archived {total} {task_type} tasks to {archive_file.name}{extra}")
 
 
+def cmd_parking_lot(args):
+    """Dispatch parking-lot subcommands."""
+    from parking_lot import list_items, list_stale, add_item, promote_item, drop_item
+
+    tasks_file, _ = get_tasks_file(args.personal)
+    sub = args.pl_command
+
+    if sub == 'list':
+        print(list_items(tasks_file))
+    elif sub == 'add':
+        print(add_item(tasks_file, args.title, dept=args.dept, priority=args.priority))
+    elif sub == 'stale':
+        print(list_stale(tasks_file))
+    elif sub == 'promote':
+        print(promote_item(tasks_file, args.id))
+    elif sub == 'drop':
+        archive_dir = Path(os.getenv(
+            'TASK_TRACKER_ARCHIVE_DIR',
+            str(tasks_file.parent / 'Done Archive')
+        ))
+        print(drop_item(tasks_file, args.id, archive_dir=archive_dir))
+
+
 def main():
     parser = argparse.ArgumentParser(description='Task Tracker CLI (Work & Personal)')
     parser.add_argument('--personal', action='store_true', help='Use Personal Tasks instead of Work Tasks')
@@ -459,9 +482,127 @@ def main():
     archive_parser = subparsers.add_parser('archive', help='Archive completed tasks')
     archive_parser.set_defaults(func=archive_done)
     
+    # Parking Lot subcommands
+    pl_parser = subparsers.add_parser('parking-lot', help='Manage parking lot (backlog)')
+    pl_sub = pl_parser.add_subparsers(dest='pl_command', required=True)
+
+    pl_sub.add_parser('list', help='List parking lot items').set_defaults(func=cmd_parking_lot)
+
+    pl_add = pl_sub.add_parser('add', help='Add item to parking lot')
+    pl_add.add_argument('title', help='Task title')
+    pl_add.add_argument('--dept', help='Department tag (Dev, Sales, etc.)')
+    pl_add.add_argument('--priority', default='low', choices=['urgent', 'high', 'medium', 'low'])
+    pl_add.set_defaults(func=cmd_parking_lot)
+
+    pl_sub.add_parser('stale', help='List stale items (JSON)').set_defaults(func=cmd_parking_lot)
+
+    pl_promote = pl_sub.add_parser('promote', help='Promote item to objectives')
+    pl_promote.add_argument('id', type=int, help='Item ID from list')
+    pl_promote.set_defaults(func=cmd_parking_lot)
+
+    pl_drop = pl_sub.add_parser('drop', help='Drop item (archive as dropped)')
+    pl_drop.add_argument('id', type=int, help='Item ID from list')
+    pl_drop.set_defaults(func=cmd_parking_lot)
+
     args = parser.parse_args()
     args.func(args)
 
 
 if __name__ == '__main__':
     main()
+
+
+# === Delegation CLI Wrappers ===
+
+def cmd_delegated_list(args):
+    """List delegated tasks."""
+    delegation_file = delegation.resolve_delegation_file()
+    delegation.ensure_delegation_file(delegation_file)
+    
+    if args.json:
+        print(delegation.list_items_json(delegation_file, overdue_only=args.overdue))
+    else:
+        items = delegation.list_items(delegation_file, overdue_only=args.overdue)
+        if not items:
+            print("No delegated tasks.")
+            return
+        
+        for item in items:
+            if item.get('id') is None:
+                status_icon = "✅"
+                assignee = item.get('assignee', 'Unknown')
+                title = item.get('title', '')
+                dept = f" #{item.get('department')}" if item.get('department') else ""
+                delegated_date = item.get('delegated', '')
+                completed_date = item.get('completed', '')
+                print(f"  {status_icon} {title} → {assignee}{dept} [delegated::{delegated_date}] [completed::{completed_date}]")
+            else:
+                item_id = item['id']
+                status = item.get('status', 'active')
+                status_icon = "⏰" if status == "awaiting_followup" else "📋"
+                assignee = item.get('assignee', 'Unknown')
+                title = item.get('title', '')
+                dept = f" #{item.get('department')}" if item.get('department') else ""
+                followup_date = item.get('followup', '')
+                print(f"{item_id:2d}. {status_icon} {title} → {assignee}{dept} [followup::{followup_date}]")
+
+
+def cmd_delegated_add(args):
+    """Add a delegated task."""
+    delegation_file = delegation.resolve_delegation_file()
+    delegation.ensure_delegation_file(delegation_file)
+    
+    item = delegation.add_item(
+        path=delegation_file,
+        title=args.task,
+        assignee=args.assignee,
+        followup=args.followup,
+        department=args.dept,
+    )
+    print(f"✅ Delegated task added: {item['title']} → {item['assignee']} [followup::{item['followup']}]")
+
+
+def cmd_delegated_complete(args):
+    """Mark delegated task as complete."""
+    delegation_file = delegation.resolve_delegation_file()
+    delegation.ensure_delegation_file(delegation_file)
+    
+    try:
+        item = delegation.complete_item(delegation_file, args.id)
+        print(f"✅ Completed delegated task: {item['title']} → {item['assignee']}")
+    except ValueError as e:
+        print(f"❌ {e}")
+        sys.exit(1)
+
+
+def cmd_delegated_extend(args):
+    """Extend follow-up date for delegated task."""
+    delegation_file = delegation.resolve_delegation_file()
+    delegation.ensure_delegation_file(delegation_file)
+    
+    try:
+        item = delegation.extend_item(delegation_file, args.id, args.followup)
+        print(f"✅ Extended follow-up date for: {item['title']} → {item['assignee']} [new followup::{item['followup']}]")
+    except ValueError as e:
+        print(f"❌ {e}")
+        sys.exit(1)
+
+
+def cmd_delegated_take_back(args):
+    """Take back a delegated task and add it to objectives."""
+    delegation_file = delegation.resolve_delegation_file()
+    delegation.ensure_delegation_file(delegation_file)
+    
+    try:
+        item = delegation.take_back_item(delegation_file, args.id)
+        
+        work_file, _ = get_tasks_file(personal=False)
+        delegation.insert_taken_back_task(
+            tasks_file=work_file,
+            title=item['title'],
+            department=item.get('department'),
+        )
+        print(f"✅ Took back delegated task: {item['title']} (added to {work_file.name})")
+    except ValueError as e:
+        print(f"❌ {e}")
+        sys.exit(1)
