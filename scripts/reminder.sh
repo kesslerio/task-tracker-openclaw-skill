@@ -38,22 +38,18 @@ ADD_TO_TASKS=false
 INTERACTIVE=true
 DRY_RUN=false
 
+_require_value() { if [[ $# -lt 2 ]]; then echo "Option '$1' requires a value." >&2; exit 1; fi; }
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --in|--at|--every|--when|--agent|--channel|--model)
-      if [[ $# -lt 2 ]]; then
-        echo "Option '$1' requires a value." >&2
-        exit 1
-      fi
-      ;;
     --in|--at|--every|--when)
-      WHEN="$2"; INTERACTIVE=false; shift 2 ;;
+      _require_value "$@"; WHEN="$2"; INTERACTIVE=false; shift 2 ;;
     --agent)
-      AGENT="$2"; shift 2 ;;
+      _require_value "$@"; AGENT="$2"; shift 2 ;;
     --channel)
-      CHANNEL="$2"; shift 2 ;;
+      _require_value "$@"; CHANNEL="$2"; shift 2 ;;
     --model)
-      MODEL="$2"; shift 2 ;;
+      _require_value "$@"; MODEL="$2"; shift 2 ;;
     --add-to-tasks)
       ADD_TO_TASKS=true; shift ;;
     --dry-run)
