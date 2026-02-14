@@ -204,12 +204,24 @@ for job in jobs:
     if is_reminder(job):
         filtered.append(job)
 
-# Sort: active recurring first, then one-shots, then by name
+# Sort chronologically by next due date (soonest first), disabled last
 def sort_key(j):
-    kind = j.get('schedule', {}).get('kind', '')
     enabled = j.get('enabled', True)
-    name = j.get('name', '')
-    return (0 if enabled else 1, 0 if kind == 'cron' else 1, name.lower())
+    state = j.get('state', {})
+    schedule = j.get('schedule', {})
+    # Primary: next run time (use nextRunAtMs, fall back to 'at' schedule, then max int)
+    next_ms = state.get('nextRunAtMs') or 0
+    if not next_ms and schedule.get('kind') == 'at':
+        try:
+            from datetime import datetime
+            at_str = schedule.get('at', '')
+            dt = datetime.fromisoformat(at_str.replace('Z', '+00:00'))
+            next_ms = int(dt.timestamp() * 1000)
+        except:
+            next_ms = 0
+    if not next_ms:
+        next_ms = float('inf')
+    return (0 if enabled else 1, next_ms)
 
 filtered.sort(key=sort_key)
 
