@@ -1,0 +1,7 @@
+{
+  "include_ids": [],
+  "exclude_ids": [],
+  "include_name_patterns": [],
+  "workspaces": ["niemand", "niemand-work"],
+  "recent_days": 30
+}
