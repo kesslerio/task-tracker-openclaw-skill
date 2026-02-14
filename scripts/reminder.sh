@@ -40,6 +40,12 @@ DRY_RUN=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --in|--at|--every|--when|--agent|--channel|--model)
+      if [[ $# -lt 2 ]]; then
+        echo "Option '$1' requires a value." >&2
+        exit 1
+      fi
+      ;;
     --in|--at|--every|--when)
       WHEN="$2"; INTERACTIVE=false; shift 2 ;;
     --agent)

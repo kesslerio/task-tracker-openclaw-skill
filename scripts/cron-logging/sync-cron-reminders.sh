@@ -361,16 +361,18 @@ for job in jobs:
     last_status = state.get('lastStatus', '')
     status = format_status(enabled, last_status, kind)
 
-    # Separate one-shot fired jobs into completed (filtered by cutoff, only successful)
+    # Separate one-shot fired jobs:
+    # - keep successful ones in recently completed (cutoff filtered)
+    # - always keep errored ones in active until resolved
     if kind == 'at' and last_status and last_status != 'null':
-        last_ms = state.get('lastRunAtMs', 0)
-        if last_ms and last_ms >= cutoff_epoch * 1000:
-            # Only mark as completed if status is 'ok', not 'error'
-            if last_status == 'ok':
+        if last_status == 'error':
+            active_rows.append((jid, name, agent, sched_str, next_due, last_fired, 'Error ❌'))
+        elif last_status == 'ok':
+            last_ms = state.get('lastRunAtMs', 0)
+            if last_ms and last_ms >= cutoff_epoch * 1000:
                 completed_rows.append((jid, name, ms_to_datetime(last_ms), 'Fired'))
-            else:
-                # Keep errored one-shots in active with error status
-                active_rows.append((jid, name, agent, sched_str, next_due, last_fired, 'Error ❌'))
+        else:
+            active_rows.append((jid, name, agent, sched_str, next_due, last_fired, status))
     else:
         active_rows.append((jid, name, agent, sched_str, next_due, last_fired, status))
 
