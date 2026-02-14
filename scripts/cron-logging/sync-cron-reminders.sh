@@ -152,17 +152,17 @@ def is_reminder(job):
     if jid in exclude_ids:
         return False
 
-    # Explicit include
+    # Explicit include (bypass workspace filter)
     if jid in include_ids:
         return True
 
-    # Tag-based (future-proof)
-    if isinstance(tags, list) and 'reminder' in tags:
-        return True
-
-    # Workspace filter
+    # Workspace filter - must pass first
     if agent not in workspaces and agent:
         return False
+
+    # Tag-based (future-proof) - after workspace check
+    if isinstance(tags, list) and 'reminder' in tags:
+        return True
 
     # Name/text pattern matching
     for pat in all_patterns:
@@ -335,11 +335,16 @@ for job in jobs:
     last_status = state.get('lastStatus', '')
     status = format_status(enabled, last_status, kind)
 
-    # Separate one-shot fired jobs into completed (filtered by cutoff)
+    # Separate one-shot fired jobs into completed (filtered by cutoff, only successful)
     if kind == 'at' and last_status and last_status != 'null':
         last_ms = state.get('lastRunAtMs', 0)
         if last_ms and last_ms >= cutoff_epoch * 1000:
-            completed_rows.append((jid, name, ms_to_datetime(last_ms), 'Fired'))
+            # Only mark as completed if status is 'ok', not 'error'
+            if last_status == 'ok':
+                completed_rows.append((jid, name, ms_to_datetime(last_ms), 'Fired'))
+            else:
+                # Keep errored one-shots in active with error status
+                active_rows.append((jid, name, agent, sched_str, next_due, last_fired, 'Error ❌'))
     else:
         active_rows.append((jid, name, agent, sched_str, next_due, last_fired, status))
 

@@ -291,14 +291,18 @@ if cron_expr:
 # Try relative
 dt = parse_relative(input_str)
 if dt:
-    iso = dt.strftime('%Y-%m-%dT%H:%M:%S')
+    # Use local timezone offset to ensure correct interpretation
+    offset = dt.strftime('%z')
+    iso = dt.strftime('%Y-%m-%dT%H:%M:%S') + offset
     print(f'at {iso}')
     sys.exit(0)
 
 # Try absolute
 dt = parse_absolute(input_str)
 if dt:
-    iso = dt.strftime('%Y-%m-%dT%H:%M:%S')
+    # Use local timezone offset to ensure correct interpretation
+    offset = dt.strftime('%z')
+    iso = dt.strftime('%Y-%m-%dT%H:%M:%S') + offset
     print(f'at {iso}')
     sys.exit(0)
 
