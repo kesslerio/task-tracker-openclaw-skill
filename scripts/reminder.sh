@@ -219,20 +219,24 @@ def parse_absolute(s):
         if delta == 0: delta = 7
         return (now + timedelta(days=delta)).replace(hour=9, minute=0, second=0, microsecond=0)
 
-    # ISO date: 2026-02-15 [10:00]
+    # ISO date: 2026-02-15 [10:00] - treat as local time
     m = re.match(r'^(\d{4}-\d{2}-\d{2})\s*(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$', s)
     if m:
+        # Parse as local naive datetime, then make timezone-aware
         d = datetime.strptime(m.group(1), '%Y-%m-%d')
         h = int(m.group(2))
         mi = int(m.group(3)) if m.group(3) else 0
         ampm = m.group(4)
         if ampm == 'pm' and h < 12: h += 12
         if ampm == 'am' and h == 12: h = 0
-        return d.replace(hour=h, minute=mi)
+        # Get local timezone and apply
+        local_tz = datetime.now().astimezone().tzinfo
+        return d.replace(hour=h, minute=mi, tzinfo=local_tz)
 
     m = re.match(r'^(\d{4}-\d{2}-\d{2})$', s)
     if m:
-        return datetime.strptime(m.group(1), '%Y-%m-%d').replace(hour=9, minute=0)
+        local_tz = datetime.now().astimezone().tzinfo
+        return datetime.strptime(m.group(1), '%Y-%m-%d').replace(hour=9, minute=0, tzinfo=local_tz)
 
     return None
 

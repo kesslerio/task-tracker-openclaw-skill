@@ -260,8 +260,9 @@ def ms_to_date(ms):
         return '-'
     try:
         secs = int(ms) // 1000
-        from datetime import datetime, timezone, timedelta
-        pt = timezone(timedelta(hours=-8))
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        pt = ZoneInfo('America/Los_Angeles')
         dt = datetime.fromtimestamp(secs, tz=pt)
         return dt.strftime('%Y-%m-%d')
     except:
