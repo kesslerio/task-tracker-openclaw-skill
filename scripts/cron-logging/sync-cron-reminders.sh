@@ -114,6 +114,7 @@ log "Filtering and formatting reminder crons..."
 FILTERED_OUTPUT=$(echo "$CRON_JSON" | python3 -c "
 import json, sys, re
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 data = json.load(sys.stdin)
 jobs = data.get('jobs', [])
@@ -221,6 +222,10 @@ HEADER
   echo "$FILTERED_OUTPUT" | python3 -c "
 import json, sys, subprocess, os
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+
+# Recent days cutoff passed from bash
+cutoff_epoch = $cutoff_epoch
 
 jobs = json.load(sys.stdin)
 
@@ -242,7 +247,7 @@ def ms_to_datetime(ms):
         return '-'
     try:
         secs = int(ms) // 1000
-        pt = timezone(timedelta(hours=-8))
+        pt = ZoneInfo('America/Los_Angeles')
         dt = datetime.fromtimestamp(secs, tz=pt)
         return dt.strftime('%Y-%m-%d %I:%M%P')
     except:
@@ -316,8 +321,9 @@ for job in jobs:
         at_str = schedule.get('at', '')
         try:
             from datetime import datetime
+            from zoneinfo import ZoneInfo
             dt = datetime.fromisoformat(at_str.replace('Z', '+00:00'))
-            pt = timezone(timedelta(hours=-8))
+            pt = ZoneInfo('America/Los_Angeles')
             sched_str = 'Once: ' + dt.astimezone(pt).strftime('%Y-%m-%d %I:%M%P PT')
         except:
             sched_str = f'Once: {at_str}'
@@ -329,10 +335,10 @@ for job in jobs:
     last_status = state.get('lastStatus', '')
     status = format_status(enabled, last_status, kind)
 
-    # Separate one-shot fired jobs into completed
+    # Separate one-shot fired jobs into completed (filtered by cutoff)
     if kind == 'at' and last_status and last_status != 'null':
         last_ms = state.get('lastRunAtMs', 0)
-        if last_ms:
+        if last_ms and last_ms >= cutoff_epoch * 1000:
             completed_rows.append((jid, name, ms_to_datetime(last_ms), 'Fired'))
     else:
         active_rows.append((jid, name, agent, sched_str, next_due, last_fired, status))

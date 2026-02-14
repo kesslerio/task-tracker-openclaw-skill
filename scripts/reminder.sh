@@ -329,8 +329,8 @@ CMD+=(--agent "$AGENT")
 CMD+=(--model "$MODEL")
 CMD+=(--session "$DEFAULT_SESSION")
 CMD+=(--announce)
-CMD+=(--channel "telegram")
-CMD+=(--to "${CHANNEL#telegram:}")
+CMD+=(--channel "${CHANNEL%%:*}")
+CMD+=(--to "${CHANNEL#*:}")
 
 # Message payload: the reminder text
 CMD+=(--message "Reminder: ${REMINDER_TEXT}")
