@@ -104,6 +104,31 @@ try:
     print('|'.join(cfg.get('include_name_patterns', [])))
 except: pass
 " 2>/dev/null || echo "")
+
+  # Load workspaces and recent_days from config (fallback to defaults)
+  CONFIG_WORKSPACES=$(python3 -c "
+import json, sys
+try:
+    cfg = json.load(open('$CONFIG_FILE'))
+    ws = cfg.get('workspaces', [])
+    print(' '.join(ws) if ws else '')
+except: pass
+" 2>/dev/null || echo "")
+  if [[ -n "$CONFIG_WORKSPACES" ]]; then
+    WORKSPACES=($CONFIG_WORKSPACES)
+  fi
+
+  CONFIG_RECENT_DAYS=$(python3 -c "
+import json, sys
+try:
+    cfg = json.load(open('$CONFIG_FILE'))
+    rd = cfg.get('recent_days')
+    print(rd if rd else '')
+except: pass
+" 2>/dev/null || echo "")
+  if [[ -n "$CONFIG_RECENT_DAYS" ]]; then
+    RECENT_DAYS=$CONFIG_RECENT_DAYS
+  fi
 fi
 
 # --- Filter and format -------------------------------------------------------

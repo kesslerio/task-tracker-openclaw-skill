@@ -143,7 +143,7 @@ import re, sys
 from datetime import datetime, timedelta, timezone
 
 input_str = '''${input}'''
-now = datetime.now()
+now = datetime.now(timezone.utc).astimezone()  # Local timezone-aware datetime
 
 def parse_relative(s):
     \"\"\"Parse relative durations: 'in 2 days', '3h', '1w', 'in 30m'\"\"\"
