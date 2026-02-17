@@ -222,6 +222,7 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
         # Detect section headers
         if line.startswith('## '):
             current_task = None
+            current_department = None  # Reset department at new section
             if parsed_format == 'objectives':
                 if re.match(r'##\s+Objectives\b', line, re.IGNORECASE):
                     current_section = 'objectives'
