@@ -246,25 +246,19 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 if section_match:
                     emoji = section_match.group(1)
                     current_section = mapping.get(emoji)
-            
-            # NEW: Handle ### sub-sections (e.g. ### 👥 Hiring #hiring)
-            # These define the department for following tasks, not storage sections
-            if line.startswith('### '):
-                # Extract department from ### line, e.g. ### 👥 Hiring #hiring
-                # Default to 'today' as storage section
-                current_section = 'today'
-                # Try to extract department from the line (e.g. "Hiring")
-                section_match = re.match(r'###\s+[^\s]+\s+([A-Za-z]+)\s*#?', line)
-                if section_match:
-                    current_department = section_match.group(1).title()
-                current_objective = None
-                continue
-            else:
-                # Legacy format: ## 🔴 High Priority
-                section_match = re.match(r'## ([🔴🟡🟢📅✅])', line)
-                if section_match:
-                    emoji = section_match.group(1)
-                    current_section = mapping.get(emoji)
+            continue
+        
+        # NEW: Handle ### sub-sections (e.g. ### 👥 Hiring #hiring)
+        # These define the department for following tasks, not storage sections
+        if line.startswith('### '):
+            # Extract department from ### line, e.g. ### 👥 Hiring #hiring
+            # Default to 'today' as storage section
+            current_section = 'today'
+            # Try to extract department from the line (e.g. "Hiring")
+            section_match = re.match(r'###\s+[^\s]+\s+([A-Za-z]+)\s*#?', line)
+            if section_match:
+                current_department = section_match.group(1).title()
+            current_objective = None
             continue
         
         # Detect task line
@@ -384,7 +378,7 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 'section': current_section,
                 'parent_objective': parent_objective,
                 'is_objective': is_objective,
-                'department': department,
+                'department': department or current_department,
                 'priority': priority,
                 'due': due_str,
                 'area': area,
