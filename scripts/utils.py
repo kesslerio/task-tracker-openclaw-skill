@@ -85,6 +85,15 @@ PRIORITY_TAGS = {
     'low': 'low',
 }
 
+# Priority emojis used in new Tasks plugin format
+PRIORITY_EMOJI_MAP = {
+    '🔺': 'urgent',  # Highest
+    '⏫': 'high',
+    '🔼': 'medium',
+    '🔽': 'low',
+    '⏬': 'low',     # Lowest
+}
+
 PRIORITY_TO_SECTION = {
     'urgent': 'q1',
     'high': 'q1',
@@ -204,6 +213,7 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
     parsed_format = detect_format(content, format)
     
     current_section = None
+    current_department = None  # Track department from ### lines
     current_task = None
     current_objective = None
     today = datetime.now().date()
@@ -236,6 +246,17 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 if section_match:
                     emoji = section_match.group(1)
                     current_section = mapping.get(emoji)
+            # NEW: Handle ### sub-sections (e.g. ### 👥 Hiring #hiring)
+            # These define the department for following tasks, not storage sections
+            elif line.startswith('### '):
+                # Extract department from ### line, e.g. ### 👥 Hiring #hiring
+                # Default to 'today' as storage section
+                current_section = 'today'
+                # Try to extract department from the line (e.g. "Hiring")
+                section_match = re.match(r'###\s+[^\s]+\s+([A-Za-z]+)\s*#?', line)
+                if section_match:
+                    current_department = section_match.group(1).title()
+                current_objective = None
             else:
                 # Legacy format: ## 🔴 High Priority
                 section_match = re.match(r'## ([🔴🟡🟢📅✅])', line)
@@ -304,6 +325,18 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 date_match = re.search(r'🗓️(\d{4}-\d{2}-\d{2})', rest)
                 if date_match:
                     due_str = date_match.group(1)
+                
+                # NEW: Parse 📅 YYYY-MM-DD format (Tasks plugin)
+                date_match = re.search(r'📅\s*(\d{4}-\d{2}-\d{2})', rest)
+                if date_match:
+                    due_str = date_match.group(1)
+                
+                # NEW: Parse priority emojis 🔺 ⏫ 🔼 🔽 ⏬
+                for emoji, prio in PRIORITY_EMOJI_MAP.items():
+                    if emoji in rest and priority is None:
+                        priority = prio
+                        # Strip the emoji from rest
+                        rest = rest.replace(emoji, '').strip()
                 
                 # Parse inline fields (handle multi-word values)
                 # Pattern: field:: value (but not field:: next_field::)
