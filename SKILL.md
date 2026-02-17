@@ -80,9 +80,39 @@ This skill reads tasks directly from markdown files. Works best with Obsidian bu
 | **Dataview** | TASK queries in daily notes | ✅ Yes |
 | **Templater** | Auto-populate daily note templates | Optional |
 | **Periodic Notes** | Daily/weekly note templates | Optional |
-| **Tasks** | Advanced task management | Optional |
+| **[Tasks](https://github.com/obsidian-tasks-group/obsidian-tasks)** | Advanced task management | Optional (recommended) |
+
+> **Note:** The Tasks plugin provides a richer task format with `📅` due dates, `🔺` priorities, and `✅` completion dates. This skill supports both the emoji format (below) and the Tasks plugin format.
 
 ### Task Format
+
+This skill supports **two task formats**:
+
+#### 1. Tasks Plugin Format (Recommended)
+
+If you use the [Obsidian Tasks](https://github.com/obsidian-tasks-group/obsidian-tasks) plugin:
+
+```markdown
+- [ ] **Task name** 📅 2026-01-22 🔺 #tag
+- [x] Completed task ✅ 2026-01-20 🔼
+```
+
+**Features:**
+- `📅 YYYY-MM-DD` — Due date
+- `🔺` — Urgent (maps to Q1)
+- `⏫` — High priority (maps to Q1)
+- `🔼` — Medium priority (maps to Q2)
+- `🔽`/`⏬` — Low priority (maps to backlog)
+- `✅ YYYY-MM-DD` — Completion timestamp
+- `#tag` — Department/category tags
+
+**Sub-sections as departments:**
+```markdown
+### 👥 Hiring #hiring
+- [ ] Post to Indeed 📅 2026-02-17 🔺
+```
+
+#### 2. Emoji Date Format (Legacy/Dataview)
 
 Tasks use the **emoji date format** for Dataview compatibility:
 
@@ -91,7 +121,7 @@ Tasks use the **emoji date format** for Dataview compatibility:
   - Additional notes here
 ```
 
-#### Inline Fields
+**Inline Fields (Legacy format):**
 
 | Field | Purpose | Example |
 |-------|---------|---------|
