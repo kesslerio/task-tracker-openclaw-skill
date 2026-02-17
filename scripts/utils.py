@@ -151,7 +151,7 @@ def _extract_tags_from_title(title: str) -> tuple[str, str | None, str | None]:
 def _split_plain_task_body(task_body: str) -> tuple[str, str]:
     """Split plain task body into title and metadata suffix."""
     marker_match = re.search(
-        r'\s+(🗓️\d{4}-\d{2}-\d{2}|(?:area|goal|owner|blocks|type|recur|estimate|depends|sprint)::)',
+        r'\s+(🗓️\d{4}-\d{2}-\d{2}|📅\d{4}-\d{2}-\d{2}|📅\s+\d{4}-\d{2}-\d{2}|🔺|⏫|🔼|🔽|⏬|(?:area|goal|owner|blocks|type|recur|estimate|depends|sprint)::)',
         task_body,
     )
     if marker_match:
@@ -246,9 +246,10 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 if section_match:
                     emoji = section_match.group(1)
                     current_section = mapping.get(emoji)
+            
             # NEW: Handle ### sub-sections (e.g. ### 👥 Hiring #hiring)
             # These define the department for following tasks, not storage sections
-            elif line.startswith('### '):
+            if line.startswith('### '):
                 # Extract department from ### line, e.g. ### 👥 Hiring #hiring
                 # Default to 'today' as storage section
                 current_section = 'today'
@@ -257,6 +258,7 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 if section_match:
                     current_department = section_match.group(1).title()
                 current_objective = None
+                continue
             else:
                 # Legacy format: ## 🔴 High Priority
                 section_match = re.match(r'## ([🔴🟡🟢📅✅])', line)
