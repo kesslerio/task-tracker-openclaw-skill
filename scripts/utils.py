@@ -247,6 +247,10 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 if section_match:
                     emoji = section_match.group(1)
                     current_section = mapping.get(emoji)
+                else:
+                    # Unrecognized ## header — clear section so tasks don't
+                    # inherit a prior section (e.g. 🟢 Waiting, 📅 Backlog).
+                    current_section = None
             continue
         
         # Handle ### sub-sections (e.g. ### 👥 Hiring #hiring) — objectives format only.
@@ -260,8 +264,12 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
             section_match = re.match(r'###\s+[^\s]+\s+([A-Za-z]+)\s*#?', line)
             if section_match:
                 current_department = section_match.group(1).title()
-            # Only switch to 'today' when NOT inside the Objectives section
-            if current_section != 'objectives':
+            # Only switch to 'today' when inside an active content section
+            # (i.e. the ## 📋 All Tasks section). Do NOT override 'objectives',
+            # 'parking_lot', 'backlog', or 'done' — tasks there should stay
+            # in their intended bucket even when grouped by ### headings.
+            ACTIVE_SECTIONS = {None, 'today', 'q1', 'q2', 'q3', 'team'}
+            if current_section in ACTIVE_SECTIONS:
                 current_section = 'today'
             current_objective = None
             continue
@@ -817,22 +825,14 @@ def regroup_by_effective_priority(tasks_data: dict, reference_date=None) -> dict
             # the parser marks as objectives headers — not actionable tasks.
             if task.get('is_objective'):
                 continue
-            # Deduplicate cross-section duplicates only: tasks that appear in
-            # both 'objectives' and 'today' sections due to the objectives format
-            # listing the same task twice. We record a canonical key only when the
-            # task came from 'objectives'; if we later see the same task from
-            # 'today' (same title+due+department) we skip it. Same-section
-            # duplicates (intentional repeated tasks) are NOT deduplicated.
-            task_section = task.get('section', '')
-            dedup_key = (
-                task.get('title', ''),
-                task.get('due', ''),
-                task.get('department', ''),
-            )
-            if task_section == 'today' and dedup_key in seen:
+            # Deduplicate by object identity: track which task objects (by id)
+            # have already been emitted. parse_tasks reuses the same dict object
+            # when the same task appears in multiple buckets (e.g. q1 and q1 from
+            # priority mapping), so id-based dedup is exact — no false positives.
+            task_id = id(task)
+            if task_id in seen:
                 continue
-            if task_section == 'objectives':
-                seen.add(dedup_key)
+            seen.add(task_id)
             eff = effective_priority(task, reference_date)
             # Shallow copy to avoid mutating the shared task dict
             display_task = {**task, '_escalation_indicator': eff['indicator']}
