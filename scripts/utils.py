@@ -250,15 +250,19 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
             continue
         
         # Handle ### sub-sections (e.g. ### 👥 Hiring #hiring) — objectives format only.
-        # In objectives format these indicate department groupings under ## 📋 All Tasks.
-        # In legacy/obsidian format, ### lines are ignored (current_section stays intact).
+        # In objectives format, ### lines under ## 📋 All Tasks indicate department
+        # groupings. Tasks there go into the 'today' bucket. However, ### lines
+        # that appear while current_section == 'objectives' must NOT override the
+        # section — objective sub-items should stay classified as objectives.
+        # In legacy/obsidian format, ### lines are ignored entirely.
         if line.startswith('### ') and parsed_format == 'objectives':
             # Extract department from ### line, e.g. ### 👥 Hiring #hiring
             section_match = re.match(r'###\s+[^\s]+\s+([A-Za-z]+)\s*#?', line)
             if section_match:
                 current_department = section_match.group(1).title()
-            # Sub-sections under ## 📋 All Tasks belong to 'today' storage bucket
-            current_section = 'today'
+            # Only switch to 'today' when NOT inside the Objectives section
+            if current_section != 'objectives':
+                current_section = 'today'
             current_objective = None
             continue
         
@@ -813,18 +817,22 @@ def regroup_by_effective_priority(tasks_data: dict, reference_date=None) -> dict
             # the parser marks as objectives headers — not actionable tasks.
             if task.get('is_objective'):
                 continue
-            # Dedup by (title, due, department) to collapse cross-section
-            # duplicates (e.g. same task in both 'objectives' and 'today')
-            # while still distinguishing genuinely distinct tasks that share
-            # a name+date but belong to different departments.
+            # Deduplicate cross-section duplicates only: tasks that appear in
+            # both 'objectives' and 'today' sections due to the objectives format
+            # listing the same task twice. We record a canonical key only when the
+            # task came from 'objectives'; if we later see the same task from
+            # 'today' (same title+due+department) we skip it. Same-section
+            # duplicates (intentional repeated tasks) are NOT deduplicated.
+            task_section = task.get('section', '')
             dedup_key = (
                 task.get('title', ''),
                 task.get('due', ''),
                 task.get('department', ''),
             )
-            if dedup_key in seen:
+            if task_section == 'today' and dedup_key in seen:
                 continue
-            seen.add(dedup_key)
+            if task_section == 'objectives':
+                seen.add(dedup_key)
             eff = effective_priority(task, reference_date)
             # Shallow copy to avoid mutating the shared task dict
             display_task = {**task, '_escalation_indicator': eff['indicator']}
