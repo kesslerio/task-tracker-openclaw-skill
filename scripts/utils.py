@@ -247,41 +247,18 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 if section_match:
                     emoji = section_match.group(1)
                     current_section = mapping.get(emoji)
-                else:
-                    # Unrecognized ## header — clear section so tasks don't
-                    # inherit a prior section (e.g. 🟢 Waiting, 📅 Backlog).
-                    current_section = None
             continue
         
-        # Handle ### sub-sections (e.g. ### 👥 Hiring #hiring) — objectives format only.
-        # In objectives format, ### lines under ## 📋 All Tasks indicate department
-        # groupings. Tasks there go into the 'today' bucket. However, ### lines
-        # that appear while current_section == 'objectives' must NOT override the
-        # section — objective sub-items should stay classified as objectives.
-        # In legacy/obsidian format, ### lines are ignored entirely.
-        if line.startswith('### ') and parsed_format == 'objectives':
+        # NEW: Handle ### sub-sections (e.g. ### 👥 Hiring #hiring)
+        # These define the department for following tasks, not storage sections
+        if line.startswith('### '):
             # Extract department from ### line, e.g. ### 👥 Hiring #hiring
-            # Prefer #tag at end of heading (e.g. ### 👥 Business Development #bizdev → BizDev)
-            # Fall back to first word after emoji (e.g. ### 👥 Hiring → Hiring)
-            tag_match = re.search(r'#([A-Za-z][A-Za-z0-9_-]*)', line)
-            word_match = re.match(r'###\s+[^\s]+\s+([A-Za-z]+)', line)
-            if tag_match:
-                raw = tag_match.group(1).lower()
-                current_department = DEPARTMENT_TAGS.get(raw, tag_match.group(1).title())
-            elif word_match:
-                raw = word_match.group(1).lower()
-                current_department = DEPARTMENT_TAGS.get(raw, word_match.group(1).title())
-            # Only switch to 'today' when inside an active content section
-            # (i.e. the ## 📋 All Tasks section). Do NOT override 'objectives',
-            # 'parking_lot', 'backlog', or 'done' — tasks there should stay
-            # in their intended bucket even when grouped by ### headings.
-            # Only switch to 'today' for neutral/ambiguous sections.
-            # Q-sections (q1/q2/q3/team) already have explicit priority context
-            # from their ## header — preserve them so tasks don't lose their bucket.
-            # Parking lot/backlog/done/objectives are also preserved.
-            SWITCH_TO_TODAY_SECTIONS = {None, 'today'}
-            if current_section in SWITCH_TO_TODAY_SECTIONS:
-                current_section = 'today'
+            # Default to 'today' as storage section
+            current_section = 'today'
+            # Try to extract department from the line (e.g. "Hiring")
+            section_match = re.match(r'###\s+[^\s]+\s+([A-Za-z]+)\s*#?', line)
+            if section_match:
+                current_department = section_match.group(1).title()
             current_objective = None
             continue
         
