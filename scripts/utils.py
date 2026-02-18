@@ -263,7 +263,10 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
             # Extract department from ### line, e.g. ### 👥 Hiring #hiring
             section_match = re.match(r'###\s+[^\s]+\s+([A-Za-z]+)\s*#?', line)
             if section_match:
-                current_department = section_match.group(1).title()
+                raw = section_match.group(1).lower()
+                # Use canonical tag mapping (HR, BizDev, etc.) for consistency
+                # with department names derived from #tag parsing
+                current_department = DEPARTMENT_TAGS.get(raw, section_match.group(1).title())
             # Only switch to 'today' when inside an active content section
             # (i.e. the ## 📋 All Tasks section). Do NOT override 'objectives',
             # 'parking_lot', 'backlog', or 'done' — tasks there should stay
