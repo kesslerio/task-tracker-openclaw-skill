@@ -249,16 +249,16 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                     current_section = mapping.get(emoji)
             continue
         
-        # NEW: Handle ### sub-sections (e.g. ### 👥 Hiring #hiring)
-        # These define the department for following tasks, not storage sections
-        if line.startswith('### '):
+        # Handle ### sub-sections (e.g. ### 👥 Hiring #hiring) — objectives format only.
+        # In objectives format these indicate department groupings under ## 📋 All Tasks.
+        # In legacy/obsidian format, ### lines are ignored (current_section stays intact).
+        if line.startswith('### ') and parsed_format == 'objectives':
             # Extract department from ### line, e.g. ### 👥 Hiring #hiring
-            # Default to 'today' as storage section
-            current_section = 'today'
-            # Try to extract department from the line (e.g. "Hiring")
             section_match = re.match(r'###\s+[^\s]+\s+([A-Za-z]+)\s*#?', line)
             if section_match:
                 current_department = section_match.group(1).title()
+            # Sub-sections under ## 📋 All Tasks belong to 'today' storage bucket
+            current_section = 'today'
             current_objective = None
             continue
         
@@ -821,7 +821,15 @@ def regroup_by_effective_priority(tasks_data: dict, reference_date=None) -> dict
                 stripped = _re.sub(r'\s*#\w+', '', title).strip()
                 if not stripped or ' ' not in stripped:
                     continue
-            dedup_key = (task.get('title', ''), task.get('due', ''))
+            # Dedup key includes original section + department to avoid
+            # false merges of distinct tasks that share title+due (e.g. same
+            # task name in different departments, or recurring tasks).
+            dedup_key = (
+                task.get('title', ''),
+                task.get('due', ''),
+                task.get('section', ''),
+                task.get('department', ''),
+            )
             if dedup_key in seen:
                 continue
             seen.add(dedup_key)
