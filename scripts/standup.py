@@ -34,10 +34,10 @@ from utils import (
 
 
 def group_by_area(tasks):
-    """Group tasks by area."""
+    """Group tasks by area (falls back to department for objectives format tasks)."""
     areas = {}
     for t in tasks:
-        area = t.get('area') or 'Uncategorized'
+        area = t.get('area') or t.get('department') or 'Uncategorized'
         if area not in areas:
             areas[area] = []
         areas[area].append(t)
