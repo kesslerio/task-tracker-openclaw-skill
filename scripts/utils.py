@@ -275,8 +275,12 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
             # (i.e. the ## 📋 All Tasks section). Do NOT override 'objectives',
             # 'parking_lot', 'backlog', or 'done' — tasks there should stay
             # in their intended bucket even when grouped by ### headings.
-            ACTIVE_SECTIONS = {None, 'today', 'q1', 'q2', 'q3', 'team'}
-            if current_section in ACTIVE_SECTIONS:
+            # Only switch to 'today' for neutral/ambiguous sections.
+            # Q-sections (q1/q2/q3/team) already have explicit priority context
+            # from their ## header — preserve them so tasks don't lose their bucket.
+            # Parking lot/backlog/done/objectives are also preserved.
+            SWITCH_TO_TODAY_SECTIONS = {None, 'today'}
+            if current_section in SWITCH_TO_TODAY_SECTIONS:
                 current_section = 'today'
             current_objective = None
             continue
@@ -832,10 +836,19 @@ def regroup_by_effective_priority(tasks_data: dict, reference_date=None) -> dict
             # the parser marks as objectives headers — not actionable tasks.
             if task.get('is_objective'):
                 continue
-            # Deduplicate by object identity: track which task objects (by id)
-            # have already been emitted. parse_tasks reuses the same dict object
-            # when the same task appears in multiple buckets (e.g. q1 and q1 from
-            # priority mapping), so id-based dedup is exact — no false positives.
+            # Two-layer dedup:
+            # 1. Semantic: objectives-format lists same task in both 'objectives'
+            #    and 'today' as separate objects. Record (title,due) from 'objectives'
+            #    tasks; skip matching 'today' tasks. Preserves same-section and
+            #    q-section duplicates (intentional repeated tasks unaffected).
+            # 2. Object-identity: guard same dict object appearing in multiple
+            #    q-buckets due to priority mapping (exact, no false positives).
+            task_section = task.get('section', '')
+            semantic_key = (task.get('title', ''), task.get('due', ''))
+            if task_section == 'today' and semantic_key in seen:
+                continue
+            if task_section == 'objectives':
+                seen.add(semantic_key)
             task_id = id(task)
             if task_id in seen:
                 continue
