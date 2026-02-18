@@ -241,8 +241,8 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                     section_match = re.match(r'## ([🔴🟡🟠👥⚪✅])', line)
                     current_section = mapping.get(section_match.group(1)) if section_match else None
                     current_objective = None
-            elif parsed_format == 'obsidian':
-                # Match emoji at start of section name
+            elif parsed_format in ('obsidian', 'legacy'):
+                # Match emoji at start of section name (both formats use same emoji headers)
                 section_match = re.match(r'## ([🔴🟡🟠👥⚪✅])', line)
                 if section_match:
                     emoji = section_match.group(1)
