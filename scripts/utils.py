@@ -808,26 +808,18 @@ def regroup_by_effective_priority(tasks_data: dict, reference_date=None) -> dict
     seen: set = set()
     for section_key in ('q1', 'q2', 'q3'):
         for task in tasks_data.get(section_key, []):
-            # Skip section-header pseudo-tasks in objectives format.
-            # These are parent objective lines like "- [ ] Hiring #hiring" or
-            # "- [ ] Marketing" that have no due date and no priority emoji —
-            # they act as grouping headers, not actionable tasks.
-            if task.get('section') == 'objectives' and not task.get('due') and not any(
-                c in task.get('title', '') for c in ['📅', '🔺', '⏫', '🔼', '🔽', '⏬']
-            ):
-                title = task.get('title', '')
-                # Header heuristic: single word, or word(s) followed only by #tags
-                import re as _re
-                stripped = _re.sub(r'\s*#\w+', '', title).strip()
-                if not stripped or ' ' not in stripped:
-                    continue
-            # Dedup key includes original section + department to avoid
-            # false merges of distinct tasks that share title+due (e.g. same
-            # task name in different departments, or recurring tasks).
+            # Skip objective-header pseudo-tasks (is_objective=True).
+            # These are parent grouping lines like "- [ ] Hiring #hiring" that
+            # the parser marks as objectives headers — not actionable tasks.
+            if task.get('is_objective'):
+                continue
+            # Dedup by (title, due, department) to collapse cross-section
+            # duplicates (e.g. same task in both 'objectives' and 'today')
+            # while still distinguishing genuinely distinct tasks that share
+            # a name+date but belong to different departments.
             dedup_key = (
                 task.get('title', ''),
                 task.get('due', ''),
-                task.get('section', ''),
                 task.get('department', ''),
             )
             if dedup_key in seen:
