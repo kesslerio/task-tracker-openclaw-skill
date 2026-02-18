@@ -722,6 +722,20 @@ def effective_priority(task: dict, reference_date=None) -> dict:
     else:
         ref = reference_date
 
+    # Normalize non-q sections (objectives/today/parking_lot) to q1/q2/q3
+    # based on task priority so regroup_by_effective_priority never gets
+    # an unknown key.
+    SECTION_PRIORITY_FALLBACK = {
+        'urgent': 'q1',
+        'high': 'q1',
+        'medium': 'q2',
+        'low': 'q3',
+    }
+    if section not in ('q1', 'q2', 'q3'):
+        priority = task.get('priority') or 'medium'
+        section = SECTION_PRIORITY_FALLBACK.get(priority, 'q2')
+        original_section = original_section  # keep original for reference
+
     # Only escalate open tasks with a due date in eligible sections
     if task.get('done') or not due_str or section not in ('q2', 'q3'):
         return {
@@ -786,10 +800,31 @@ def regroup_by_effective_priority(tasks_data: dict, reference_date=None) -> dict
     Returns dict with keys 'q1', 'q2', 'q3'. Each task is a shallow copy
     with a transient '_escalation_indicator' key — original task dicts are
     not mutated.
+
+    Deduplicates by (title, due) to avoid double-counting tasks that appear
+    in both objectives and today sections of the objectives format.
     """
     regrouped = {'q1': [], 'q2': [], 'q3': []}
+    seen: set = set()
     for section_key in ('q1', 'q2', 'q3'):
         for task in tasks_data.get(section_key, []):
+            # Skip section-header pseudo-tasks in objectives format.
+            # These are parent objective lines like "- [ ] Hiring #hiring" or
+            # "- [ ] Marketing" that have no due date and no priority emoji —
+            # they act as grouping headers, not actionable tasks.
+            if task.get('section') == 'objectives' and not task.get('due') and not any(
+                c in task.get('title', '') for c in ['📅', '🔺', '⏫', '🔼', '🔽', '⏬']
+            ):
+                title = task.get('title', '')
+                # Header heuristic: single word, or word(s) followed only by #tags
+                import re as _re
+                stripped = _re.sub(r'\s*#\w+', '', title).strip()
+                if not stripped or ' ' not in stripped:
+                    continue
+            dedup_key = (task.get('title', ''), task.get('due', ''))
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
             eff = effective_priority(task, reference_date)
             # Shallow copy to avoid mutating the shared task dict
             display_task = {**task, '_escalation_indicator': eff['indicator']}
