@@ -261,12 +261,16 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
         # In legacy/obsidian format, ### lines are ignored entirely.
         if line.startswith('### ') and parsed_format == 'objectives':
             # Extract department from ### line, e.g. ### 👥 Hiring #hiring
-            section_match = re.match(r'###\s+[^\s]+\s+([A-Za-z]+)\s*#?', line)
-            if section_match:
-                raw = section_match.group(1).lower()
-                # Use canonical tag mapping (HR, BizDev, etc.) for consistency
-                # with department names derived from #tag parsing
-                current_department = DEPARTMENT_TAGS.get(raw, section_match.group(1).title())
+            # Prefer #tag at end of heading (e.g. ### 👥 Business Development #bizdev → BizDev)
+            # Fall back to first word after emoji (e.g. ### 👥 Hiring → Hiring)
+            tag_match = re.search(r'#([A-Za-z][A-Za-z0-9_-]*)', line)
+            word_match = re.match(r'###\s+[^\s]+\s+([A-Za-z]+)', line)
+            if tag_match:
+                raw = tag_match.group(1).lower()
+                current_department = DEPARTMENT_TAGS.get(raw, tag_match.group(1).title())
+            elif word_match:
+                raw = word_match.group(1).lower()
+                current_department = DEPARTMENT_TAGS.get(raw, word_match.group(1).title())
             # Only switch to 'today' when inside an active content section
             # (i.e. the ## 📋 All Tasks section). Do NOT override 'objectives',
             # 'parking_lot', 'backlog', or 'done' — tasks there should stay
