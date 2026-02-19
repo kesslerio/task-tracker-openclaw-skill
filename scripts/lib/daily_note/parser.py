@@ -70,7 +70,7 @@ def parse_top_priority_tasks(content: str) -> list[str]:
     tasks = []
     in_priority_section = False
     priority_headers = [
-        r"^##\s*top\s",
+        r"^##\s*top\b",
         r"^##\s*top\s*priority",
         r"^##\s*q1",
         r"^##\s*🔴",

@@ -11,7 +11,7 @@ def normalize_task(task: str) -> str:
     - Lowercase for case-insensitive comparison
     """
     # Remove leading markdown task prefix
-    task = re.sub(r"^-\s*\[\s*\]\s*", "", task)
+    task = re.sub(r"^\s*-\s*\[\s*\]\s*", "", task)
     # Strip whitespace
     task = task.strip()
     # Lowercase for comparison
