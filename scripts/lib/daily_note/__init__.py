@@ -1,0 +1,1 @@
+"""Daily note creation utilities."""
