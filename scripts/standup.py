@@ -162,6 +162,28 @@ def format_split_standup(output: dict, date_display: str) -> list:
     return messages
 
 
+def build_compact_standup_sections(output: dict) -> dict:
+    """Compact standup payload for automation clients.
+
+    Returns DONEs, Calendar DOs, and DOs with stable quick IDs.
+    """
+    done = [t.get('title', '') for t in (output.get('completed') or [])[:12]]
+    calendar_dos = []
+    for idx, t in enumerate(output.get('due_today') or [], start=1):
+        calendar_dos.append({"quick_id": f"c{idx}", "title": t.get('title', '')})
+
+    dos = []
+    stack = (output.get('q1') or []) + (output.get('q2') or []) + (output.get('q3') or [])
+    for idx, t in enumerate(stack[:20], start=1):
+        dos.append({"quick_id": f"d{idx}", "title": t.get('title', '')})
+
+    return {
+        "dones": done,
+        "calendar_dos": calendar_dos,
+        "dos": dos,
+    }
+
+
 def generate_standup(
     date_str: str = None,
     json_output: bool = False,
@@ -369,6 +391,7 @@ def main():
     parser.add_argument('--json', action='store_true', help='Output as JSON')
     parser.add_argument('--split', action='store_true', help='Split into 3 messages (completed/calendar/todos)')
     parser.add_argument('--skip-missed', action='store_true', help='Skip missed tasks section')
+    parser.add_argument('--compact-json', action='store_true', help='Output compact DONEs/Calendar DOs/DOs JSON')
 
     args = parser.parse_args()
 
@@ -382,7 +405,7 @@ def main():
 
     result = generate_standup(
         date_str=args.date,
-        json_output=args.json,
+        json_output=(args.json or args.compact_json),
         split_output=args.split,
         tasks_data=tasks_data,
         notes_dir=notes_dir,
@@ -397,7 +420,9 @@ def main():
             else:
                 result = f"{missed_block}{result}"
 
-    if args.json:
+    if args.compact_json:
+        print(json.dumps(build_compact_standup_sections(result), indent=2))
+    elif args.json:
         print(json.dumps(result, indent=2))
     elif args.split:
         for i, msg in enumerate(result, 1):
