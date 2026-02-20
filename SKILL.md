@@ -57,7 +57,10 @@ export TASK_TRACKER_ARCHIVE_DIR="$HOME/clawd/memory/work"
 export TASK_TRACKER_LEGACY_FILE="$HOME/clawd/memory/work/TASKS.md"
 
 # Optional: Daily notes directory for completion logging (YYYY-MM-DD.md files)
-export TASK_TRACKER_DAILY_NOTES_DIR="$HOME/Obsidian/06-Daily"
+export TASK_TRACKER_DAILY_NOTES_DIR="$HOME/Obsidian/01-TODOs/Daily"
+
+# Required for EOD sync: path to Weekly TODOs file
+export TASK_TRACKER_WEEKLY_TODOS="$HOME/Obsidian/01-TODOs/Weekly TODOs.md"
 ```
 
 **Default paths (used when env vars are not set):**
@@ -432,6 +435,78 @@ export TASK_TRACKER_PERSONAL_FILE="$HOME/path/to/Personal Tasks.md"
 
 ---
 
+---
+
+## EOD Sync
+
+Auto-sync completed items from your daily note's `✅ Done` section into Weekly TODOs.
+
+### How It Works
+
+1. Reads today's daily note and extracts items from the `## ✅ Done` section
+2. Fuzzy-matches each completion against open `- [ ]` tasks in Weekly TODOs
+3. Marks matched tasks as `- [x] Task title ✅ YYYY-MM-DD`
+
+**Match thresholds:**
+- ≥ 80% similarity → auto-sync ✅
+- 60–79% → logged as uncertain ⚠️ (manual review needed)
+- < 60% → skipped ⏭️
+
+### Usage
+
+```bash
+# Preview what would change (safe, no writes)
+python3 scripts/eod_sync.py --dry-run
+
+# Run sync for today
+python3 scripts/eod_sync.py
+
+# Sync a specific day
+python3 scripts/eod_sync.py --date 2026-02-18
+
+# Verbose mode (shows all match scores)
+python3 scripts/eod_sync.py --verbose
+```
+
+### Embedded Daily Progress View
+
+Add a transclusion block to Weekly TODOs that embeds each day's `✅ Done` section inline in Obsidian:
+
+```bash
+# Preview what would be written (dry run)
+python3 scripts/update_weekly_embeds.py --dry-run
+
+# Refresh the 📊 Daily Progress section for the current week
+python3 scripts/update_weekly_embeds.py
+
+# Refresh for a specific week (pass any date in that week)
+python3 scripts/update_weekly_embeds.py --week 2026-02-17
+```
+
+This inserts (or updates) a `## 📊 Daily Progress` section in Weekly TODOs:
+
+```markdown
+## 📊 Daily Progress
+
+### Monday
+![[01-TODOs/Daily/2026-02-17#✅ Done]]
+
+### Tuesday
+![[01-TODOs/Daily/2026-02-18#✅ Done]]
+...
+```
+
+> **Tip:** Run `update_weekly_embeds.py` at the start of each week to refresh the transclusion dates.
+
+### Required Environment Variables
+
+```bash
+export TASK_TRACKER_WEEKLY_TODOS="$HOME/Obsidian/01-TODOs/Weekly TODOs.md"
+export TASK_TRACKER_DAILY_NOTES_DIR="$HOME/Obsidian/01-TODOs/Daily"
+```
+
+---
+
 ## Files
 
 | File | Purpose |
@@ -441,6 +516,8 @@ export TASK_TRACKER_PERSONAL_FILE="$HOME/path/to/Personal Tasks.md"
 | `scripts/personal_standup.py` | Personal daily standup generator |
 | `scripts/weekly_review.py` | Weekly review generator |
 | `scripts/extract_tasks.py` | Extract tasks from meeting notes |
+| `scripts/eod_sync.py` | Auto-sync EOD completions to Weekly TODOs |
+| `scripts/update_weekly_embeds.py` | Refresh 📊 Daily Progress transclusion links |
 | `scripts/utils.py` | Shared utilities |
 | `assets/templates/` | Template task files |
 
