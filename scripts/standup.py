@@ -412,7 +412,7 @@ def main():
     )
 
     missed_block = ""
-    if not args.json:
+    if not (args.json or args.compact_json):
         missed_block = format_missed_tasks_block(missed_buckets)
         if missed_block:
             if args.split:

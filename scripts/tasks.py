@@ -562,6 +562,9 @@ def cmd_state(args):
     if args.state_command == 'backlog':
         pri = args.priority or task.get('priority') or 'low'
         msg = add_item(tasks_file, task['title'], dept=args.dept or task.get('department'), priority=pri)
+        if not msg.startswith('✅'):
+            print(f"❌ Backlog move failed: {msg}", file=sys.stderr)
+            return
         tasks_file.write_text(_remove_task_line(tasks_file.read_text(), old_line))
         print(f"✅ Backlog: {task['title']} ({msg})")
         return
