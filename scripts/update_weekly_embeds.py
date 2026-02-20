@@ -5,7 +5,7 @@ update_weekly_embeds.py — Refresh the 📊 Daily Progress section in Weekly TO
 Calculates the current week's Monday–Friday dates and updates (or creates)
 the `## 📊 Daily Progress` section with Obsidian transclusion links:
 
-  ![[01-TODOs/Daily/2026-02-17#✅ Done]]
+  ![[01-TODOs/Daily/2026-02-17#Done]]
 
 Call this at the start of each week or after the weekly note is recreated.
 
@@ -67,8 +67,9 @@ VAULT_PREFIX = _vault_relative_prefix(DAILY_NOTES_DIR)  # e.g. "01-TODOs/Daily"
 # Section header that we manage
 PROGRESS_SECTION_HEADER = "## 📊 Daily Progress"
 
-# Anchor used in transclusion links (matches the Done section header)
-DONE_ANCHOR = "✅ Done"
+# Anchor used in transclusion links (matches the Done section header in daily notes)
+# Supports both "## Done" and "## ✅ Done" formats
+DONE_ANCHOR = "Done"
 
 DAYS_OF_WEEK = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
 

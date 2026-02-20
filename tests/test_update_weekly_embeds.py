@@ -56,7 +56,7 @@ class TestBuildProgressSection:
         monday = date(2026, 2, 16)
         section = embeds.build_progress_section(monday)
         assert "![[" in section
-        assert "#✅ Done]]" in section
+        assert "#Done]]" in section
 
     def test_header_present(self):
         monday = date(2026, 2, 16)
@@ -66,7 +66,7 @@ class TestBuildProgressSection:
     def test_vault_prefix_in_links(self):
         monday = date(2026, 2, 16)
         section = embeds.build_progress_section(monday)
-        # Should contain something like ![[01-TODOs/Daily/2026-02-16#✅ Done]]
+        # Should contain something like ![[01-TODOs/Daily/2026-02-16#Done]]
         assert "![[" in section
         assert "2026-02-16" in section
 
@@ -84,10 +84,10 @@ WEEKLY_WITH_SECTION = """\
 ## 📊 Daily Progress
 
 ### Monday
-![[01-TODOs/Daily/2026-02-09#✅ Done]]
+![[01-TODOs/Daily/2026-02-09#Done]]
 
 ### Tuesday
-![[01-TODOs/Daily/2026-02-10#✅ Done]]
+![[01-TODOs/Daily/2026-02-10#Done]]
 
 ## 📋 Tasks Query
 ```tasks

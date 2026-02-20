@@ -120,7 +120,7 @@ def similarity(a: str, b: str) -> float:
 # ---------------------------------------------------------------------------
 
 _DONE_SECTION_RE = re.compile(
-    r"^##\s+✅\s+Done\s*$",
+    r"^##\s+(?:✅\s*)?Done\s*$",
     re.IGNORECASE,
 )
 _SECTION_RE = re.compile(r"^##\s+")
