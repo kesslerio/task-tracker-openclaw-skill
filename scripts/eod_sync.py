@@ -140,9 +140,10 @@ def parse_done_items(daily_note: str) -> list[str]:
             # Stop at next ## section
             if _SECTION_RE.match(line) and not _DONE_SECTION_RE.match(line):
                 break
-            # Collect checkbox or plain list items
+            # Collect ONLY checked checkbox items (not unchecked [- ])
+            # Must be - [x] or - [X], not - [ ]
             stripped = line.strip()
-            if re.match(r"^-\s*\[[ xX]\]", stripped) or re.match(r"^-\s+\S", stripped):
+            if re.match(r"^-\s*\[[xX]\]", stripped) or re.match(r"^-\s+\S", stripped):
                 # Skip placeholder text
                 if stripped.lower() in {"- (update as day progresses)", "- (none today)"}:
                     continue
@@ -201,6 +202,9 @@ def build_sync_plan(
     results: list[SyncResult] = []
     matched_task_indices: set[int] = set()
 
+    # Greedy matching: process each done_item in order, assign to best available task.
+    # Tasks can only be matched once (matched_task_indices prevents duplicates).
+    # This maximizes total matches though not guaranteed globally optimal.
     for done_item in done_items:
         best_score = 0.0
         best_task = None
