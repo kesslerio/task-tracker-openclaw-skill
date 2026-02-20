@@ -513,6 +513,115 @@ def cmd_parking_lot(args):
         print(drop_item(tasks_file, args.id, archive_dir=archive_dir))
 
 
+def _find_open_task(personal: bool, query: str) -> tuple[Path, dict | None, str]:
+    tasks_file, fmt = get_tasks_file(personal)
+    if not tasks_file.exists():
+        return tasks_file, None, f"❌ Tasks file not found: {tasks_file}"
+    content = tasks_file.read_text()
+    tasks_data = parse_tasks(content, personal, fmt)
+    matches = [t for t in tasks_data.get('all', []) if not t.get('done') and query.lower() in t.get('title', '').lower()]
+    if not matches:
+        return tasks_file, None, f"❌ No open task matches: {query}"
+    if len(matches) > 1:
+        return tasks_file, None, f"❌ Multiple matches for '{query}'. Be more specific."
+    return tasks_file, matches[0], ""
+
+
+def cmd_state(args):
+    """First-class state transitions: pause/delegate/backlog/drop."""
+    from parking_lot import add_item
+
+    tasks_file, task, err = _find_open_task(args.personal, args.query)
+    if err:
+        print(err)
+        return
+
+    content = tasks_file.read_text()
+    old_line = task.get('raw_line', '')
+    if not old_line:
+        print("❌ Task has no raw line; cannot transition.")
+        return
+
+    if args.state_command == 'pause':
+        new_line = old_line if 'paused::' in old_line else f"{old_line} paused::{datetime.now().date().isoformat()}"
+        if args.until:
+            if 'pause_until::' in new_line:
+                new_line = re.sub(r'pause_until::\d{4}-\d{2}-\d{2}', f'pause_until::{args.until}', new_line)
+            else:
+                new_line = f"{new_line} pause_until::{args.until}"
+        tasks_file.write_text(content.replace(old_line, new_line, 1))
+        print(f"✅ Paused: {task['title']}")
+        return
+
+    if args.state_command == 'delegate':
+        item = delegation.add_item(delegation.resolve_delegation_file(), task['title'], args.to, args.followup, task.get('department'))
+        tasks_file.write_text(_remove_task_line(content, old_line))
+        print(f"✅ Delegated: {item['title']} → {item['assignee']} [followup::{item['followup']}]")
+        return
+
+    if args.state_command == 'backlog':
+        pri = args.priority or task.get('priority') or 'low'
+        msg = add_item(tasks_file, task['title'], dept=args.dept or task.get('department'), priority=pri)
+        if not msg.startswith('✅'):
+            print(f"❌ Backlog move failed: {msg}", file=sys.stderr)
+            return
+        tasks_file.write_text(_remove_task_line(tasks_file.read_text(), old_line))
+        print(f"✅ Backlog: {task['title']} ({msg})")
+        return
+
+    if args.state_command == 'drop':
+        archive_dir = Path(os.getenv('TASK_TRACKER_ARCHIVE_DIR', str(tasks_file.parent / 'Done Archive')))
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archive_file = archive_dir / f"ARCHIVE-{get_current_quarter()}.md"
+        entry = f"- [x] ~~{task['title']}~~ (dropped) ✅ {datetime.now().date().isoformat()}\n"
+        with archive_file.open('a', encoding='utf-8') as fh:
+            fh.write(entry)
+        tasks_file.write_text(_remove_task_line(content, old_line))
+        print(f"✅ Dropped: {task['title']}")
+        return
+
+
+def cmd_promote_from_backlog(args):
+    from parking_lot import promote_item
+    tasks_file, _ = get_tasks_file(args.personal)
+    cap = max(int(args.cap or 1), 1)
+    promoted = []
+    for _ in range(cap):
+        out = promote_item(tasks_file, 1)
+        if out.startswith('✅'):
+            promoted.append(out)
+        else:
+            break
+    if not promoted:
+        print("No backlog items promoted.")
+    else:
+        for row in promoted:
+            print(row)
+
+
+def cmd_review_backlog(args):
+    from parking_lot import list_stale
+    old = os.getenv('PARKING_LOT_STALE_DAYS')
+    os.environ['PARKING_LOT_STALE_DAYS'] = str(args.stale_days)
+    try:
+        raw = list_stale(get_tasks_file(args.personal)[0])
+    finally:
+        if old is None:
+            del os.environ['PARKING_LOT_STALE_DAYS']
+        else:
+            os.environ['PARKING_LOT_STALE_DAYS'] = old
+    if args.json:
+        print(raw)
+        return
+    items = json.loads(raw)
+    if not items:
+        print(f"No stale backlog items (threshold: {args.stale_days}d).")
+        return
+    print(f"Stale backlog items ({len(items)}):")
+    for it in items:
+        print(f"- #{it['id']} {it['title']} ({it['age_days']}d)")
+
+
 def _format_completion_pct(value: float) -> str:
     """Format completion percentage for human-readable output."""
     if float(value).is_integer():
@@ -653,6 +762,39 @@ def main():
     del_takeback = del_sub.add_parser('take-back', help='Take back delegated task')
     del_takeback.add_argument('id', type=int, help='Item ID from list')
     del_takeback.set_defaults(func=cmd_delegated)
+
+    state_parser = subparsers.add_parser('state', help='Transition active task state')
+    state_sub = state_parser.add_subparsers(dest='state_command', required=True)
+
+    st_pause = state_sub.add_parser('pause', help='Pause an active task')
+    st_pause.add_argument('query', help='Task title query')
+    st_pause.add_argument('--until', help='Optional resume date YYYY-MM-DD')
+    st_pause.set_defaults(func=cmd_state)
+
+    st_delegate = state_sub.add_parser('delegate', help='Delegate an active task')
+    st_delegate.add_argument('query', help='Task title query')
+    st_delegate.add_argument('--to', required=True, help='Assignee')
+    st_delegate.add_argument('--followup', required=True, help='Follow-up date YYYY-MM-DD')
+    st_delegate.set_defaults(func=cmd_state)
+
+    st_backlog = state_sub.add_parser('backlog', help='Move active task to backlog')
+    st_backlog.add_argument('query', help='Task title query')
+    st_backlog.add_argument('--dept', help='Department tag')
+    st_backlog.add_argument('--priority', choices=['urgent', 'high', 'medium', 'low'])
+    st_backlog.set_defaults(func=cmd_state)
+
+    st_drop = state_sub.add_parser('drop', help='Drop active task and archive as dropped')
+    st_drop.add_argument('query', help='Task title query')
+    st_drop.set_defaults(func=cmd_state)
+
+    promote_parser = subparsers.add_parser('promote-from-backlog', help='Promote top backlog item(s)')
+    promote_parser.add_argument('--cap', type=int, default=1, help='Max items to promote')
+    promote_parser.set_defaults(func=cmd_promote_from_backlog)
+
+    review_parser = subparsers.add_parser('review-backlog', help='Review stale backlog items')
+    review_parser.add_argument('--stale-days', type=int, default=int(os.getenv('PARKING_LOT_STALE_DAYS', '30')))
+    review_parser.add_argument('--json', action='store_true')
+    review_parser.set_defaults(func=cmd_review_backlog)
 
     args = parser.parse_args()
     args.func(args)

@@ -77,6 +77,17 @@ Tasks are stored in `~/clawd/memory/work/TASKS.md` using this format:
 ### Daily Standup
 ```bash
 python3 scripts/standup.py
+python3 scripts/standup.py --compact-json   # DONEs/Calendar DOs/DOs API shape
+```
+
+### State transitions
+```bash
+python3 scripts/tasks.py state pause "task title" --until 2026-03-01
+python3 scripts/tasks.py state delegate "task title" --to Alex --followup 2026-03-01
+python3 scripts/tasks.py state backlog "task title"
+python3 scripts/tasks.py state drop "task title"
+python3 scripts/tasks.py promote-from-backlog --cap 3
+python3 scripts/tasks.py review-backlog --stale-days 45 --json
 ```
 
 Output:
