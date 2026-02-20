@@ -266,16 +266,18 @@ def apply_sync_plan(
         indent = task["indent"]
         body = task["body"]
 
-        # Preserve metadata: keep priority emojis, tags, and due dates intact.
-        # Just replace the checkbox and append completion date.
+        # Preserve the full line including checkbox prefix, just swap [ ] to [x]
+        # and append completion date.
         # Pattern: "- [ ] Task title 📅 2026-02-19 ⏫ #tag" -> "- [x] Task title 📅 2026-02-19 ⏫ #tag ✅ 2026-02-19"
-        # The body already contains the metadata, so we just swap [ ] to [x] and add ✅ completion date
-        new_line = body.replace("- [ ]", "- [x]")
+        # Use raw line (includes checkbox) not body (already stripped)
+        raw_line = task["raw"].rstrip("\n")
+        # Replace unchecked checkbox with checked
+        new_line = raw_line.replace("- [ ]", "- [x]")
         # Remove any existing completion date to avoid duplicates
         new_line = re.sub(r"\s+✅\s*\d{4}-\d{2}-\d{2}\s*$", "", new_line)
         new_line = f"{new_line} ✅ {sync_date}\n"
 
-        updated[idx] = f"{indent}{new_line}"
+        updated[idx] = new_line
 
     return updated
 
