@@ -55,6 +55,7 @@ python3 scripts/tasks.py review-backlog --stale-days 45 --json
 
 ```bash
 python3 scripts/standup.py --compact-json
+# Schema: references/standup-compact-schema-v1.md
 python3 scripts/tasks.py list --completed-since 24h
 python3 scripts/tasks.py list --completed-since 7d
 ```
