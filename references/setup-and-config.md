@@ -27,8 +27,8 @@ export TASK_TRACKER_WEEKLY_TODOS="$HOME/path/to/Weekly TODOs.md"
 
 If env vars are not set, task-tracker falls back to:
 
-- Work: `~/Obsidian/03-Areas/Work/Work Tasks.md`
-- Personal: `~/Obsidian/03-Areas/Personal/Personal Tasks.md`
+- Work: `$HOME/path/to/Work Tasks.md`
+- Personal: `$HOME/path/to/Personal Tasks.md`
 - Legacy: `~/clawd/memory/work/TASKS.md`
 
 Defaults are convenient but user-specific; explicit env vars are recommended.

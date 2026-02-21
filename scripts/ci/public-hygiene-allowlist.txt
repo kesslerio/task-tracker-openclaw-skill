@@ -1,0 +1,7 @@
+# Public hygiene check allowlist
+#
+# Format:
+#   RULE|path/to/file
+#   RULE|path/to/file:line
+#
+# Use sparingly for intentional examples that would otherwise trigger checks.

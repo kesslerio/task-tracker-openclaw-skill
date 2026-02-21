@@ -297,8 +297,8 @@ sequenceDiagram
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `TASK_TRACKER_WORK_FILE` | `~/Obsidian/03-Areas/Work/Work Tasks.md` | Path to work task board |
-| `TASK_TRACKER_PERSONAL_FILE` | `~/Obsidian/03-Areas/Personal/Personal Tasks.md` | Path to personal task board |
+| `TASK_TRACKER_WORK_FILE` | `$HOME/path/to/Work Tasks.md` | Path to work task board |
+| `TASK_TRACKER_PERSONAL_FILE` | `$HOME/path/to/Personal Tasks.md` | Path to personal task board |
 | `TASK_TRACKER_LEGACY_FILE` | `~/clawd/memory/work/TASKS.md` | Fallback if Obsidian file missing |
 | `TASK_TRACKER_ARCHIVE_DIR` | `~/clawd/memory/work` | Directory for quarterly archives |
 | `TASK_TRACKER_DAILY_NOTES_DIR` | *(unset — disables completion tracking)* | Directory with `YYYY-MM-DD.md` daily notes |
