@@ -57,6 +57,8 @@ python3 scripts/tasks.py review-backlog --stale-days 45 --json
 python3 scripts/standup.py --compact-json
 python3 scripts/tasks.py list --completed-since 24h
 python3 scripts/tasks.py list --completed-since 7d
+python3 scripts/tasks.py calendar sync --json
+python3 scripts/tasks.py calendar resolve --window today --json
 ```
 
 ## Wrapper shortcuts
