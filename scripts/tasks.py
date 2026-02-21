@@ -23,6 +23,7 @@ from urllib.parse import quote
 sys.path.insert(0, str(Path(__file__).parent))
 from daily_notes import extract_completed_tasks
 from log_done import log_task_completed
+from standup_common import get_calendar_events, flatten_calendar_events
 import delegation
 from utils import (
     detect_format,
@@ -623,6 +624,89 @@ def cmd_review_backlog(args):
         print(f"- #{it['id']} {it['title']} ({it['age_days']}d)")
 
 
+def _calendar_classification(task: dict) -> str:
+    raw = str(task.get('raw_line') or '').lower()
+    title = str(task.get('title') or '').lower()
+    if 'status::blocked' in raw or 'depends::' in raw:
+        return 'blocked'
+    if '#private' in raw or 'private::true' in raw:
+        return 'private'
+    if 'buffer' in title or 'buffer::true' in raw:
+        return 'buffer'
+    return 'normal'
+
+
+def cmd_calendar_sync(args):
+    """Calendar sync payload for orchestration consumers."""
+    _, tasks_data = load_tasks(args.personal)
+    events = flatten_calendar_events(get_calendar_events())
+    meetings = []
+    for task in tasks_data.get('all', []):
+        raw = str(task.get('raw_line') or '')
+        if 'meeting::' not in raw:
+            continue
+        status_match = re.search(r'status::(scheduled|done|canceled|blocked)', raw, flags=re.IGNORECASE)
+        status = status_match.group(1).lower() if status_match else ('done' if task.get('done') else 'scheduled')
+        meetings.append({
+            'title': task.get('title', ''),
+            'status': status,
+            'classification': _calendar_classification(task),
+            'done': bool(task.get('done')),
+        })
+
+    payload = {
+        'command': 'calendar sync',
+        'idempotent': True,
+        'events_seen': len(events),
+        'meetings': meetings,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"Synced {len(meetings)} meeting task(s); events seen: {len(events)}")
+
+
+def cmd_calendar_resolve(args):
+    """Resolve calendar lifecycle from note completions in a date window."""
+    _, tasks_data = load_tasks(args.personal)
+    today = datetime.now().date()
+    if args.window == 'today':
+        start = end = today
+    else:
+        start = end = (today - timedelta(days=1))
+
+    notes_dir_raw = os.getenv("TASK_TRACKER_DAILY_NOTES_DIR")
+    completed = extract_completed_tasks(Path(notes_dir_raw), start, end) if notes_dir_raw else []
+    done_titles = {t.get('title', '').casefold() for t in completed}
+
+    resolved = []
+    for task in tasks_data.get('all', []):
+        raw = str(task.get('raw_line') or '')
+        if 'meeting::' not in raw:
+            continue
+        title = task.get('title', '')
+        raw_l = raw.lower()
+        status = 'done' if title.casefold() in done_titles else 'scheduled'
+        if 'status::blocked' in raw_l:
+            status = 'blocked'
+        if 'status::done' in raw_l or task.get('done'):
+            status = 'done'
+        if 'status::canceled' in raw_l:
+            status = 'canceled'
+        resolved.append({'title': title, 'status': status, 'window': args.window})
+
+    payload = {
+        'command': 'calendar resolve',
+        'window': args.window,
+        'resolved': resolved,
+        'idempotent': True,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"Resolved {len(resolved)} meeting lifecycle item(s) for {args.window}")
+
+
 def cmd_done_scan(args):
     """Scan completed items in a true rolling time window for standup consumers."""
     window_map = {'24h': timedelta(hours=24), '7d': timedelta(days=7), '30d': timedelta(days=30)}
@@ -779,6 +863,18 @@ def main():
     # Archive command
     archive_parser = subparsers.add_parser('archive', help='Archive completed tasks')
     archive_parser.set_defaults(func=archive_done)
+
+    calendar_parser = subparsers.add_parser('calendar', help='Calendar domain commands')
+    calendar_sub = calendar_parser.add_subparsers(dest='calendar_command', required=True)
+
+    cal_sync = calendar_sub.add_parser('sync', help='Sync calendar meeting classification/lifecycle')
+    cal_sync.add_argument('--json', action='store_true', help='Output as JSON')
+    cal_sync.set_defaults(func=cmd_calendar_sync)
+
+    cal_resolve = calendar_sub.add_parser('resolve', help='Resolve calendar task lifecycle')
+    cal_resolve.add_argument('--window', choices=['today', 'yesterday'], default='today')
+    cal_resolve.add_argument('--json', action='store_true', help='Output as JSON')
+    cal_resolve.set_defaults(func=cmd_calendar_resolve)
 
     objectives_parser = subparsers.add_parser('objectives', help='Show objective progress')
     objectives_parser.add_argument('--json', action='store_true', help='Output as JSON')

@@ -9,6 +9,7 @@ import os
 import sys
 from datetime import timedelta
 from pathlib import Path
+from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).parent))
 from daily_notes import extract_completed_actions, extract_completed_tasks
@@ -162,25 +163,76 @@ def format_split_standup(output: dict, date_display: str) -> list:
     return messages
 
 
-def build_compact_standup_sections(output: dict) -> dict:
-    """Compact standup payload for automation clients.
+def _build_daily_note_links(anchor_date: str | None = None) -> dict:
+    """Build Obsidian universal+deep links for standup date and previous day."""
+    notes_dir = os.getenv("TASK_TRACKER_DAILY_NOTES_DIR")
+    vault = os.getenv("TASK_TRACKER_OBSIDIAN_VAULT", "Obsidian")
+    if not notes_dir:
+        return {}
 
-    Returns DONEs, Calendar DOs, and DOs with stable quick IDs.
-    """
-    done = [t.get('title', '') for t in (output.get('completed') or [])[:12]]
-    calendar_dos = []
-    for idx, t in enumerate(output.get('due_today') or [], start=1):
-        calendar_dos.append({"quick_id": f"c{idx}", "title": t.get('title', '')})
+    relative_dir = os.getenv("TASK_TRACKER_DAILY_NOTES_RELATIVE_DIR", "01-TODOs/Daily").strip("/")
 
-    dos = []
-    stack = (output.get('q1') or []) + (output.get('q2') or []) + (output.get('q3') or [])
-    for idx, t in enumerate(stack[:20], start=1):
-        dos.append({"quick_id": f"d{idx}", "title": t.get('title', '')})
+    from datetime import date
+    base_date = date.today()
+    if anchor_date:
+        try:
+            base_date = date.fromisoformat(anchor_date)
+        except ValueError:
+            pass
+
+    def mk_link(day_offset: int) -> dict:
+        note_date = base_date + timedelta(days=day_offset)
+        note_name = f"{note_date.isoformat()}.md"
+        rel_path = f"{relative_dir}/{note_name}"
+        encoded_vault = quote(vault, safe="")
+        encoded_file = quote(rel_path, safe="")
+        return {
+            "universal": f"https://obsidian.md/open?vault={encoded_vault}&file={encoded_file}",
+            "deep": f"obsidian://open?vault={encoded_vault}&file={encoded_file}",
+        }
 
     return {
+        "today_daily_note": mk_link(0),
+        "yesterday_daily_note": mk_link(-1),
+    }
+
+
+def build_compact_standup_sections(output: dict) -> dict:
+    """Compact standup payload schema v1 for automation clients."""
+    done = [t.get('title', '') for t in (output.get('completed') or [])[:12]]
+    calendar_dos = [
+        {"quick_id": f"c{idx}", "title": t.get('title', ''), "status": "scheduled"}
+        for idx, t in enumerate(output.get('due_today') or [], start=1)
+    ]
+
+    completed = output.get('completed') or []
+    calendar_dones = [
+        {"quick_id": f"cd{idx}", "title": t.get('title', ''), "status": "done"}
+        for idx, t in enumerate(
+            [
+                t for t in completed
+                if t.get("is_calendar_meeting") or "meeting::" in str(t.get("raw_line") or "")
+            ],
+            start=1,
+        )
+    ]
+
+    dos = []
+    stack = (
+        [("q1", t) for t in (output.get('q1') or [])]
+        + [("q2", t) for t in (output.get('q2') or [])]
+        + [("q3", t) for t in (output.get('q3') or [])]
+    )
+    for idx, (section, t) in enumerate(stack[:20], start=1):
+        dos.append({"quick_id": f"d{idx}", "title": t.get('title', ''), "section": section})
+
+    return {
+        "schema_version": "1",
         "dones": done,
         "calendar_dos": calendar_dos,
+        "calendar_dones": calendar_dones,
         "dos": dos,
+        "links": _build_daily_note_links(output.get("date")),
     }
 
 
@@ -256,11 +308,18 @@ def generate_standup(
         )
         # Merge any stale [x] items from the board (deduplicate)
         board_done = tasks_data.get('done', [])
-        seen = {t['title'].casefold() for t in notes_completed}
+        by_title = {t['title'].casefold(): t for t in notes_completed}
         for bt in board_done:
-            if bt['title'].casefold() not in seen:
-                seen.add(bt['title'].casefold())
-                notes_completed.append(bt)
+            key = bt['title'].casefold()
+            is_calendar = "meeting::" in str(bt.get("raw_line") or "")
+            if key in by_title:
+                if is_calendar:
+                    by_title[key]["is_calendar_meeting"] = True
+                continue
+            if is_calendar:
+                bt["is_calendar_meeting"] = True
+            by_title[key] = bt
+            notes_completed.append(bt)
         output['completed'] = notes_completed
     else:
         output['completed'] = tasks_data.get('done', [])
