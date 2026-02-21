@@ -16,8 +16,9 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).parent))
 from daily_notes import extract_completed_tasks
@@ -706,6 +707,72 @@ def cmd_calendar_resolve(args):
         print(f"Resolved {len(resolved)} meeting lifecycle item(s) for {args.window}")
 
 
+def cmd_done_scan(args):
+    """Scan completed items in a true rolling time window for standup consumers."""
+    window_map = {'24h': timedelta(hours=24), '7d': timedelta(days=7), '30d': timedelta(days=30)}
+    cutoff = datetime.now() - window_map[args.window]
+    end = datetime.now().date()
+    start = (cutoff.date() - timedelta(days=1))
+
+    notes_dir_raw = os.getenv("TASK_TRACKER_DAILY_NOTES_DIR")
+    items = []
+    if notes_dir_raw:
+        raw_items = extract_completed_tasks(Path(notes_dir_raw), start, end)
+        for item in raw_items:
+            try:
+                item_date = datetime.strptime(item.get('completed_date', ''), '%Y-%m-%d').date()
+            except ValueError:
+                continue
+            ts = item.get('timestamp')
+            if ts:
+                try:
+                    item_dt = datetime.strptime(f"{item_date.isoformat()} {ts}", '%Y-%m-%d %H:%M')
+                except ValueError:
+                    item_dt = datetime.combine(item_date, datetime.max.time())
+            else:
+                item_dt = datetime.combine(item_date, datetime.min.time())
+            if item_dt >= cutoff:
+                items.append(item)
+
+    payload = {
+        'command': 'done scan',
+        'window': args.window,
+        'count': len(items),
+        'items': items,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"Done items ({args.window}): {len(items)}")
+
+
+def _daily_note_link(which: str) -> dict:
+    rel_dir = os.getenv('TASK_TRACKER_DAILY_NOTES_RELATIVE_DIR', '01-TODOs/Daily').strip('/')
+    vault = os.getenv('TASK_TRACKER_OBSIDIAN_VAULT', 'Obsidian')
+    offset = 0 if which == 'today' else -1
+    target = date.today() + timedelta(days=offset)
+    rel = f"{rel_dir}/{target.isoformat()}.md"
+    enc_vault = quote(vault, safe='')
+    enc_rel = quote(rel, safe='')
+    return {
+        'date': target.isoformat(),
+        'universal': f"https://obsidian.md/open?vault={enc_vault}&file={enc_rel}",
+        'deep': f"obsidian://open?vault={enc_vault}&file={enc_rel}",
+    }
+
+
+def cmd_daily_links(args):
+    payload = {
+        'command': 'daily links',
+        'window': args.window,
+        'links': {args.window: _daily_note_link(args.window)},
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(payload['links'][args.window]['deep'])
+
+
 def _format_completion_pct(value: float) -> str:
     """Format completion percentage for human-readable output."""
     if float(value).is_integer():
@@ -778,6 +845,16 @@ def main():
     done_parser.add_argument('query', help='Task title (fuzzy match)')
     done_parser.set_defaults(func=done_task)
     
+    done_scan_parser = subparsers.add_parser('done-scan', help='Scan completed items from daily notes')
+    done_scan_parser.add_argument('--window', choices=['24h', '7d', '30d'], default='24h')
+    done_scan_parser.add_argument('--json', action='store_true')
+    done_scan_parser.set_defaults(func=cmd_done_scan)
+
+    daily_links_parser = subparsers.add_parser('daily-links', help='Generate daily note links')
+    daily_links_parser.add_argument('--window', choices=['today', 'yesterday'], default='today')
+    daily_links_parser.add_argument('--json', action='store_true')
+    daily_links_parser.set_defaults(func=cmd_daily_links)
+
     # Blockers command
     blockers_parser = subparsers.add_parser('blockers', help='Show blocking tasks')
     blockers_parser.add_argument('--person', help='Filter by person being blocked')
