@@ -49,7 +49,16 @@ This repository keeps existing scripts and command behavior intact. The recent d
 ```bash
 # run tests
 pytest -q
+
+# enforce public-repo hygiene (paths, IDs, and default examples)
+bash scripts/ci/check-public-hygiene.sh
 ```
+
+If a hygiene match is intentional, add a targeted allowlist entry in
+`scripts/ci/public-hygiene-allowlist.txt` using one of:
+
+- `RULE|path/to/file`
+- `RULE|path/to/file:line`
 
 ## License
 
