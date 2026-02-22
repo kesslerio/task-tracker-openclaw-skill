@@ -802,24 +802,31 @@ def _slugify(value: str) -> str:
     return slug or "task"
 
 
-def _extract_inline_identifiers(text: str) -> set[str]:
-    identifiers: set[str] = set()
+def _extract_inline_identifiers(text: str) -> dict[str, set[str]]:
+    exact_identifiers: set[str] = set()
+    fallback_identifiers: set[str] = set()
     if not text:
-        return identifiers
+        return {"exact": exact_identifiers, "fallback": fallback_identifiers}
 
     for match in re.findall(r"\b(?:id|task_id|task)::([A-Za-z0-9._:-]+)", text, flags=re.IGNORECASE):
-        identifiers.add(match.casefold())
+        exact_identifiers.add(match.casefold())
 
     for url in re.findall(r"https?://[^\s)>\]]+", text):
-        identifiers.add(url.casefold())
-        issue_match = re.search(r"/issues/(\d+)\b", url)
-        if issue_match:
-            identifiers.add(f"issue:{issue_match.group(1)}")
+        lowered_url = url.casefold()
+        exact_identifiers.add(lowered_url)
+        github_issue_match = re.search(
+            r"^https?://(?:www\.)?github\.com/([^/\s]+)/([^/\s]+)/issues/(\d+)\b",
+            lowered_url,
+        )
+        if github_issue_match:
+            owner, repo, issue_num = github_issue_match.groups()
+            exact_identifiers.add(f"gh:{owner}/{repo}#{issue_num}")
+            fallback_identifiers.add(f"gh-issue-num:{issue_num}")
 
     for match in re.findall(r"\b#(\d+)\b", text):
-        identifiers.add(f"issue:{match}")
+        fallback_identifiers.add(f"gh-issue-num:{match}")
 
-    return identifiers
+    return {"exact": exact_identifiers, "fallback": fallback_identifiers}
 
 
 def _task_identifier_bundle(task: dict, fallback_id: str) -> dict:
@@ -834,14 +841,17 @@ def _task_identifier_bundle(task: dict, fallback_id: str) -> dict:
     if explicit_match:
         explicit_id = explicit_match.group(1)
 
-    identifiers = _extract_inline_identifiers(raw_line)
-    identifiers.update(_extract_inline_identifiers(title))
+    raw_identifiers = _extract_inline_identifiers(raw_line)
+    title_identifiers = _extract_inline_identifiers(title)
+    exact_identifiers = raw_identifiers["exact"] | title_identifiers["exact"]
+    fallback_identifiers = raw_identifiers["fallback"] | title_identifiers["fallback"]
     if explicit_id:
-        identifiers.add(explicit_id.casefold())
+        exact_identifiers.add(explicit_id.casefold())
 
     return {
         "task_id": explicit_id or fallback_id,
-        "identifiers": identifiers,
+        "exact_identifiers": exact_identifiers,
+        "fallback_identifiers": fallback_identifiers,
     }
 
 
@@ -937,12 +947,14 @@ def _extract_done_lines(content: str) -> list[dict]:
         if not cleaned:
             continue
 
+        identifiers = _extract_inline_identifiers(cleaned)
         parsed.append(
             {
                 "raw_line": raw.rstrip("\n"),
                 "title": cleaned,
                 "normalized_title": _normalize_title(cleaned),
-                "identifiers": _extract_inline_identifiers(cleaned),
+                "exact_identifiers": identifiers["exact"],
+                "fallback_identifiers": identifiers["fallback"],
             }
         )
     return parsed
@@ -965,7 +977,8 @@ def _build_task_catalog(tasks_data: dict) -> list[dict]:
                 "task": task,
                 "canonical": canonical,
                 "normalized_title": _normalize_title(canonical["title"]),
-                "identifiers": bundle["identifiers"],
+                "exact_identifiers": bundle["exact_identifiers"],
+                "fallback_identifiers": bundle["fallback_identifiers"],
             }
         )
     return catalog
@@ -989,20 +1002,45 @@ def _ingest_match_line(
     auto_threshold: float,
     review_threshold: float,
 ) -> dict:
-    for candidate in catalog:
-        if line["identifiers"] and (line["identifiers"] & candidate["identifiers"]):
-            return {
-                "raw_line": line["raw_line"],
-                "parsed_title": line["title"],
-                "normalized_title": line["normalized_title"],
-                "canonical_task": candidate["canonical"],
-                "match_metadata": {
-                    "matched_task_id": candidate["canonical"]["task_id"],
-                    "score": 1.0,
-                    "decision": "auto-link",
-                    "match_type": "exact-id-or-link",
-                },
-            }
+    exact_matches = [
+        candidate
+        for candidate in catalog
+        if line["exact_identifiers"] and (line["exact_identifiers"] & candidate["exact_identifiers"])
+    ]
+    if exact_matches:
+        chosen = sorted(exact_matches, key=lambda c: c["canonical"]["task_id"])[0]
+        return {
+            "raw_line": line["raw_line"],
+            "parsed_title": line["title"],
+            "normalized_title": line["normalized_title"],
+            "canonical_task": chosen["canonical"],
+            "match_metadata": {
+                "matched_task_id": chosen["canonical"]["task_id"],
+                "score": 1.0,
+                "decision": "auto-link",
+                "match_type": "exact-id-or-link",
+            },
+        }
+
+    fallback_matches = [
+        candidate
+        for candidate in catalog
+        if line["fallback_identifiers"] and (line["fallback_identifiers"] & candidate["fallback_identifiers"])
+    ]
+    if fallback_matches:
+        chosen = sorted(fallback_matches, key=lambda c: c["canonical"]["task_id"])[0]
+        return {
+            "raw_line": line["raw_line"],
+            "parsed_title": line["title"],
+            "normalized_title": line["normalized_title"],
+            "canonical_task": chosen["canonical"],
+            "match_metadata": {
+                "matched_task_id": chosen["canonical"]["task_id"],
+                "score": 0.6,
+                "decision": "needs-review",
+                "match_type": "issue-number-fallback",
+            },
+        }
 
     exact_title_matches = [
         candidate for candidate in catalog if candidate["normalized_title"] == line["normalized_title"]

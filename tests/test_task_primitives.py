@@ -42,6 +42,19 @@ def _write_duplicate_title_work_file(tmp_path):
     return work
 
 
+def _write_cross_repo_issue_work_file(tmp_path):
+    work = tmp_path / "Weekly TODOs.md"
+    work.write_text(
+        """# Weekly TODOs
+
+## 🔴 Q1
+- [ ] **Repo A issue 42** https://github.com/acme/repo-a/issues/42 area:: Delivery
+- [ ] **Repo B issue 42** https://github.com/acme/repo-b/issues/42 area:: Platform
+"""
+    )
+    return work
+
+
 def test_primitive_schema_shape(tmp_path):
     work = _write_work_file(tmp_path)
     today_note = tmp_path / f"{date.today().isoformat()}.md"
@@ -261,3 +274,24 @@ def test_ingest_daily_log_strips_time_prefix_before_checkmark(tmp_path):
     assert payload["items"][0]["parsed_title"] == "Ship alpha milestone"
     assert payload["items"][0]["match_metadata"]["decision"] == "auto-link"
     assert payload["items"][0]["match_metadata"]["match_type"] == "normalized-title"
+
+
+def test_ingest_daily_log_disambiguates_cross_repo_issue_urls(tmp_path):
+    work = _write_cross_repo_issue_work_file(tmp_path)
+    env = _env(tmp_path, work)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "ingest-daily-log"],
+        input="- Fixed API bug https://github.com/acme/repo-b/issues/42\n",
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert proc.returncode == 0
+    payload = json.loads(proc.stdout)
+    assert payload["totals"]["parsed_done_lines"] == 1
+    assert payload["totals"]["auto_linked"] == 1
+    assert payload["items"][0]["match_metadata"]["decision"] == "auto-link"
+    assert payload["items"][0]["match_metadata"]["match_type"] == "exact-id-or-link"
+    assert payload["items"][0]["canonical_task"]["title"] == "Repo B issue 42"
