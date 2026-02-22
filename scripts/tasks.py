@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+from difflib import SequenceMatcher
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -37,6 +38,10 @@ from utils import (
     ARCHIVE_DIR,
     get_objective_progress,
 )
+
+TASK_PRIMITIVES_SCHEMA_VERSION = "v1"
+FUZZY_AUTO_LINK_THRESHOLD = 0.90
+FUZZY_REVIEW_THRESHOLD = 0.70
 
 
 def list_tasks(args):
@@ -746,6 +751,622 @@ def cmd_done_scan(args):
         print(f"Done items ({args.window}): {len(items)}")
 
 
+def _new_schema(command: str) -> dict:
+    return {
+        "schema_version": TASK_PRIMITIVES_SCHEMA_VERSION,
+        "command": command,
+    }
+
+
+def _safe_load_tasks(personal: bool = False) -> dict:
+    """Load tasks, returning an empty skeleton on failures."""
+    empty = {
+        "all": [],
+        "done": [],
+        "q1": [],
+        "q2": [],
+        "q3": [],
+        "backlog": [],
+        "today": [],
+        "objectives": [],
+        "team": [],
+        "parking_lot": [],
+        "due_today": [],
+    }
+    tasks_file, fmt = get_tasks_file(personal)
+    if not tasks_file.exists():
+        return empty
+    try:
+        content = tasks_file.read_text()
+    except OSError:
+        return empty
+    try:
+        return parse_tasks(content, personal, fmt)
+    except Exception:
+        return empty
+
+
+def _normalize_title(title: str) -> str:
+    lowered = (title or "").strip().casefold()
+    lowered = re.sub(r"\[x\]|\[ \]|✅|☑️", " ", lowered)
+    lowered = re.sub(r"\*\*|__|~~", "", lowered)
+    lowered = re.sub(r"[^\w\s/-]", " ", lowered)
+    lowered = re.sub(r"\s+", " ", lowered)
+    return lowered.strip()
+
+
+def _slugify(value: str) -> str:
+    normalized = _normalize_title(value)
+    slug = re.sub(r"[^a-z0-9]+", "-", normalized)
+    slug = re.sub(r"-{2,}", "-", slug).strip("-")
+    return slug or "task"
+
+
+def _extract_inline_identifiers(text: str) -> dict[str, set[str]]:
+    exact_identifiers: set[str] = set()
+    fallback_identifiers: set[str] = set()
+    if not text:
+        return {"exact": exact_identifiers, "fallback": fallback_identifiers}
+
+    for match in re.findall(r"\b(?:id|task_id|task)::([A-Za-z0-9._:-]+)", text, flags=re.IGNORECASE):
+        exact_identifiers.add(match.casefold())
+
+    for url in re.findall(r"https?://[^\s)>\]]+", text):
+        lowered_url = url.casefold()
+        exact_identifiers.add(lowered_url)
+        github_issue_match = re.search(
+            r"^https?://(?:www\.)?github\.com/([^/\s]+)/([^/\s]+)/issues/(\d+)\b",
+            lowered_url,
+        )
+        if github_issue_match:
+            owner, repo, issue_num = github_issue_match.groups()
+            exact_identifiers.add(f"gh:{owner}/{repo}#{issue_num}")
+            fallback_identifiers.add(f"gh-issue-num:{issue_num}")
+
+    for match in re.findall(r"\b#(\d+)\b", text):
+        fallback_identifiers.add(f"gh-issue-num:{match}")
+
+    return {"exact": exact_identifiers, "fallback": fallback_identifiers}
+
+
+def _task_identifier_bundle(task: dict, fallback_id: str) -> dict:
+    raw_line = str(task.get("raw_line") or "")
+    title = str(task.get("title") or "")
+    explicit_id = None
+    explicit_match = re.search(
+        r"\b(?:id|task_id|task)::([A-Za-z0-9._:-]+)",
+        raw_line,
+        flags=re.IGNORECASE,
+    )
+    if explicit_match:
+        explicit_id = explicit_match.group(1)
+
+    raw_identifiers = _extract_inline_identifiers(raw_line)
+    title_identifiers = _extract_inline_identifiers(title)
+    exact_identifiers = raw_identifiers["exact"] | title_identifiers["exact"]
+    fallback_identifiers = raw_identifiers["fallback"] | title_identifiers["fallback"]
+    if explicit_id:
+        exact_identifiers.add(explicit_id.casefold())
+
+    return {
+        "task_id": explicit_id or fallback_id,
+        "exact_identifiers": exact_identifiers,
+        "fallback_identifiers": fallback_identifiers,
+    }
+
+
+def _canonical_task(task: dict, task_id: str) -> dict:
+    return {
+        "task_id": task_id,
+        "title": task.get("title", ""),
+        "done": bool(task.get("done")),
+        "section": task.get("section"),
+        "area": task.get("area") or task.get("department") or "Uncategorized",
+        "priority": task.get("priority"),
+        "due": task.get("due"),
+        "owner": task.get("owner"),
+        "goal": task.get("goal"),
+    }
+
+
+def _group_tasks_by_area(tasks: list[dict]) -> dict[str, list[dict]]:
+    grouped: dict[str, list[dict]] = {}
+    for task in tasks:
+        key = task.get("area") or "Uncategorized"
+        grouped.setdefault(key, []).append(task)
+    return dict(sorted(grouped.items(), key=lambda item: item[0].casefold()))
+
+
+def _group_tasks_by_category(tasks: list[dict]) -> dict[str, list[dict]]:
+    labels = {
+        "q1": "Q1",
+        "q2": "Q2",
+        "q3": "Q3",
+        "team": "Team",
+        "backlog": "Backlog",
+        "today": "Today",
+        "objectives": "Objectives",
+        "parking_lot": "Parking Lot",
+    }
+    grouped: dict[str, list[dict]] = {}
+    for task in tasks:
+        section = task.get("section")
+        key = labels.get(section, section or "Uncategorized")
+        grouped.setdefault(key, []).append(task)
+    return dict(sorted(grouped.items(), key=lambda item: item[0].casefold()))
+
+
+def _parse_range_inputs(week: str | None, start_raw: str | None, end_raw: str | None) -> tuple[date, date, str]:
+    if start_raw or end_raw:
+        if not start_raw or not end_raw:
+            raise ValueError("Both --start and --end are required together.")
+        try:
+            start_date = datetime.strptime(start_raw, "%Y-%m-%d").date()
+            end_date = datetime.strptime(end_raw, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise ValueError("Invalid date. Use YYYY-MM-DD.") from exc
+        if start_date > end_date:
+            start_date, end_date = end_date, start_date
+        return start_date, end_date, "custom-range"
+
+    today = datetime.now().date()
+    if not week:
+        start_date = today - timedelta(days=today.weekday())
+        return start_date, start_date + timedelta(days=6), "current-week"
+
+    match = re.fullmatch(r"(\d{4})-W(\d{2})", week)
+    if not match:
+        raise ValueError("Invalid --week format. Use YYYY-WNN (example: 2026-W07).")
+    start_date = date.fromisocalendar(int(match.group(1)), int(match.group(2)), 1)
+    return start_date, start_date + timedelta(days=6), "iso-week"
+
+
+def _extract_done_lines(content: str) -> list[dict]:
+    parsed: list[dict] = []
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+
+        is_checkbox = bool(re.match(r"^\s*[-*+]\s+\[(?:x|X| )\]\s+", raw))
+        is_checked = bool(re.match(r"^\s*[-*+]\s+\[(?:x|X)\]\s+", raw))
+
+        is_plain_bullet = bool(re.match(r"^\s*[-*+]\s+", raw))
+        if is_checkbox and not is_checked:
+            continue
+        if not is_checkbox and not is_plain_bullet and not line.startswith("✅"):
+            # Plain lines are accepted as completed actions too.
+            pass
+
+        cleaned = re.sub(r"^\s*[-*+]\s+", "", raw).strip()
+        cleaned = re.sub(r"^\[(?:x|X| )\]\s+", "", cleaned)
+        cleaned = re.sub(r"^\d{1,2}:\d{2}(?::\d{2})?\s+", "", cleaned)
+        cleaned = re.sub(r"^✅\s*", "", cleaned)
+        cleaned = re.sub(r"\s*✅\s*\d{4}-\d{2}-\d{2}\s*$", "", cleaned)
+        cleaned = cleaned.strip()
+        if not cleaned:
+            continue
+
+        identifiers = _extract_inline_identifiers(cleaned)
+        parsed.append(
+            {
+                "raw_line": raw.rstrip("\n"),
+                "title": cleaned,
+                "normalized_title": _normalize_title(cleaned),
+                "exact_identifiers": identifiers["exact"],
+                "fallback_identifiers": identifiers["fallback"],
+            }
+        )
+    return parsed
+
+
+def _fuzzy_score(left: str, right: str) -> float:
+    if not left or not right:
+        return 0.0
+    return SequenceMatcher(None, left, right).ratio()
+
+
+def _build_task_catalog(tasks_data: dict) -> list[dict]:
+    catalog: list[dict] = []
+    for idx, task in enumerate(tasks_data.get("all", []), start=1):
+        fallback_id = f"{_slugify(task.get('title', 'task'))}-{idx:03d}"
+        bundle = _task_identifier_bundle(task, fallback_id=fallback_id)
+        canonical = _canonical_task(task, bundle["task_id"])
+        catalog.append(
+            {
+                "task": task,
+                "canonical": canonical,
+                "normalized_title": _normalize_title(canonical["title"]),
+                "exact_identifiers": bundle["exact_identifiers"],
+                "fallback_identifiers": bundle["fallback_identifiers"],
+            }
+        )
+    return catalog
+
+
+def _task_id_lookup(tasks_data: dict) -> dict[int, str]:
+    lookup: dict[int, str] = {}
+    for entry in _build_task_catalog(tasks_data):
+        lookup[id(entry["task"])] = entry["canonical"]["task_id"]
+    return lookup
+
+
+def _canonical_task_with_lookup(task: dict, task_ids: dict[int, str]) -> dict:
+    fallback_id = _slugify(task.get("title", ""))
+    return _canonical_task(task, task_ids.get(id(task), fallback_id))
+
+
+def _ingest_match_line(
+    line: dict,
+    catalog: list[dict],
+    auto_threshold: float,
+    review_threshold: float,
+) -> dict:
+    exact_matches = [
+        candidate
+        for candidate in catalog
+        if line["exact_identifiers"] and (line["exact_identifiers"] & candidate["exact_identifiers"])
+    ]
+    if exact_matches:
+        chosen = sorted(exact_matches, key=lambda c: c["canonical"]["task_id"])[0]
+        return {
+            "raw_line": line["raw_line"],
+            "parsed_title": line["title"],
+            "normalized_title": line["normalized_title"],
+            "canonical_task": chosen["canonical"],
+            "match_metadata": {
+                "matched_task_id": chosen["canonical"]["task_id"],
+                "score": 1.0,
+                "decision": "auto-link",
+                "match_type": "exact-id-or-link",
+            },
+        }
+
+    fallback_matches = [
+        candidate
+        for candidate in catalog
+        if line["fallback_identifiers"] and (line["fallback_identifiers"] & candidate["fallback_identifiers"])
+    ]
+    if fallback_matches:
+        chosen = sorted(fallback_matches, key=lambda c: c["canonical"]["task_id"])[0]
+        return {
+            "raw_line": line["raw_line"],
+            "parsed_title": line["title"],
+            "normalized_title": line["normalized_title"],
+            "canonical_task": chosen["canonical"],
+            "match_metadata": {
+                "matched_task_id": chosen["canonical"]["task_id"],
+                "score": 0.6,
+                "decision": "needs-review",
+                "match_type": "issue-number-fallback",
+            },
+        }
+
+    exact_title_matches = [
+        candidate for candidate in catalog if candidate["normalized_title"] == line["normalized_title"]
+    ]
+    if exact_title_matches:
+        chosen = sorted(exact_title_matches, key=lambda c: c["canonical"]["task_id"])[0]
+        return {
+            "raw_line": line["raw_line"],
+            "parsed_title": line["title"],
+            "normalized_title": line["normalized_title"],
+            "canonical_task": chosen["canonical"],
+            "match_metadata": {
+                "matched_task_id": chosen["canonical"]["task_id"],
+                "score": 1.0,
+                "decision": "auto-link",
+                "match_type": "normalized-title",
+            },
+        }
+
+    scored = []
+    for candidate in catalog:
+        score = _fuzzy_score(line["normalized_title"], candidate["normalized_title"])
+        scored.append((score, candidate["canonical"]["task_id"], candidate))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    best_score, _, best = scored[0] if scored else (0.0, "", None)
+
+    decision = "no-match"
+    if best and best_score >= auto_threshold:
+        decision = "auto-link"
+    elif best and best_score >= review_threshold:
+        decision = "needs-review"
+
+    return {
+        "raw_line": line["raw_line"],
+        "parsed_title": line["title"],
+        "normalized_title": line["normalized_title"],
+        "canonical_task": best["canonical"] if best and decision != "no-match" else None,
+        "match_metadata": {
+            "matched_task_id": best["canonical"]["task_id"] if best and decision != "no-match" else None,
+            "score": round(float(best_score), 4),
+            "decision": decision,
+            "match_type": "fuzzy",
+        },
+    }
+
+
+def cmd_standup_summary(args):
+    tasks_data = _safe_load_tasks(args.personal)
+    task_ids = _task_id_lookup(tasks_data)
+    today = datetime.now().date()
+
+    notes_dir_raw = os.getenv("TASK_TRACKER_DAILY_NOTES_DIR")
+    dones: list[dict] = []
+    if notes_dir_raw:
+        notes_items = extract_completed_tasks(Path(notes_dir_raw), today - timedelta(days=1), today)
+        dones = [
+            {
+                "title": item.get("title", ""),
+                "completed_date": item.get("completed_date"),
+                "timestamp": item.get("timestamp"),
+                "area": item.get("area") or "Uncategorized",
+            }
+            for item in notes_items
+        ]
+    else:
+        dones = [
+            {
+                "title": task.get("title", ""),
+                "completed_date": task.get("completed_date"),
+                "timestamp": None,
+                "area": task.get("area") or task.get("department") or "Uncategorized",
+            }
+            for task in tasks_data.get("done", [])
+        ]
+
+    dos_raw = [
+        task
+        for task in tasks_data.get("all", [])
+        if not task.get("done") and task.get("section") in {"q1", "q2", "today"}
+    ]
+    dos = [_canonical_task_with_lookup(task, task_ids) for task in dos_raw]
+
+    overdue_raw = []
+    for task in tasks_data.get("all", []):
+        if task.get("done") or not task.get("due"):
+            continue
+        try:
+            due_date = datetime.strptime(task.get("due"), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if due_date < today:
+            overdue_raw.append(task)
+    overdue = [_canonical_task_with_lookup(task, task_ids) for task in overdue_raw]
+
+    carryover_suggestions = []
+    for task in overdue_raw:
+        carryover_suggestions.append(
+            {
+                "title": task.get("title", ""),
+                "reason": "overdue",
+                "suggestion": "carry-to-today",
+                "due": task.get("due"),
+                "area": task.get("area") or task.get("department") or "Uncategorized",
+            }
+        )
+
+    payload = _new_schema("standup-summary")
+    payload.update(
+        {
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "date": today.isoformat(),
+            "dones": dones,
+            "dos": dos,
+            "overdue": overdue,
+            "carryover_suggestions": carryover_suggestions,
+            "groups": {
+                "dones_by_area": _group_tasks_by_area(dones),
+                "dos_by_area": _group_tasks_by_area(dos),
+                "overdue_by_area": _group_tasks_by_area(overdue),
+                "dos_by_category": _group_tasks_by_category(dos),
+            },
+        }
+    )
+    print(json.dumps(payload, indent=2))
+
+
+def cmd_weekly_review_summary(args):
+    try:
+        start_date, end_date, selection_mode = _parse_range_inputs(args.week, args.start, args.end)
+    except ValueError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    tasks_data = _safe_load_tasks(args.personal)
+    task_ids = _task_id_lookup(tasks_data)
+    notes_dir_raw = os.getenv("TASK_TRACKER_DAILY_NOTES_DIR")
+
+    done_items: list[dict] = []
+    if notes_dir_raw:
+        note_tasks = extract_completed_tasks(Path(notes_dir_raw), start_date, end_date)
+        done_items = [
+            {
+                "task_id": None,
+                "title": item.get("title", ""),
+                "done": True,
+                "section": "done",
+                "area": item.get("area") or "Uncategorized",
+                "priority": item.get("priority"),
+                "due": item.get("due"),
+                "owner": None,
+                "goal": None,
+                "completed_date": item.get("completed_date"),
+            }
+            for item in note_tasks
+        ]
+    else:
+        for task in tasks_data.get("done", []):
+            completed = task.get("completed_date")
+            if not completed:
+                continue
+            try:
+                completed_date = datetime.strptime(completed, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if start_date <= completed_date <= end_date:
+                row = _canonical_task_with_lookup(task, task_ids)
+                row["completed_date"] = completed
+                done_items.append(row)
+
+    do_items = []
+    for task in tasks_data.get("all", []):
+        if task.get("done"):
+            continue
+        due_raw = task.get("due")
+        if due_raw:
+            try:
+                due_date = datetime.strptime(due_raw, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if due_date < start_date or due_date > end_date:
+                continue
+        do_items.append(_canonical_task_with_lookup(task, task_ids))
+
+    payload = _new_schema("weekly-review-summary")
+    payload.update(
+        {
+            "range": {
+                "mode": selection_mode,
+                "week": args.week,
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+            },
+            "DONE": {
+                "items": done_items,
+                "by_area": _group_tasks_by_area(done_items),
+                "by_category": _group_tasks_by_category(done_items),
+            },
+            "DO": {
+                "items": do_items,
+                "by_area": _group_tasks_by_area(do_items),
+                "by_category": _group_tasks_by_category(do_items),
+            },
+        }
+    )
+    print(json.dumps(payload, indent=2))
+
+
+def cmd_ingest_daily_log(args):
+    if args.file:
+        file_path = Path(args.file)
+        try:
+            source_content = file_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            payload = _new_schema("ingest-daily-log")
+            payload.update(
+                {
+                    "source": {"type": "file", "path": str(file_path)},
+                    "error": {
+                        "code": "input-file-unreadable",
+                        "message": str(exc),
+                    },
+                }
+            )
+            print(json.dumps(payload, indent=2))
+            sys.exit(2)
+        source = {"type": "file", "path": str(file_path)}
+    else:
+        source_content = sys.stdin.read()
+        source = {"type": "stdin"}
+
+    parsed_lines = _extract_done_lines(source_content)
+    tasks_data = _safe_load_tasks(args.personal)
+    catalog = _build_task_catalog(tasks_data)
+    auto_threshold = float(args.auto_threshold)
+    review_threshold = float(args.review_threshold)
+    if review_threshold > auto_threshold:
+        print("❌ --review-threshold cannot be greater than --auto-threshold", file=sys.stderr)
+        sys.exit(2)
+
+    matched = [
+        _ingest_match_line(line, catalog, auto_threshold=auto_threshold, review_threshold=review_threshold)
+        for line in parsed_lines
+    ]
+
+    counts = {"auto-link": 0, "needs-review": 0, "no-match": 0}
+    for item in matched:
+        counts[item["match_metadata"]["decision"]] += 1
+
+    payload = _new_schema("ingest-daily-log")
+    payload.update(
+        {
+            "source": source,
+            "thresholds": {
+                "auto_link": auto_threshold,
+                "needs_review": review_threshold,
+            },
+            "totals": {
+                "input_lines": len(source_content.splitlines()),
+                "parsed_done_lines": len(parsed_lines),
+                "auto_linked": counts["auto-link"],
+                "needs_review": counts["needs-review"],
+                "no_match": counts["no-match"],
+            },
+            "items": matched,
+        }
+    )
+    print(json.dumps(payload, indent=2))
+
+
+def cmd_calendar_sync_primitive(args):
+    payload = _new_schema("calendar-sync")
+    warnings: list[str] = []
+    events = []
+    meetings = []
+
+    try:
+        events = flatten_calendar_events(get_calendar_events())
+    except Exception:
+        warnings.append("calendar-events-unavailable")
+
+    try:
+        tasks_data = _safe_load_tasks(args.personal)
+        for task in tasks_data.get("all", []):
+            raw = str(task.get("raw_line") or "")
+            if "meeting::" not in raw:
+                continue
+            raw_l = raw.lower()
+            status = "scheduled"
+            if task.get("done") or "status::done" in raw_l:
+                status = "done"
+            elif "status::canceled" in raw_l:
+                status = "canceled"
+            elif "status::blocked" in raw_l:
+                status = "blocked"
+
+            meetings.append(
+                {
+                    "task_id": _task_identifier_bundle(task, _slugify(task.get("title", "")))["task_id"],
+                    "title": task.get("title", ""),
+                    "status": status,
+                    "classification": _calendar_classification(task),
+                }
+            )
+    except Exception:
+        warnings.append("task-meetings-unavailable")
+
+    lifecycle_map = {
+        "scheduled": [m for m in meetings if m["status"] == "scheduled"],
+        "done": [m for m in meetings if m["status"] == "done"],
+        "blocked": [m for m in meetings if m["status"] == "blocked"],
+        "canceled": [m for m in meetings if m["status"] == "canceled"],
+    }
+
+    payload.update(
+        {
+            "idempotent": True,
+            "optional_helper": True,
+            "warnings": warnings,
+            "events_seen": len(events),
+            "meetings_seen": len(meetings),
+            "lifecycle_map": lifecycle_map,
+        }
+    )
+    print(json.dumps(payload, indent=2))
+
+
 def _daily_note_link(which: str) -> dict:
     rel_dir = os.getenv('TASK_TRACKER_DAILY_NOTES_RELATIVE_DIR', '01-TODOs/Daily').strip('/')
     vault = os.getenv('TASK_TRACKER_OBSIDIAN_VAULT', 'Obsidian')
@@ -854,6 +1475,46 @@ def main():
     daily_links_parser.add_argument('--window', choices=['today', 'yesterday'], default='today')
     daily_links_parser.add_argument('--json', action='store_true')
     daily_links_parser.set_defaults(func=cmd_daily_links)
+
+    standup_summary_parser = subparsers.add_parser(
+        'standup-summary',
+        help='Return standup primitive summary JSON',
+    )
+    standup_summary_parser.set_defaults(func=cmd_standup_summary)
+
+    weekly_review_summary_parser = subparsers.add_parser(
+        'weekly-review-summary',
+        help='Return weekly review primitive summary JSON',
+    )
+    weekly_review_summary_parser.add_argument('--week', help='ISO week to review (YYYY-WNN)')
+    weekly_review_summary_parser.add_argument('--start', help='Start date (YYYY-MM-DD)')
+    weekly_review_summary_parser.add_argument('--end', help='End date (YYYY-MM-DD)')
+    weekly_review_summary_parser.set_defaults(func=cmd_weekly_review_summary)
+
+    ingest_daily_log_parser = subparsers.add_parser(
+        'ingest-daily-log',
+        help='Ingest done lines and map to canonical tasks',
+    )
+    ingest_daily_log_parser.add_argument('--file', help='Input log file; default is stdin')
+    ingest_daily_log_parser.add_argument(
+        '--auto-threshold',
+        type=float,
+        default=FUZZY_AUTO_LINK_THRESHOLD,
+        help='Fuzzy score threshold for auto-linking',
+    )
+    ingest_daily_log_parser.add_argument(
+        '--review-threshold',
+        type=float,
+        default=FUZZY_REVIEW_THRESHOLD,
+        help='Fuzzy score threshold for needs-review',
+    )
+    ingest_daily_log_parser.set_defaults(func=cmd_ingest_daily_log)
+
+    calendar_sync_parser = subparsers.add_parser(
+        'calendar-sync',
+        help='Optional helper payload for calendar lifecycle mapping',
+    )
+    calendar_sync_parser.set_defaults(func=cmd_calendar_sync_primitive)
 
     # Blockers command
     blockers_parser = subparsers.add_parser('blockers', help='Show blocking tasks')
