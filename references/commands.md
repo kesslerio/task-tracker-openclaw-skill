@@ -64,6 +64,28 @@ python3 scripts/tasks.py calendar sync --json
 python3 scripts/tasks.py calendar resolve --window today --json
 ```
 
+### Task primitives (issue #88)
+
+```bash
+python3 scripts/tasks.py standup-summary
+python3 scripts/tasks.py weekly-review-summary --week 2026-W08
+python3 scripts/tasks.py weekly-review-summary --start 2026-02-16 --end 2026-02-22
+python3 scripts/tasks.py ingest-daily-log --file /tmp/done-log.md
+cat /tmp/done-log.md | python3 scripts/tasks.py ingest-daily-log
+python3 scripts/tasks.py calendar-sync
+```
+
+All primitives return JSON with a stable envelope:
+
+```json
+{
+  "schema_version": "v1",
+  "command": "..."
+}
+```
+
+Detailed shape: `references/task-primitives-schema-v1.md`.
+
 ## Wrapper shortcuts
 
 ```bash
