@@ -930,6 +930,7 @@ def _extract_done_lines(content: str) -> list[dict]:
 
         cleaned = re.sub(r"^\s*[-*+]\s+", "", raw).strip()
         cleaned = re.sub(r"^\[(?:x|X| )\]\s+", "", cleaned)
+        cleaned = re.sub(r"^\d{1,2}:\d{2}(?::\d{2})?\s+", "", cleaned)
         cleaned = re.sub(r"^✅\s*", "", cleaned)
         cleaned = re.sub(r"\s*✅\s*\d{4}-\d{2}-\d{2}\s*$", "", cleaned)
         cleaned = cleaned.strip()
@@ -968,6 +969,18 @@ def _build_task_catalog(tasks_data: dict) -> list[dict]:
             }
         )
     return catalog
+
+
+def _task_id_lookup(tasks_data: dict) -> dict[int, str]:
+    lookup: dict[int, str] = {}
+    for entry in _build_task_catalog(tasks_data):
+        lookup[id(entry["task"])] = entry["canonical"]["task_id"]
+    return lookup
+
+
+def _canonical_task_with_lookup(task: dict, task_ids: dict[int, str]) -> dict:
+    fallback_id = _slugify(task.get("title", ""))
+    return _canonical_task(task, task_ids.get(id(task), fallback_id))
 
 
 def _ingest_match_line(
@@ -1038,6 +1051,7 @@ def _ingest_match_line(
 
 def cmd_standup_summary(args):
     tasks_data = _safe_load_tasks(args.personal)
+    task_ids = _task_id_lookup(tasks_data)
     today = datetime.now().date()
 
     notes_dir_raw = os.getenv("TASK_TRACKER_DAILY_NOTES_DIR")
@@ -1069,7 +1083,7 @@ def cmd_standup_summary(args):
         for task in tasks_data.get("all", [])
         if not task.get("done") and task.get("section") in {"q1", "q2", "today"}
     ]
-    dos = [_canonical_task(task, _task_identifier_bundle(task, _slugify(task.get("title", "")))["task_id"]) for task in dos_raw]
+    dos = [_canonical_task_with_lookup(task, task_ids) for task in dos_raw]
 
     overdue_raw = []
     for task in tasks_data.get("all", []):
@@ -1081,7 +1095,7 @@ def cmd_standup_summary(args):
             continue
         if due_date < today:
             overdue_raw.append(task)
-    overdue = [_canonical_task(task, _task_identifier_bundle(task, _slugify(task.get("title", "")))["task_id"]) for task in overdue_raw]
+    overdue = [_canonical_task_with_lookup(task, task_ids) for task in overdue_raw]
 
     carryover_suggestions = []
     for task in overdue_raw:
@@ -1123,6 +1137,7 @@ def cmd_weekly_review_summary(args):
         sys.exit(2)
 
     tasks_data = _safe_load_tasks(args.personal)
+    task_ids = _task_id_lookup(tasks_data)
     notes_dir_raw = os.getenv("TASK_TRACKER_DAILY_NOTES_DIR")
 
     done_items: list[dict] = []
@@ -1153,7 +1168,7 @@ def cmd_weekly_review_summary(args):
             except ValueError:
                 continue
             if start_date <= completed_date <= end_date:
-                row = _canonical_task(task, _task_identifier_bundle(task, _slugify(task.get("title", "")))["task_id"])
+                row = _canonical_task_with_lookup(task, task_ids)
                 row["completed_date"] = completed
                 done_items.append(row)
 
@@ -1169,7 +1184,7 @@ def cmd_weekly_review_summary(args):
                 continue
             if due_date < start_date or due_date > end_date:
                 continue
-        do_items.append(_canonical_task(task, _task_identifier_bundle(task, _slugify(task.get("title", "")))["task_id"]))
+        do_items.append(_canonical_task_with_lookup(task, task_ids))
 
     payload = _new_schema("weekly-review-summary")
     payload.update(
@@ -1197,8 +1212,23 @@ def cmd_weekly_review_summary(args):
 
 def cmd_ingest_daily_log(args):
     if args.file:
-        source_content = Path(args.file).read_text(encoding="utf-8")
-        source = {"type": "file", "path": str(Path(args.file))}
+        file_path = Path(args.file)
+        try:
+            source_content = file_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            payload = _new_schema("ingest-daily-log")
+            payload.update(
+                {
+                    "source": {"type": "file", "path": str(file_path)},
+                    "error": {
+                        "code": "input-file-unreadable",
+                        "message": str(exc),
+                    },
+                }
+            )
+            print(json.dumps(payload, indent=2))
+            sys.exit(2)
+        source = {"type": "file", "path": str(file_path)}
     else:
         source_content = sys.stdin.read()
         source = {"type": "stdin"}

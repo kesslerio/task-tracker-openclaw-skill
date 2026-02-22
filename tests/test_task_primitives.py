@@ -28,6 +28,20 @@ def _env(tmp_path, work):
     return env
 
 
+def _write_duplicate_title_work_file(tmp_path):
+    work = tmp_path / "Weekly TODOs.md"
+    work.write_text(
+        """# Weekly TODOs
+
+## 🔴 Q1
+- [ ] **Duplicate title** area:: Delivery
+- [ ] **Duplicate title** area:: Platform
+- [ ] **Unique title** area:: Docs
+"""
+    )
+    return work
+
+
 def test_primitive_schema_shape(tmp_path):
     work = _write_work_file(tmp_path)
     today_note = tmp_path / f"{date.today().isoformat()}.md"
@@ -148,3 +162,102 @@ def test_ingest_daily_log_checkbox_and_fuzzy_threshold_bands(tmp_path):
     assert first["score"] >= 0.70
     assert first["score"] < 0.98
     assert payload["items"][1]["match_metadata"]["matched_task_id"] is None
+
+
+def test_ingest_daily_log_unreadable_file_returns_json_envelope(tmp_path):
+    work = _write_work_file(tmp_path)
+    env = _env(tmp_path, work)
+    missing = tmp_path / "does-not-exist.md"
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "ingest-daily-log", "--file", str(missing)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode != 0
+    payload = json.loads(proc.stdout)
+    assert payload["schema_version"] == "v1"
+    assert payload["command"] == "ingest-daily-log"
+    assert payload["error"]["code"] == "input-file-unreadable"
+    assert "Traceback" not in proc.stdout
+    assert "Traceback" not in proc.stderr
+
+
+def test_fallback_task_ids_are_unique_and_consistent_across_primitives(tmp_path):
+    work = _write_duplicate_title_work_file(tmp_path)
+    env = _env(tmp_path, work)
+
+    standup = subprocess.run(
+        ["python3", "scripts/tasks.py", "standup-summary"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert standup.returncode == 0
+    standup_payload = json.loads(standup.stdout)
+    standup_duplicate_ids = [
+        item["task_id"] for item in standup_payload["dos"] if item["title"] == "Duplicate title"
+    ]
+    assert len(standup_duplicate_ids) == 2
+    assert len(set(standup_duplicate_ids)) == 2
+
+    week_start = date.today() - timedelta(days=date.today().weekday())
+    week_end = week_start + timedelta(days=6)
+    weekly = subprocess.run(
+        [
+            "python3",
+            "scripts/tasks.py",
+            "weekly-review-summary",
+            "--start",
+            week_start.isoformat(),
+            "--end",
+            week_end.isoformat(),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert weekly.returncode == 0
+    weekly_payload = json.loads(weekly.stdout)
+    weekly_duplicate_ids = [
+        item["task_id"] for item in weekly_payload["DO"]["items"] if item["title"] == "Duplicate title"
+    ]
+    assert standup_duplicate_ids == weekly_duplicate_ids
+
+    ingest = subprocess.run(
+        ["python3", "scripts/tasks.py", "ingest-daily-log"],
+        input="- Duplicate title\n",
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert ingest.returncode == 0
+    ingest_payload = json.loads(ingest.stdout)
+    mapped_id = ingest_payload["items"][0]["canonical_task"]["task_id"]
+    assert mapped_id == sorted(standup_duplicate_ids)[0]
+
+
+def test_ingest_daily_log_strips_time_prefix_before_checkmark(tmp_path):
+    work = _write_work_file(tmp_path)
+    env = _env(tmp_path, work)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "ingest-daily-log"],
+        input="09:15 ✅ Ship alpha milestone\n",
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert proc.returncode == 0
+    payload = json.loads(proc.stdout)
+    assert payload["totals"]["parsed_done_lines"] == 1
+    assert payload["items"][0]["parsed_title"] == "Ship alpha milestone"
+    assert payload["items"][0]["match_metadata"]["decision"] == "auto-link"
+    assert payload["items"][0]["match_metadata"]["match_type"] == "normalized-title"
