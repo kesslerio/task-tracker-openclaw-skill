@@ -131,7 +131,7 @@ def generate_personal_standup(
     # Apply display-only priority escalation
     regrouped = regroup_by_effective_priority(tasks_data, reference_date=standup_date)
 
-    # Completed: daily notes primary, board [x] fallback
+    # Completed: daily notes only (no all-time board fallback)
     yesterday = standup_date - timedelta(days=1)
     if notes_dir:
         completed = extract_completed_tasks(
@@ -139,14 +139,8 @@ def generate_personal_standup(
             start_date=yesterday,
             end_date=standup_date,
         )
-        board_done = tasks_data.get('done', [])
-        seen = {t['title'].casefold() for t in completed}
-        for bt in board_done:
-            if bt['title'].casefold() not in seen:
-                seen.add(bt['title'].casefold())
-                completed.append(bt)
     else:
-        completed = tasks_data.get('done', [])
+        completed = []
 
     # Build output using new task structure
     output = {
