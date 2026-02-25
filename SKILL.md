@@ -112,6 +112,7 @@ bash scripts/task-shortcuts.sh standup   # alias of daily
 bash scripts/task-shortcuts.sh weekly
 bash scripts/task-shortcuts.sh done24h
 bash scripts/task-shortcuts.sh done7d
+bash scripts/task-shortcuts.sh tasks     # quick priorities view
 ```
 
 ### EOD sync + weekly embed refresh
