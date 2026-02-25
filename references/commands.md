@@ -90,7 +90,9 @@ Detailed shape: `references/task-primitives-schema-v1.md`.
 
 ```bash
 bash scripts/task-shortcuts.sh daily
+bash scripts/task-shortcuts.sh standup   # alias of daily
 bash scripts/task-shortcuts.sh weekly
 bash scripts/task-shortcuts.sh done24h
 bash scripts/task-shortcuts.sh done7d
+bash scripts/task-shortcuts.sh tasks     # quick priorities view
 ```
