@@ -108,6 +108,7 @@ python3 scripts/weekly_review.py
 ```bash
 python3 scripts/extract_tasks.py --from-text "Meeting notes..."
 bash scripts/task-shortcuts.sh daily
+bash scripts/task-shortcuts.sh standup   # alias of daily
 bash scripts/task-shortcuts.sh weekly
 bash scripts/task-shortcuts.sh done24h
 bash scripts/task-shortcuts.sh done7d

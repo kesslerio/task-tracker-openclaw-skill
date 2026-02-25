@@ -13,7 +13,7 @@ SCRIPT_DIR="$(cd "$(dirname "$_source")" && pwd)"
 unset _source _dir
 
 case "${1:-}" in
-  daily)
+  daily|standup)
     export STANDUP_CALENDARS="$(cat ~/.config/task-tracker-calendars.json 2>/dev/null || echo '{}')"
 
     # Create temp dir (portable: -t template works on GNU and BSD/macOS)
@@ -55,7 +55,7 @@ case "${1:-}" in
     python3 "$SCRIPT_DIR/tasks.py" list --status done --completed-since 7d
     ;;
   *)
-    echo "Usage: $0 {daily|weekly|done24h|done7d}"
+    echo "Usage: $0 {daily|standup|weekly|done24h|done7d}"
     exit 1
     ;;
 esac
