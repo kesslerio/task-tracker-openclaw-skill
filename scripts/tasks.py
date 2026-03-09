@@ -146,11 +146,11 @@ def add_task(args):
     
     # Build task entry with emoji date format
     priority_patterns = {
-        'high': r'## 🔴',
-        'medium': r'## 🟡',
-        'low': r'## ⚪',
+        'high': r'^##\s+🔴(?:\s|$)',
+        'medium': r'^##\s+🟡(?:\s|$)',
+        'low': r'^##\s+⚪(?:\s|$)',
     }
-    priority_pattern = priority_patterns.get(args.priority, r'## 🟡')
+    priority_pattern = priority_patterns.get(args.priority, r'^##\s+🟡(?:\s|$)')
     
     # Build task line
     task_line = f'- [ ] **{args.title}**'
@@ -162,13 +162,15 @@ def add_task(args):
     if args.owner and args.owner not in ('me', default_owner):
         task_line += f' owner:: {args.owner}'
     
-    # Find section and insert after header
-    section_match = re.search(rf'({priority_pattern}[^\n]*\n)', content)
-    
-    if section_match:
-        insert_pos = section_match.end()
-        # Skip any subsection headers or blank lines
-        remaining = content[insert_pos:]
+    def _next_h2_pos(text: str, start_pos: int) -> int:
+        match = re.search(r'^##\s+', text[start_pos:], re.MULTILINE)
+        if not match:
+            return len(text)
+        return start_pos + match.start()
+
+    def _advance_after_header(text: str, start_pos: int) -> int:
+        insert_at = start_pos
+        remaining = text[insert_at:]
         lines = remaining.split('\n')
         skip_lines = 0
         for line in lines:
@@ -176,14 +178,65 @@ def add_task(args):
                 skip_lines += 1
             else:
                 break
-        insert_pos += sum(len(lines[i]) + 1 for i in range(skip_lines))
-        
-        new_content = content[:insert_pos] + task_line + '\n' + content[insert_pos:]
-        tasks_file.write_text(new_content)
-        task_type = "Personal" if args.personal else "Work"
-        print(f"✅ Added {task_type} task: {args.title}")
+        return insert_at + sum(len(lines[i]) + 1 for i in range(skip_lines))
+
+    # 1) Legacy priority anchors (## 🔴 / ## 🟡 / ## ⚪)
+    section_match = re.search(priority_pattern, content, re.MULTILINE)
+    insert_pos = None
+    if section_match:
+        header_end = content.find('\n', section_match.start())
+        if header_end == -1:
+            header_end = len(content)
+        else:
+            header_end += 1
+        insert_pos = _advance_after_header(content, header_end)
     else:
+        # 2) Fallback: ## 📋 All Tasks (or plain ## All Tasks)
+        all_tasks_match = re.search(r'^##\s+(?:📋\s+)?All Tasks(?:\s|$)', content, re.MULTILINE)
+        if all_tasks_match:
+            all_tasks_header_end = content.find('\n', all_tasks_match.start())
+            if all_tasks_header_end == -1:
+                all_tasks_header_end = len(content)
+            else:
+                all_tasks_header_end += 1
+
+            all_tasks_section_end = _next_h2_pos(content, all_tasks_header_end)
+            all_tasks_body = content[all_tasks_header_end:all_tasks_section_end]
+
+            dept_match = None
+            if args.area:
+                area_re = re.escape(args.area.strip())
+                dept_match = re.search(rf'^###.*\b{area_re}\b.*$', all_tasks_body, re.MULTILINE | re.IGNORECASE)
+            if not dept_match:
+                dept_match = re.search(r'^###\s+.+$', all_tasks_body, re.MULTILINE)
+
+            if dept_match:
+                dept_header_end = all_tasks_header_end + dept_match.end()
+                if dept_header_end < len(content) and content[dept_header_end] != '\n':
+                    nl_pos = content.find('\n', dept_header_end)
+                    dept_header_end = len(content) if nl_pos == -1 else nl_pos + 1
+                insert_pos = _advance_after_header(content, dept_header_end)
+            else:
+                insert_pos = _advance_after_header(content, all_tasks_header_end)
+        else:
+            # 3) Final fallback: first department header anywhere
+            dept_match = re.search(r'^###\s+.+$', content, re.MULTILINE)
+            if dept_match:
+                dept_header_end = content.find('\n', dept_match.start())
+                if dept_header_end == -1:
+                    dept_header_end = len(content)
+                else:
+                    dept_header_end += 1
+                insert_pos = _advance_after_header(content, dept_header_end)
+
+    if insert_pos is None:
         print(f"⚠️ Could not find section matching '{priority_pattern}'. Add manually.")
+        return
+
+    new_content = content[:insert_pos] + task_line + '\n' + content[insert_pos:]
+    tasks_file.write_text(new_content)
+    task_type = "Personal" if args.personal else "Work"
+    print(f"✅ Added {task_type} task: {args.title}")
 
 
 def _remove_task_line(content: str, raw_line: str) -> str:

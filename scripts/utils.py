@@ -252,10 +252,8 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
         # NEW: Handle ### sub-sections (e.g. ### 👥 Hiring #hiring)
         # These define the department for following tasks, not storage sections
         if line.startswith('### '):
-            # Extract department from ### line, e.g. ### 👥 Hiring #hiring
-            # Default to 'today' as storage section
-            current_section = 'today'
-            # Try to extract department from the line (e.g. "Hiring")
+            # Extract department from ### line for metadata, but preserve parent section
+            # Don't reset current_section - ### headers are organizational only
             section_match = re.match(r'###\s+[^\s]+\s+([A-Za-z]+)\s*#?', line)
             if section_match:
                 current_department = section_match.group(1).title()

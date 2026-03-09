@@ -35,3 +35,6 @@ docs/LOCAL-SETUP.md
 
 # Logs
 *.log
+
+.ai/
+.worktrees/
