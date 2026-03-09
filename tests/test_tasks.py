@@ -100,3 +100,90 @@ def test_extract_inline_identifiers_accepts_trailing_punctuation():
 
     assert "tsk_ship" in identifiers["exact"]
     assert "legacy-1" in identifiers["exact"]
+
+
+def test_add_task_legacy_priority_section(tmp_path, monkeypatch, capsys):
+    tasks_file = tmp_path / 'Work Tasks.md'
+    tasks_file.write_text("""# Weekly TODOs
+
+## 🔴 Q1
+- [ ] **Existing high**
+
+## 🟡 Q2
+- [ ] **Existing medium**
+""")
+    monkeypatch.setattr(tasks, 'get_tasks_file', lambda personal=False: (tasks_file, 'obsidian'))
+
+    args = SimpleNamespace(
+        title='New medium task',
+        priority='medium',
+        due=None,
+        area=None,
+        owner='me',
+        personal=False,
+    )
+    tasks.add_task(args)
+
+    updated = tasks_file.read_text()
+    assert re.search(
+        r"## 🟡 Q2\n- \[ \] \*\*New medium task\*\* task_id::tsk_[a-f0-9]{16}\n- \[ \] \*\*Existing medium\*\*",
+        updated,
+    )
+    assert "⚠️" not in capsys.readouterr().out
+
+
+def test_add_task_fallback_to_all_tasks_department_section(tmp_path, monkeypatch, capsys):
+    tasks_file = tmp_path / 'Work Tasks.md'
+    tasks_file.write_text("""# Weekly TODOs — 2026-W08
+
+## 📋 All Tasks
+### 🚀 Sales #sales
+- [ ] Sales existing
+
+### 📣 Marketing #marketing
+- [ ] Marketing existing
+
+## 📋 Tasks Query
+```tasks
+not done
+```
+""")
+    monkeypatch.setattr(tasks, 'get_tasks_file', lambda personal=False: (tasks_file, 'obsidian'))
+
+    args = SimpleNamespace(
+        title='Marketing follow-up',
+        priority='medium',
+        due='2026-02-20',
+        area='Marketing',
+        owner='me',
+        personal=False,
+    )
+    tasks.add_task(args)
+
+    updated = tasks_file.read_text()
+    assert re.search(
+        r"### 📣 Marketing #marketing\n- \[ \] \*\*Marketing follow-up\*\* 🗓️2026-02-20 task_id::tsk_[a-f0-9]{16} area:: Marketing\n- \[ \] Marketing existing",
+        updated,
+    )
+    assert "## 📋 Tasks Query" in updated
+    assert "⚠️" not in capsys.readouterr().out
+
+
+def test_add_task_warns_when_no_anchor_found(tmp_path, monkeypatch, capsys):
+    tasks_file = tmp_path / 'Work Tasks.md'
+    tasks_file.write_text("# Weekly TODOs\n\nNo task sections yet.\n")
+    monkeypatch.setattr(tasks, 'get_tasks_file', lambda personal=False: (tasks_file, 'obsidian'))
+
+    args = SimpleNamespace(
+        title='Orphan task',
+        priority='high',
+        due=None,
+        area=None,
+        owner='me',
+        personal=False,
+    )
+    tasks.add_task(args)
+
+    out = capsys.readouterr().out
+    assert "⚠️ Could not find section matching" in out
+    assert "Orphan task" not in tasks_file.read_text()
