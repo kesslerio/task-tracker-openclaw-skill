@@ -51,23 +51,42 @@ def opaque_task_id(raw_line: str, line_number: int | None) -> str:
     return f"tsk_{hashlib.sha256(material).hexdigest()[:16]}"
 
 
+def _parking_lot_line_numbers(content: str) -> set[int]:
+    parking_lines: set[int] = set()
+    in_parking_lot = False
+    for idx, line in enumerate(content.splitlines(), start=1):
+        if re.match(r"##\s+(?:🅿️\s*)?Parking Lot\b", line, re.IGNORECASE):
+            in_parking_lot = True
+            continue
+        if in_parking_lot and re.match(r"##\s+", line):
+            in_parking_lot = False
+        if in_parking_lot:
+            parking_lines.add(idx)
+    return parking_lines
+
+
 def task_records(content: str, personal: bool = False, fmt: str = "obsidian") -> list[IdentityRecord]:
     parsed = parse_tasks(content, personal=personal, format=fmt)
+    parking_lot_lines = _parking_lot_line_numbers(content)
     records: list[IdentityRecord] = []
     for task in parsed.get("all", []):
         raw_line = str(task.get("raw_line") or "")
         line_number = task.get("line_number")
+        line_number_int = int(line_number) if line_number else None
+        section = task.get("section")
+        if line_number_int in parking_lot_lines:
+            section = "parking_lot"
         records.append(
             IdentityRecord(
                 task_id=task.get("task_id"),
                 legacy_id=task.get("legacy_id"),
                 title=str(task.get("title") or ""),
                 done=bool(task.get("done")),
-                section=task.get("section"),
+                section=section,
                 area=task.get("area") or task.get("department"),
-                line_number=int(line_number) if line_number else None,
+                line_number=line_number_int,
                 raw_line=raw_line,
-                fallback_id=fallback_id_for(raw_line, int(line_number) if line_number else None),
+                fallback_id=fallback_id_for(raw_line, line_number_int),
             )
         )
     return records
@@ -80,7 +99,8 @@ def load_records(personal: bool = False) -> tuple[Path, str, list[IdentityRecord
 
 
 def active_records(records: Iterable[IdentityRecord]) -> list[IdentityRecord]:
-    return [record for record in records if not record.done and record.section != "backlog"]
+    inactive_sections = {"backlog", "parking_lot"}
+    return [record for record in records if not record.done and record.section not in inactive_sections]
 
 
 def export_active(records: Iterable[IdentityRecord]) -> list[dict]:

@@ -60,6 +60,31 @@ def test_identity_audit_reports_duplicate_task_ids(tmp_path):
     assert payload["audit"]["duplicate_task_ids"][0]["task_id"] == "tsk_same"
 
 
+def test_identity_audit_excludes_parking_lot_from_active_repairs(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text("""# Work
+
+## 🔴 Q1
+- [ ] **Active missing id** area:: Delivery
+
+## 🅿️ Parking Lot
+- [ ] **Backlog missing id** #Ops #low created::2026-01-01
+""")
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "identity-audit"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_env(tmp_path, work),
+    )
+
+    payload = json.loads(proc.stdout)
+    repairs = payload["audit"]["proposed_repairs"]
+    assert [repair["title"] for repair in repairs] == ["Active missing id"]
+    assert payload["audit"]["totals"]["missing_task_ids"] == 1
+
+
 def test_standup_summary_prefers_task_id_over_legacy_id(tmp_path):
     work = tmp_path / "Work Tasks.md"
     work.write_text("""# Work

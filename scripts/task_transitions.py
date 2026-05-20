@@ -16,6 +16,8 @@ from task_identity import load_records
 from task_ledger import append_event, ledger_path, new_event
 from utils import next_recurrence_date
 
+INLINE_FIELD_RE = re.compile(r"\s+[A-Za-z_][A-Za-z0-9_-]*::")
+
 
 def _remove_task_line(content: str, raw_line: str) -> str:
     lines = content.split("\n")
@@ -47,6 +49,16 @@ def _remove_task_line(content: str, raw_line: str) -> str:
 
 def _replace_task_line(content: str, raw_line: str, replacement: str) -> str:
     return content.replace(raw_line, replacement, 1)
+
+
+def _set_due_date(raw_line: str, due_date: str) -> str:
+    marker = f"🗓️{due_date}"
+    if re.search(r"🗓️\d{4}-\d{2}-\d{2}", raw_line):
+        return re.sub(r"🗓️\d{4}-\d{2}-\d{2}", marker, raw_line, count=1)
+    match = INLINE_FIELD_RE.search(raw_line)
+    if match:
+        return f"{raw_line[:match.start()]} {marker}{raw_line[match.start():]}"
+    return f"{raw_line.rstrip()} {marker}"
 
 
 def _archive_dropped_task(record, archive_dir: Path | None = None) -> None:
@@ -114,11 +126,7 @@ def complete_by_id(task_id: str, personal: bool = False, source: str = "user_com
             from_date_match = re.search(r"🗓️(\d{4}-\d{2}-\d{2})", record.raw_line)
             from_date = from_date_match.group(1) if from_date_match else datetime.now().date().isoformat()
             next_due = next_recurrence_date(recur_value, from_date)
-            next_line = record.raw_line
-            if re.search(r"🗓️\d{4}-\d{2}-\d{2}", next_line):
-                next_line = re.sub(r"🗓️\d{4}-\d{2}-\d{2}", f"🗓️{next_due}", next_line, count=1)
-            else:
-                next_line = f"{next_line.rstrip()} 🗓️{next_due}"
+            next_line = _set_due_date(record.raw_line, next_due)
             new_content = _replace_task_line(content, record.raw_line, next_line)
         except ValueError:
             new_content = _remove_task_line(content, record.raw_line)
@@ -182,11 +190,15 @@ def transition_by_id(
         if metadata and metadata.get("paused_at") and "paused::" not in replacement:
             replacement = f"{replacement.rstrip()} paused::{metadata['paused_at']}"
         if metadata and metadata.get("due"):
-            if re.search(r"🗓️\d{4}-\d{2}-\d{2}", replacement):
-                replacement = re.sub(r"🗓️\d{4}-\d{2}-\d{2}", f"🗓️{metadata['due']}", replacement, count=1)
+            replacement = _set_due_date(replacement, str(metadata["due"]))
+            if re.search(r"\bpause_until::\d{4}-\d{2}-\d{2}", replacement):
+                replacement = re.sub(
+                    r"\bpause_until::\d{4}-\d{2}-\d{2}",
+                    f"pause_until::{metadata['due']}",
+                    replacement,
+                    count=1,
+                )
             else:
-                replacement = f"{replacement.rstrip()} 🗓️{metadata['due']}"
-            if "pause_until::" not in replacement:
                 replacement = f"{replacement.rstrip()} pause_until::{metadata['due']}"
         if replacement != record.raw_line:
             tasks_file.write_text(content.replace(record.raw_line, replacement, 1), encoding="utf-8")

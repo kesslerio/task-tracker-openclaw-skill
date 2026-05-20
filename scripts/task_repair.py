@@ -53,7 +53,7 @@ def repair_missing_ids(personal: bool = False, apply: bool = False) -> dict:
         }
 
     lines = content.split("\n")
-    events = []
+    event_objects = []
     for repair in proposed:
         line_number = int(repair["line_number"])
         idx = line_number - 1
@@ -75,9 +75,10 @@ def repair_missing_ids(personal: bool = False, apply: bool = False) -> dict:
             reason="add-missing-task-id",
             metadata={"line_number": line_number, "title": repair.get("title")},
         )
-        events.append(append_event(event, path=ledger_path(tasks_file)))
+        event_objects.append(event)
 
     tasks_file.write_text("\n".join(lines), encoding="utf-8")
+    events = [append_event(event, path=ledger_path(tasks_file)) for event in event_objects]
     return {
         "schema_version": "v1",
         "command": "identity-repair",

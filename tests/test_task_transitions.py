@@ -113,6 +113,29 @@ def test_done_recurring_task_rolls_forward_next_due_date(tmp_path):
     assert "🗓️2026-05-27" in content
 
 
+def test_done_recurring_task_inserts_due_before_inline_fields(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text("""# Work
+
+## 🔴 Q1
+- [ ] **Send weekly update** task_id::tsk_weekly recur::weekly area:: Delivery
+""")
+    env = _env(tmp_path, work)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "done", "tsk_weekly"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 0
+    line = next(line for line in work.read_text().splitlines() if "Send weekly update" in line)
+    assert "🗓️" in line
+    assert line.index("🗓️") < line.index("area::")
+
+
 def test_done_removes_indented_block_across_blank_line(tmp_path):
     work = tmp_path / "Work Tasks.md"
     work.write_text("""# Work
@@ -214,3 +237,25 @@ def test_state_pause_without_until_persists_paused_marker(tmp_path):
 
     assert proc.returncode == 0
     assert "paused::" in work.read_text()
+
+
+def test_state_pause_updates_existing_pause_until(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text(
+        "# Work\n\n## 🔴 Q1\n- [ ] **Pause me** task_id::tsk_pause paused::2026-05-01 pause_until::2026-05-10 🗓️2026-05-10\n"
+    )
+    env = _env(tmp_path, work)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "state", "pause", "tsk_pause", "--until", "2026-05-20"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 0
+    content = work.read_text()
+    assert "pause_until::2026-05-20" in content
+    assert "pause_until::2026-05-10" not in content
+    assert "🗓️2026-05-20" in content
