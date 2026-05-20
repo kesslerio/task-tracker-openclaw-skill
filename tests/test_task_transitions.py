@@ -8,6 +8,7 @@ def _env(tmp_path, work):
     env = os.environ.copy()
     env["TASK_TRACKER_WORK_FILE"] = str(work)
     env["TASK_TRACKER_DAILY_NOTES_DIR"] = str(tmp_path / "daily")
+    env["TASK_TRACKER_DONE_LOG_DIR"] = str(tmp_path / "daily")
     env["TASK_TRACKER_LEDGER_FILE"] = str(tmp_path / "events.jsonl")
     env["STANDUP_CALENDARS"] = "{}"
     return env
@@ -113,6 +114,29 @@ def test_done_recurring_task_rolls_forward_next_due_date(tmp_path):
     assert "🗓️2026-05-27" in content
 
 
+def test_done_recurring_task_preserves_multi_word_rule(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text("""# Work
+
+## 🔴 Q1
+- [ ] **Send monday update** task_id::tsk_monday recur::every monday 📅 2026-05-19
+""")
+    env = _env(tmp_path, work)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "done", "tsk_monday"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 0
+    content = work.read_text()
+    assert "Send monday update" in content
+    assert "📅 2026-05-25" in content
+
+
 def test_done_recurring_task_inserts_due_before_inline_fields(tmp_path):
     work = tmp_path / "Work Tasks.md"
     work.write_text("""# Work
@@ -134,6 +158,31 @@ def test_done_recurring_task_inserts_due_before_inline_fields(tmp_path):
     line = next(line for line in work.read_text().splitlines() if "Send weekly update" in line)
     assert "🗓️" in line
     assert line.index("🗓️") < line.index("area::")
+
+
+def test_done_by_canonical_id_logs_due_and_recur_context(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text("""# Work
+
+## 🔴 Q1
+- [ ] **Send weekly update** task_id::tsk_weekly recur::weekly 🗓️2026-05-20
+""")
+    env = _env(tmp_path, work)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "done", "tsk_weekly"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 0
+    daily_notes = list((tmp_path / "daily").glob("*.md"))
+    assert daily_notes
+    note = daily_notes[0].read_text()
+    assert '"due": "2026-05-20"' in note
+    assert '"recur": "weekly"' in note
 
 
 def test_done_removes_indented_block_across_blank_line(tmp_path):
@@ -220,6 +269,86 @@ def test_state_delegate_backlog_drop_write_destination_records(tmp_path):
     assert "Backlog me" in work.read_text()
     archive_text = "\n".join(path.read_text() for path in (tmp_path / "archive").glob("*.md"))
     assert "Drop me" in archive_text
+
+
+def test_state_drop_defaults_archive_next_to_tasks_file(tmp_path):
+    work = tmp_path / "nested" / "Work Tasks.md"
+    work.parent.mkdir()
+    work.write_text("# Work\n\n## 🔴 Q1\n- [ ] **Drop me** task_id::tsk_drop area:: Dev\n")
+    env = _env(tmp_path, work)
+    env.pop("TASK_TRACKER_ARCHIVE_DIR", None)
+
+    proc = subprocess.run(
+        ["python3", str(Path.cwd() / "scripts" / "tasks.py"), "state", "drop", "tsk_drop"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=tmp_path,
+        env=env,
+    )
+
+    assert proc.returncode == 0
+    archive_files = list((work.parent / "Done Archive").glob("*.md"))
+    assert archive_files
+    assert "Drop me" in archive_files[0].read_text()
+
+
+def test_state_backlog_preserves_priority_and_sanitizes_department(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text("""# Work
+
+## 🔴 Q1
+- [ ] **Backlog me** task_id::tsk_backlog area:: Customer Success #high
+
+## 🅿️ Parking Lot
+""")
+    env = _env(tmp_path, work)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "state", "backlog", "tsk_backlog"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 0
+    content = work.read_text()
+    assert "#high" in content
+    assert "#CustomerSuccess" in content
+    assert "#Customer Success" not in content
+
+
+def test_state_delegate_sanitizes_department(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    delegated = tmp_path / "Delegated.md"
+    delegated.write_text("# Delegated Tasks\n\n## Active\n\n## Awaiting Follow-up\n\n## Completed\n")
+    work.write_text("# Work\n\n## 🔴 Q1\n- [ ] **Delegate me** task_id::tsk_delegate area:: Customer Success\n")
+    env = _env(tmp_path, work)
+    env["TASK_TRACKER_DELEGATION_FILE"] = str(delegated)
+
+    proc = subprocess.run(
+        [
+            "python3",
+            "scripts/tasks.py",
+            "state",
+            "delegate",
+            "tsk_delegate",
+            "--to",
+            "Alex",
+            "--followup",
+            "2026-05-27",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 0
+    content = delegated.read_text()
+    assert "#CustomerSuccess" in content
+    assert "#Customer Success" not in content
 
 
 def test_state_pause_without_until_persists_paused_marker(tmp_path):

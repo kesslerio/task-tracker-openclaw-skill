@@ -17,6 +17,9 @@ from task_ledger import append_event, ledger_path, new_event
 from utils import next_recurrence_date
 
 INLINE_FIELD_RE = re.compile(r"\s+[A-Za-z_][A-Za-z0-9_-]*::")
+RECURRENCE_RE = re.compile(r"\brecur::\s*(?!(?:\s|[A-Za-z_][A-Za-z0-9_-]*::))([^\n]+?)(?=\s+[A-Za-z_][A-Za-z0-9_-]*::|\s*[🗓️📅]|$)")
+DUE_RE = re.compile(r"(?:🗓️|📅\s*)(\d{4}-\d{2}-\d{2})")
+PRIORITY_VALUES = {"urgent", "high", "medium", "low"}
 
 
 def _remove_task_line(content: str, raw_line: str) -> str:
@@ -55,14 +58,43 @@ def _set_due_date(raw_line: str, due_date: str) -> str:
     marker = f"🗓️{due_date}"
     if re.search(r"🗓️\d{4}-\d{2}-\d{2}", raw_line):
         return re.sub(r"🗓️\d{4}-\d{2}-\d{2}", marker, raw_line, count=1)
+    if re.search(r"📅\s*\d{4}-\d{2}-\d{2}", raw_line):
+        return re.sub(r"📅\s*\d{4}-\d{2}-\d{2}", f"📅 {due_date}", raw_line, count=1)
     match = INLINE_FIELD_RE.search(raw_line)
     if match:
         return f"{raw_line[:match.start()]} {marker}{raw_line[match.start():]}"
     return f"{raw_line.rstrip()} {marker}"
 
 
-def _archive_dropped_task(record, archive_dir: Path | None = None) -> None:
-    target_dir = archive_dir or Path(os.getenv("TASK_TRACKER_ARCHIVE_DIR", "Done Archive"))
+def _extract_due_date(raw_line: str) -> str | None:
+    match = DUE_RE.search(raw_line)
+    return match.group(1) if match else None
+
+
+def _extract_recur_value(raw_line: str) -> str | None:
+    match = RECURRENCE_RE.search(raw_line)
+    return match.group(1).strip() if match else None
+
+
+def _extract_priority(raw_line: str) -> str | None:
+    for priority in PRIORITY_VALUES:
+        if re.search(rf"#{priority}\b", raw_line, re.IGNORECASE):
+            return priority
+    return None
+
+
+def _sanitize_department(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = re.sub(r"[^A-Za-z0-9_]", "", value)
+    if not cleaned:
+        return None
+    return cleaned[:1].upper() + cleaned[1:]
+
+
+def _archive_dropped_task(record, tasks_file: Path, archive_dir: Path | None = None) -> None:
+    env_archive_dir = os.getenv("TASK_TRACKER_ARCHIVE_DIR")
+    target_dir = archive_dir or (Path(env_archive_dir).expanduser() if env_archive_dir else tasks_file.parent / "Done Archive")
     target_dir.mkdir(parents=True, exist_ok=True)
     today = datetime.now().date()
     archive_file = target_dir / f"ARCHIVE-{today.year}-Q{((today.month - 1) // 3) + 1}.md"
@@ -101,10 +133,15 @@ def complete_by_id(task_id: str, personal: bool = False, source: str = "user_com
         metadata={"title": record.title, "line_number": record.line_number},
     )
 
+    due_value = _extract_due_date(record.raw_line)
+    recur_value = _extract_recur_value(record.raw_line) or ""
+
     logged = log_task_completed(
         title=record.title,
         section=record.section,
         area=record.area,
+        due=due_value,
+        recur=recur_value or None,
         context={"task_id": task_id, "source": source},
     )
     if not logged:
@@ -116,15 +153,9 @@ def complete_by_id(task_id: str, personal: bool = False, source: str = "user_com
             },
         }
 
-    recur_value = ""
-    recur_match = re.search(r"\brecur::\s*([^\s]+)", record.raw_line)
-    if recur_match:
-        recur_value = recur_match.group(1).strip()
-
     if recur_value:
         try:
-            from_date_match = re.search(r"🗓️(\d{4}-\d{2}-\d{2})", record.raw_line)
-            from_date = from_date_match.group(1) if from_date_match else datetime.now().date().isoformat()
+            from_date = due_value or datetime.now().date().isoformat()
             next_due = next_recurrence_date(recur_value, from_date)
             next_line = _set_due_date(record.raw_line, next_due)
             new_content = _replace_task_line(content, record.raw_line, next_line)
@@ -167,21 +198,22 @@ def transition_by_id(
             record.title,
             str((metadata or {}).get("assignee") or "unknown"),
             str((metadata or {}).get("followup") or datetime.now().date().isoformat()),
-            record.area,
+            _sanitize_department(record.area),
         )
         tasks_file.write_text(_remove_task_line(content, record.raw_line), encoding="utf-8")
     elif next_state == "backlog":
+        priority = (metadata or {}).get("priority") or _extract_priority(record.raw_line) or "low"
         msg = add_parking_item(
             tasks_file,
             record.title,
-            dept=(metadata or {}).get("dept") or record.area,
-            priority=(metadata or {}).get("priority") or "low",
+            dept=_sanitize_department((metadata or {}).get("dept") or record.area),
+            priority=priority,
         )
         if not str(msg).startswith("✅"):
             return {"ok": False, "error": {"code": "backlog-write-failed", "message": msg}}
         tasks_file.write_text(_remove_task_line(tasks_file.read_text(encoding="utf-8"), record.raw_line), encoding="utf-8")
     elif next_state == "deleted":
-        _archive_dropped_task(record)
+        _archive_dropped_task(record, tasks_file)
         tasks_file.write_text(_remove_task_line(content, record.raw_line), encoding="utf-8")
     elif next_state == "frozen":
         tasks_file.write_text(_remove_task_line(content, record.raw_line), encoding="utf-8")
