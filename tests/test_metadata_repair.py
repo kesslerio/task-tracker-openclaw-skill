@@ -171,6 +171,7 @@ def test_identity_repair_rolls_back_when_ledger_append_fails(tmp_path):
 
 
 def test_identity_repair_restores_partial_ledger_append(monkeypatch, tmp_path):
+    import task_identity
     import task_repair
 
     work = tmp_path / "Work Tasks.md"
@@ -185,6 +186,15 @@ def test_identity_repair_restores_partial_ledger_append(monkeypatch, tmp_path):
     ledger.write_text('{"event_type":"existing"}\n')
     monkeypatch.setenv("TASK_TRACKER_WORK_FILE", str(work))
     monkeypatch.setenv("TASK_TRACKER_LEDGER_FILE", str(ledger))
+    monkeypatch.setattr(
+        task_repair,
+        "load_records",
+        lambda personal=False: (
+            work,
+            work.read_text(encoding="utf-8"),
+            task_identity.task_records(work.read_text(encoding="utf-8"), personal=personal),
+        ),
+    )
 
     calls = {"count": 0}
 
