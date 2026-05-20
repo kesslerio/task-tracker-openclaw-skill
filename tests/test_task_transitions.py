@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 
@@ -94,6 +95,27 @@ def test_done_restricts_canonical_resolution_to_active_sections(tmp_path):
     assert "Backlog task" in content
 
 
+def test_done_resolves_plain_task_line_canonical_id(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text("""# Work
+
+## 🔴 Q1
+- [ ] Plain task task_id::tsk_plain
+""")
+    env = _env(tmp_path, work)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "done", "tsk_plain"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 0
+    assert "Plain task" not in work.read_text()
+
+
 def test_done_aborts_before_board_write_when_ledger_unwritable(tmp_path):
     work = tmp_path / "Work Tasks.md"
     original = """# Work
@@ -164,6 +186,33 @@ def test_done_restores_board_and_completion_log_when_ledger_append_fails(tmp_pat
     assert payload["error"]["code"] == "ledger-append-failed"
     assert work.read_text() == original
     assert not list((tmp_path / "daily").glob("*.md"))
+
+
+def test_done_handles_date_named_daily_log_directory(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    original = """# Work
+
+## 🔴 Q1
+- [ ] **Ship milestone** task_id::tsk_ship area:: Delivery
+"""
+    work.write_text(original)
+    daily_dir = tmp_path / "daily"
+    daily_dir.mkdir()
+    (daily_dir / f"{datetime.now().strftime('%Y-%m-%d')}.md").mkdir()
+    env = _env(tmp_path, work)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "done", "tsk_ship"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 2
+    payload = json.loads(proc.stdout)
+    assert payload["error"]["code"] == "completion-log-failed"
+    assert work.read_text() == original
 
 
 def test_done_id_survives_title_edit_and_reorder(tmp_path):

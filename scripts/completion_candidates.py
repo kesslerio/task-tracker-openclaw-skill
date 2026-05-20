@@ -78,7 +78,7 @@ def list_candidates(personal: bool = False) -> list[dict[str, Any]]:
     return [
         {**event, "candidate_status": statuses.get(key, "new")}
         for key, event in candidates.items()
-        if statuses.get(key, "new") in {"new", "shown", "snoozed"}
+        if statuses.get(key, "new") in {"new", "shown", "snoozed", "apply_failed"}
     ]
 
 

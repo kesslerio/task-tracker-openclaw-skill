@@ -194,7 +194,9 @@ def complete_by_id(task_id: str, personal: bool = False, source: str = "user_com
     daily_log_file = _daily_log_file()
     snapshots = {tasks_file: (True, content)}
     if daily_log_file is not None:
-        snapshots[daily_log_file] = _snapshot(daily_log_file)
+        daily_snapshot = _snapshot_regular(daily_log_file)
+        if daily_snapshot is not None:
+            snapshots[daily_log_file] = daily_snapshot
     ledger_file = ledger_path(tasks_file)
     ledger_snapshot = _snapshot_regular(ledger_file)
     if ledger_snapshot is not None:

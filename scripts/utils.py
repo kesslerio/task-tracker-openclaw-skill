@@ -151,7 +151,7 @@ def _extract_tags_from_title(title: str) -> tuple[str, str | None, str | None]:
 def _split_plain_task_body(task_body: str) -> tuple[str, str]:
     """Split plain task body into title and metadata suffix."""
     marker_match = re.search(
-        r'\s+(🗓️\d{4}-\d{2}-\d{2}|📅\d{4}-\d{2}-\d{2}|📅\s+\d{4}-\d{2}-\d{2}|🔺|⏫|🔼|🔽|⏬|(?:area|goal|owner|blocks|type|recur|estimate|depends|sprint)::)',
+        r'\s+(🗓️\s*\d{4}-\d{2}-\d{2}|📅\d{4}-\d{2}-\d{2}|📅\s+\d{4}-\d{2}-\d{2}|🔺|⏫|🔼|🔽|⏬|(?:area|goal|owner|blocks|type|recur|estimate|depends|sprint|task_id|id)::)',
         task_body,
     )
     if marker_match:
@@ -319,9 +319,9 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 else:
                     current_objective = None
 
-            if parsed_format in ('obsidian', 'objectives'):
+            if parsed_format in ('obsidian', 'objectives', 'legacy'):
                 # Parse emoji date
-                date_match = re.search(r'🗓️(\d{4}-\d{2}-\d{2})', rest)
+                date_match = re.search(r'🗓️\s*(\d{4}-\d{2}-\d{2})', rest)
                 if date_match:
                     due_str = date_match.group(1)
                 

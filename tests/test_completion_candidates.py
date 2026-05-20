@@ -209,3 +209,12 @@ def test_confirmed_candidate_records_decision_before_apply_failure(tmp_path):
         "confirmed",
         "apply_failed",
     ]
+    retry_list = subprocess.run(
+        ["python3", "scripts/tasks.py", "completion-candidates", "list"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    listed = json.loads(retry_list.stdout)["items"]
+    assert listed and listed[0]["candidate_status"] == "apply_failed"
