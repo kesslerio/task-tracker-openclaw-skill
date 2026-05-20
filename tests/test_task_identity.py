@@ -38,6 +38,23 @@ def test_identity_audit_reports_missing_ids_without_writing(tmp_path):
     assert work.read_text() == original
 
 
+def test_identity_audit_reports_missing_tasks_file_as_json(tmp_path):
+    missing = tmp_path / "Missing Tasks.md"
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "identity-audit"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_env(tmp_path, missing),
+    )
+
+    assert proc.returncode == 0
+    payload = json.loads(proc.stdout)
+    assert "tasks-file-missing" in payload["audit"]["blocking_invariants"]
+    assert str(missing) in payload["error"]
+
+
 def test_identity_audit_reports_duplicate_task_ids(tmp_path):
     work = tmp_path / "Work Tasks.md"
     work.write_text("""# Work

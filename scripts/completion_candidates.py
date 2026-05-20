@@ -102,6 +102,18 @@ def decide_candidate(
     if decision == "confirmed":
         if not matched_task_id:
             return {"ok": False, "error": {"code": "candidate-missing-task-id"}}
+        try:
+            event_path.parent.mkdir(parents=True, exist_ok=True)
+            with event_path.open("a", encoding="utf-8"):
+                pass
+        except OSError as exc:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "candidate-decision-ledger-failed",
+                    "message": f"Candidate decision ledger is not writable; task was not changed: {exc}",
+                },
+            }
         applied = complete_by_id(matched_task_id, personal=personal, source="completion_candidate")
         if not applied.get("ok"):
             return applied
@@ -113,7 +125,16 @@ def decide_candidate(
         evidence=candidate.get("evidence"),
         metadata={"candidate_status": decision, "dedupe_key": dedupe_key_value},
     )
-    append_event(event, path=event_path)
+    try:
+        append_event(event, path=event_path)
+    except OSError as exc:
+        return {
+            "ok": False,
+            "error": {
+                "code": "candidate-decision-ledger-failed",
+                "message": f"Candidate decision ledger append failed: {exc}",
+            },
+        }
     return {"ok": True, "decision": decision, "event": event}
 
 

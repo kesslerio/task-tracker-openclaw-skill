@@ -1,6 +1,10 @@
 import json
 import os
 import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 
 def _env(tmp_path, work):
@@ -164,6 +168,42 @@ def test_identity_repair_rolls_back_when_ledger_append_fails(tmp_path):
     payload = json.loads(proc.stdout)
     assert "ledger-append-failed" in payload["blocking_invariants"]
     assert work.read_text() == original
+
+
+def test_identity_repair_restores_partial_ledger_append(monkeypatch, tmp_path):
+    import task_repair
+
+    work = tmp_path / "Work Tasks.md"
+    original = """# Work
+
+## 🔴 Q1
+- [ ] **Ship milestone** area:: Delivery
+- [ ] **Write docs** area:: Delivery
+"""
+    work.write_text(original)
+    ledger = tmp_path / "events.jsonl"
+    ledger.write_text('{"event_type":"existing"}\n')
+    monkeypatch.setenv("TASK_TRACKER_WORK_FILE", str(work))
+    monkeypatch.setenv("TASK_TRACKER_LEDGER_FILE", str(ledger))
+
+    calls = {"count": 0}
+
+    def append_then_fail(event, path=None):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event) + "\n")
+            return event
+        raise OSError("simulated full disk")
+
+    monkeypatch.setattr(task_repair, "append_event", append_then_fail)
+
+    payload = task_repair.repair_missing_ids(apply=True)
+
+    assert payload["blocked"] is True
+    assert "ledger-append-failed" in payload["blocking_invariants"]
+    assert work.read_text() == original
+    assert ledger.read_text() == '{"event_type":"existing"}\n'
 
 
 def test_personal_identity_repair_uses_personal_sidecar_by_default(tmp_path):

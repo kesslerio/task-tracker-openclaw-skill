@@ -1,6 +1,10 @@
 import json
 import os
 import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 
 def _env(tmp_path, work):
@@ -133,3 +137,30 @@ def test_personal_candidate_confirmation_uses_personal_board_and_ledger(tmp_path
     assert "Work task" in work.read_text()
     assert personal.with_suffix(".md.events.jsonl").exists()
     assert not work.with_suffix(".md.events.jsonl").exists()
+
+
+def test_candidate_decision_returns_structured_error_when_ledger_append_fails(monkeypatch, tmp_path):
+    import completion_candidates
+
+    work = tmp_path / "Work Tasks.md"
+    work.write_text("# Work\n\n## 🔴 Q1\n- [ ] **Ship milestone** task_id::tsk_ship\n")
+    monkeypatch.setenv("TASK_TRACKER_WORK_FILE", str(work))
+    monkeypatch.setenv("TASK_TRACKER_LEDGER_FILE", str(tmp_path / "events.jsonl"))
+
+    created = completion_candidates.create_candidate(
+        source_type="done-topic",
+        source_pointer="telegram:42",
+        summary="Ship milestone",
+        matched_task_id="tsk_ship",
+    )
+    key = created["candidate"]["evidence"]["dedupe_key"]
+
+    def fail_append(event, path=None):
+        raise OSError("simulated ledger failure")
+
+    monkeypatch.setattr(completion_candidates, "append_event", fail_append)
+
+    payload = completion_candidates.decide_candidate(key, "rejected")
+
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "candidate-decision-ledger-failed"

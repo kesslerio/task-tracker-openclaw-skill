@@ -66,5 +66,8 @@ def read_events(path: Path | None = None) -> list[dict[str, Any]]:
     for line in target.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
-        events.append(json.loads(line))
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
     return events

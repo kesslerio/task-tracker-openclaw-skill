@@ -18,7 +18,7 @@ from utils import next_recurrence_date
 
 INLINE_FIELD_RE = re.compile(r"\s+[A-Za-z_][A-Za-z0-9_-]*::")
 RECURRENCE_RE = re.compile(r"\brecur::\s*(?!(?:\s|[A-Za-z_][A-Za-z0-9_-]*::))([^\n]+?)(?=\s+[A-Za-z_][A-Za-z0-9_-]*::|\s*[🗓️📅]|$)")
-DUE_RE = re.compile(r"(?:🗓️|📅\s*)(\d{4}-\d{2}-\d{2})")
+DUE_RE = re.compile(r"(?:🗓️\s*|📅\s*)(\d{4}-\d{2}-\d{2})")
 PRIORITY_VALUES = ("urgent", "high", "medium", "low")
 
 
@@ -56,8 +56,8 @@ def _replace_task_line(content: str, raw_line: str, replacement: str) -> str:
 
 def _set_due_date(raw_line: str, due_date: str) -> str:
     marker = f"🗓️{due_date}"
-    if re.search(r"🗓️\d{4}-\d{2}-\d{2}", raw_line):
-        return re.sub(r"🗓️\d{4}-\d{2}-\d{2}", marker, raw_line, count=1)
+    if re.search(r"🗓️\s*\d{4}-\d{2}-\d{2}", raw_line):
+        return re.sub(r"🗓️\s*\d{4}-\d{2}-\d{2}", marker, raw_line, count=1)
     if re.search(r"📅\s*\d{4}-\d{2}-\d{2}", raw_line):
         return re.sub(r"📅\s*\d{4}-\d{2}-\d{2}", f"📅 {due_date}", raw_line, count=1)
     match = INLINE_FIELD_RE.search(raw_line)
@@ -105,6 +105,12 @@ def _archive_dropped_task(record, tasks_file: Path, archive_dir: Path | None = N
 
 def _snapshot(path: Path) -> tuple[bool, str]:
     return (path.exists(), path.read_text(encoding="utf-8") if path.exists() else "")
+
+
+def _snapshot_regular(path: Path) -> tuple[bool, str] | None:
+    if path.exists() and not path.is_file():
+        return None
+    return _snapshot(path)
 
 
 def _restore_snapshots(snapshots: dict[Path, tuple[bool, str]]) -> None:
@@ -179,6 +185,10 @@ def complete_by_id(task_id: str, personal: bool = False, source: str = "user_com
     snapshots = {tasks_file: (True, content)}
     if daily_log_file is not None:
         snapshots[daily_log_file] = _snapshot(daily_log_file)
+    ledger_file = ledger_path(tasks_file)
+    ledger_snapshot = _snapshot_regular(ledger_file)
+    if ledger_snapshot is not None:
+        snapshots[ledger_file] = ledger_snapshot
 
     logged = log_task_completed(
         title=record.title,
@@ -248,6 +258,10 @@ def transition_by_id(
         metadata={"title": record.title, "line_number": record.line_number, **(metadata or {})},
     )
     snapshots = {tasks_file: (True, content)}
+    ledger_file = ledger_path(tasks_file)
+    ledger_snapshot = _snapshot_regular(ledger_file)
+    if ledger_snapshot is not None:
+        snapshots[ledger_file] = ledger_snapshot
     if next_state == "delegated":
         delegation_file = delegation.resolve_delegation_file()
         snapshots[delegation_file] = _snapshot(delegation_file)

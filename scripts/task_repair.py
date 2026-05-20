@@ -38,8 +38,36 @@ def _restore_content(tasks_file: Path, content: str) -> None:
     tasks_file.write_text(content, encoding="utf-8")
 
 
+def _ledger_snapshot(tasks_file: Path) -> tuple[Path, bool, str] | None:
+    target = ledger_path(tasks_file)
+    if target.exists() and not target.is_file():
+        return None
+    return target, target.exists(), target.read_text(encoding="utf-8") if target.exists() else ""
+
+
+def _restore_ledger(snapshot: tuple[Path, bool, str] | None) -> None:
+    if snapshot is None:
+        return
+    target, existed, content = snapshot
+    if existed:
+        target.write_text(content, encoding="utf-8")
+    elif target.exists():
+        target.unlink()
+
+
 def repair_missing_ids(personal: bool = False, apply: bool = False) -> dict:
-    tasks_file, content, records = load_records(personal)
+    try:
+        tasks_file, content, records = load_records(personal)
+    except FileNotFoundError as exc:
+        return {
+            "schema_version": "v1",
+            "command": "identity-repair",
+            "applied": False,
+            "blocked": True,
+            "blocking_invariants": ["tasks-file-missing"],
+            "proposed_repairs": [],
+            "error": str(exc),
+        }
     audit = audit_identity(records)
     proposed = audit.get("proposed_repairs", [])
     blocked = list(audit.get("blocking_invariants", []))
@@ -77,6 +105,7 @@ def repair_missing_ids(personal: bool = False, apply: bool = False) -> dict:
     ledger_error = _preflight_ledger(tasks_file)
     if ledger_error:
         return ledger_error
+    ledger_snapshot = _ledger_snapshot(tasks_file)
 
     lines = content.split("\n")
     event_objects = []
@@ -110,6 +139,7 @@ def repair_missing_ids(personal: bool = False, apply: bool = False) -> dict:
             events.append(append_event(event, path=ledger_path(tasks_file)))
     except OSError as exc:
         _restore_content(tasks_file, content)
+        _restore_ledger(ledger_snapshot)
         return {
             "schema_version": "v1",
             "command": "identity-repair",

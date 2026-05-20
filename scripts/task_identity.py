@@ -94,6 +94,8 @@ def task_records(content: str, personal: bool = False, fmt: str = "obsidian") ->
 
 def load_records(personal: bool = False) -> tuple[Path, str, list[IdentityRecord]]:
     tasks_file, fmt = get_tasks_file(personal)
+    if not tasks_file.exists():
+        raise FileNotFoundError(f"Tasks file not found: {tasks_file}")
     content = tasks_file.read_text(encoding="utf-8")
     return tasks_file, content, task_records(content, personal=personal, fmt=fmt)
 
@@ -200,7 +202,32 @@ def audit_identity(records: Iterable[IdentityRecord]) -> dict:
 
 
 def audit_payload(personal: bool = False) -> dict:
-    tasks_file, _, records = load_records(personal)
+    tasks_file, _ = get_tasks_file(personal)
+    try:
+        _, _, records = load_records(personal)
+    except FileNotFoundError as exc:
+        return {
+            "schema_version": "v1",
+            "command": "identity-audit",
+            "tasks_file": str(tasks_file),
+            "active": [],
+            "audit": {
+                "missing_task_ids": [],
+                "duplicate_task_ids": [],
+                "ambiguous_titles": [],
+                "malformed_task_ids": [],
+                "proposed_repairs": [],
+                "blocking_invariants": ["tasks-file-missing"],
+                "totals": {
+                    "active": 0,
+                    "missing_task_ids": 0,
+                    "duplicate_task_ids": 0,
+                    "ambiguous_titles": 0,
+                    "malformed_task_ids": 0,
+                },
+            },
+            "error": str(exc),
+        }
     return {
         "schema_version": "v1",
         "command": "identity-audit",

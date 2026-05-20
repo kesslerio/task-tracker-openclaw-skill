@@ -195,6 +195,29 @@ def test_done_recurring_task_rolls_forward_next_due_date(tmp_path):
     assert "🗓️2026-05-27" in content
 
 
+def test_done_recurring_task_replaces_spaced_due_marker(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text("""# Work
+
+## 🔴 Q1
+- [ ] **Send weekly update** task_id::tsk_weekly recur::weekly 🗓️ 2026-05-20
+""")
+    env = _env(tmp_path, work)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "done", "tsk_weekly"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 0
+    content = work.read_text()
+    assert "🗓️2026-05-27" in content
+    assert "🗓️ 2026-05-20" not in content
+
+
 def test_done_recurring_task_preserves_multi_word_rule(tmp_path):
     work = tmp_path / "Work Tasks.md"
     work.write_text("""# Work
