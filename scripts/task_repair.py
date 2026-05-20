@@ -102,10 +102,10 @@ def repair_missing_ids(personal: bool = False, apply: bool = False) -> dict:
             "events": [],
         }
 
+    ledger_snapshot = _ledger_snapshot(tasks_file)
     ledger_error = _preflight_ledger(tasks_file)
     if ledger_error:
         return ledger_error
-    ledger_snapshot = _ledger_snapshot(tasks_file)
 
     lines = content.split("\n")
     event_objects = []

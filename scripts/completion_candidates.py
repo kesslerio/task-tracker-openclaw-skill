@@ -31,7 +31,18 @@ def create_candidate(
     tasks_file, _ = get_tasks_file(personal)
     event_path = ledger_path(tasks_file)
     key = dedupe_key(source_type, source_pointer, summary, matched_task_id)
-    for event in read_events(event_path):
+    try:
+        events = read_events(event_path)
+    except OSError as exc:
+        return {
+            "created": False,
+            "ok": False,
+            "error": {
+                "code": "candidate-ledger-read-failed",
+                "message": f"Completion candidate ledger could not be read; no candidate was created: {exc}",
+            },
+        }
+    for event in events:
         evidence = event.get("evidence") or {}
         if evidence.get("dedupe_key") == key and event.get("event_type") == "completion_candidate":
             return {"created": False, "candidate": event}
@@ -56,16 +67,36 @@ def create_candidate(
         evidence=evidence,
         metadata={"candidate_status": "new"},
     )
-    append_event(event, path=event_path)
+    try:
+        append_event(event, path=event_path)
+    except OSError as exc:
+        return {
+            "created": False,
+            "ok": False,
+            "error": {
+                "code": "candidate-ledger-append-failed",
+                "message": f"Completion candidate ledger append failed; no candidate was created: {exc}",
+            },
+        }
     return {"created": True, "candidate": event}
 
 
-def list_candidates(personal: bool = False) -> list[dict[str, Any]]:
+def list_candidates(personal: bool = False) -> list[dict[str, Any]] | dict[str, Any]:
     tasks_file, _ = get_tasks_file(personal)
     event_path = ledger_path(tasks_file)
     statuses: dict[str, str] = {}
     candidates: dict[str, dict[str, Any]] = {}
-    for event in read_events(event_path):
+    try:
+        events = read_events(event_path)
+    except OSError as exc:
+        return {
+            "ok": False,
+            "error": {
+                "code": "candidate-ledger-read-failed",
+                "message": f"Completion candidate ledger could not be read: {exc}",
+            },
+        }
+    for event in events:
         evidence = event.get("evidence") or {}
         key = evidence.get("dedupe_key")
         if not key:
@@ -90,9 +121,12 @@ def decide_candidate(
 ) -> dict[str, Any]:
     tasks_file, _ = get_tasks_file(personal)
     event_path = ledger_path(tasks_file)
+    listed = list_candidates(personal=personal)
+    if isinstance(listed, dict) and not listed.get("ok", True):
+        return listed
     candidates = {
         (event.get("evidence") or {}).get("dedupe_key"): event
-        for event in list_candidates(personal=personal)
+        for event in listed
     }
     candidate = candidates.get(dedupe_key_value)
     if not candidate:

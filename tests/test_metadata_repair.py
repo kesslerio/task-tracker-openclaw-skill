@@ -216,6 +216,39 @@ def test_identity_repair_restores_partial_ledger_append(monkeypatch, tmp_path):
     assert ledger.read_text() == '{"event_type":"existing"}\n'
 
 
+def test_identity_repair_removes_preflight_created_ledger_on_append_failure(monkeypatch, tmp_path):
+    import task_identity
+    import task_repair
+
+    work = tmp_path / "Work Tasks.md"
+    original = """# Work
+
+## 🔴 Q1
+- [ ] **Ship milestone** area:: Delivery
+"""
+    work.write_text(original)
+    ledger = tmp_path / "events.jsonl"
+    monkeypatch.setenv("TASK_TRACKER_WORK_FILE", str(work))
+    monkeypatch.setenv("TASK_TRACKER_LEDGER_FILE", str(ledger))
+    monkeypatch.setattr(
+        task_repair,
+        "load_records",
+        lambda personal=False: (
+            work,
+            work.read_text(encoding="utf-8"),
+            task_identity.task_records(work.read_text(encoding="utf-8"), personal=personal),
+        ),
+    )
+    monkeypatch.setattr(task_repair, "append_event", lambda event, path=None: (_ for _ in ()).throw(OSError("simulated full disk")))
+
+    payload = task_repair.repair_missing_ids(apply=True)
+
+    assert payload["blocked"] is True
+    assert "ledger-append-failed" in payload["blocking_invariants"]
+    assert work.read_text() == original
+    assert not ledger.exists()
+
+
 def test_personal_identity_repair_uses_personal_sidecar_by_default(tmp_path):
     work = tmp_path / "Work Tasks.md"
     personal = tmp_path / "Personal Tasks.md"

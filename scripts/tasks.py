@@ -513,7 +513,12 @@ def cmd_identity_repair(args):
 
 def cmd_candidates(args):
     if args.candidate_command == "list":
-        print(json.dumps({"schema_version": "v1", "command": "completion-candidates", "items": list_candidates(personal=args.personal)}, indent=2, sort_keys=True))
+        items = list_candidates(personal=args.personal)
+        if isinstance(items, dict) and not items.get("ok", True):
+            payload = {"schema_version": "v1", "command": "completion-candidates", **items}
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            sys.exit(2)
+        print(json.dumps({"schema_version": "v1", "command": "completion-candidates", "items": items}, indent=2, sort_keys=True))
         return
     if args.candidate_command == "add":
         payload = create_candidate(
@@ -525,6 +530,8 @@ def cmd_candidates(args):
             personal=args.personal,
         )
         print(json.dumps(payload, indent=2, sort_keys=True))
+        if payload.get("ok") is False:
+            sys.exit(2)
         return
     if args.candidate_command == "decide":
         payload = decide_candidate(args.dedupe_key, args.decision, task_id=args.task_id, personal=args.personal)
@@ -753,7 +760,7 @@ def _extract_inline_identifiers(text: str) -> dict[str, set[str]]:
     if not text:
         return {"exact": exact_identifiers, "fallback": fallback_identifiers}
 
-    for match in re.findall(r"\b(?:id|task_id|task)::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$)", text, flags=re.IGNORECASE):
+    for match in re.findall(r"\b(?:id|task_id|task)::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$|[),.;!?])", text, flags=re.IGNORECASE):
         exact_identifiers.add(match.casefold())
 
     for url in re.findall(r"https?://[^\s)>\]]+", text):
@@ -780,8 +787,8 @@ def _task_identifier_bundle(task: dict, fallback_id: str) -> dict:
     explicit_id = None
     parsed_task_id = str(task.get("task_id") or "").strip()
     parsed_legacy_id = str(task.get("legacy_id") or "").strip()
-    legacy_id_match = re.search(r"\bid::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$)", raw_line, flags=re.IGNORECASE)
-    task_alias_match = re.search(r"\btask::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$)", raw_line, flags=re.IGNORECASE)
+    legacy_id_match = re.search(r"\bid::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$|[),.;!?])", raw_line, flags=re.IGNORECASE)
+    task_alias_match = re.search(r"\btask::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$|[),.;!?])", raw_line, flags=re.IGNORECASE)
     if parsed_task_id:
         explicit_id = parsed_task_id
     elif parsed_legacy_id:

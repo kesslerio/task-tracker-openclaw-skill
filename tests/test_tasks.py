@@ -68,3 +68,10 @@ def test_add_command_emits_canonical_task_id(tmp_path):
     match = re.search(r"task_id::(tsk_[a-f0-9]{16})", content)
     assert match
     assert match.group(1) in proc.stdout
+
+
+def test_extract_inline_identifiers_accepts_trailing_punctuation():
+    identifiers = tasks._extract_inline_identifiers("Completed task_id::tsk_ship, and id::legacy-1)")
+
+    assert "tsk_ship" in identifiers["exact"]
+    assert "legacy-1" in identifiers["exact"]

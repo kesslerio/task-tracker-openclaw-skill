@@ -47,6 +47,41 @@ def test_candidate_add_dedupes_by_source_pointer_summary_and_task(tmp_path):
     assert len((tmp_path / "events.jsonl").read_text().splitlines()) == 1
 
 
+def test_candidate_add_returns_structured_error_for_bad_ledger_path(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text("# Work\n\n## 🔴 Q1\n- [ ] **Ship milestone** task_id::tsk_ship\n")
+    bad_ledger = tmp_path / "ledger-dir"
+    bad_ledger.mkdir()
+    env = _env(tmp_path, work)
+    env["TASK_TRACKER_LEDGER_FILE"] = str(bad_ledger)
+
+    proc = subprocess.run(
+        [
+            "python3",
+            "scripts/tasks.py",
+            "completion-candidates",
+            "add",
+            "--source-type",
+            "daily-note",
+            "--source-pointer",
+            "2026-05-20.md:3",
+            "--summary",
+            "Ship milestone",
+            "--task-id",
+            "tsk_ship",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 2
+    payload = json.loads(proc.stdout)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "candidate-ledger-read-failed"
+
+
 def test_candidate_confirmation_uses_id_transition(tmp_path):
     work = tmp_path / "Work Tasks.md"
     work.write_text("# Work\n\n## 🔴 Q1\n- [ ] **Ship milestone** task_id::tsk_ship\n")
@@ -218,3 +253,25 @@ def test_confirmed_candidate_records_decision_before_apply_failure(tmp_path):
     )
     listed = json.loads(retry_list.stdout)["items"]
     assert listed and listed[0]["candidate_status"] == "apply_failed"
+
+
+def test_candidate_list_returns_structured_error_for_bad_ledger_path(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text("# Work\n\n## 🔴 Q1\n- [ ] **Ship milestone** task_id::tsk_ship\n")
+    bad_ledger = tmp_path / "ledger-dir"
+    bad_ledger.mkdir()
+    env = _env(tmp_path, work)
+    env["TASK_TRACKER_LEDGER_FILE"] = str(bad_ledger)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "completion-candidates", "list"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 2
+    payload = json.loads(proc.stdout)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "candidate-ledger-read-failed"

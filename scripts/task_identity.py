@@ -12,8 +12,8 @@ from typing import Iterable
 
 from utils import get_tasks_file, parse_tasks
 
-TASK_ID_RE = re.compile(r"\btask_id::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$)")
-LEGACY_ID_RE = re.compile(r"\bid::([A-Za-z0-9._:-]+)")
+TASK_ID_RE = re.compile(r"\btask_id::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$|[),.;!?])")
+LEGACY_ID_RE = re.compile(r"\bid::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$|[),.;!?])")
 
 
 @dataclass(frozen=True)
