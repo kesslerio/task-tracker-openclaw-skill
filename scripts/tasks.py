@@ -6,7 +6,7 @@ Usage:
     tasks.py list [--priority high|medium|low] [--status open|done] [--completed-since 24h|7d|30d] [--due today|this-week|overdue|due-or-overdue]
     tasks.py --personal list
     tasks.py add "Task title" [--priority high|medium|low] [--due YYYY-MM-DD]
-    tasks.py done "task query"
+    tasks.py done "task_id"
     tasks.py blockers [--person NAME]
     tasks.py archive
 """
@@ -25,7 +25,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 from daily_notes import extract_completed_tasks
 from log_done import log_task_completed
 from standup_common import get_calendar_events, flatten_calendar_events
+from completion_candidates import create_candidate, decide_candidate, list_candidates
 import delegation
+from task_identity import audit_payload, print_json as print_identity_json
+from task_repair import repair_missing_ids
+from task_transitions import block_unsafe_query, complete_by_id, print_result, transition_by_id
 from utils import (
     detect_format,
     get_tasks_file,
@@ -223,92 +227,16 @@ def _remove_task_line(content: str, raw_line: str) -> str:
 
 
 def done_task(args):
-    """Complete a task: log to daily notes and remove from the board."""
-    tasks_file, format = get_tasks_file(args.personal)
+    """Complete a task by canonical ID only."""
+    query = args.query.strip()
+    if not re.fullmatch(r"[A-Za-z0-9._:-]+", query):
+        print_result(block_unsafe_query(args.query))
+        sys.exit(2)
 
-    if not tasks_file.exists():
-        print(f"❌ Tasks file not found: {tasks_file}")
-        return
-
-    content = tasks_file.read_text()
-    tasks_data = parse_tasks(content, args.personal, format)
-    tasks = tasks_data['all']
-
-    query = args.query.lower()
-    matches = [t for t in tasks if query in t['title'].lower() and not t['done']]
-
-    if not matches:
-        print(f"No matching task found for: {args.query}")
-        return
-
-    if len(matches) > 1:
-        print(f"Multiple matches found:")
-        for i, t in enumerate(matches, 1):
-            print(f"  {i}. {t['title']}")
-        print("\nBe more specific.")
-        return
-
-    task = matches[0]
-
-    old_line = task.get('raw_line', '')
-    if not old_line:
-        print("⚠️ Could not find task line to update.")
-        return
-
-    # Log completion to daily notes — abort board changes if this fails
-    logged = log_task_completed(
-        title=task['title'],
-        section=task.get('section'),
-        area=task.get('area'),
-        due=task.get('due'),
-        recur=task.get('recur'),
-    )
-    if not logged:
-        print(
-            "❌ Could not log completion to daily notes. "
-            "Task was NOT removed from the board to prevent data loss.\n"
-            "Check that TASK_TRACKER_DAILY_NOTES_DIR (or TASK_TRACKER_DONE_LOG_DIR) "
-            "is set and writable.",
-            file=sys.stderr,
-        )
-        return
-
-    completed_today = datetime.now().strftime('%Y-%m-%d')
-    recur_value = (task.get('recur') or '').strip()
-
-    if recur_value:
-        # Recurring: replace with next instance (no completed line on board)
-        from_date = task.get('due') or completed_today
-        try:
-            next_due = next_recurrence_date(recur_value, from_date)
-            next_task_line = old_line
-
-            if re.search(r'🗓️\d{4}-\d{2}-\d{2}', next_task_line):
-                next_task_line = re.sub(
-                    r'🗓️\d{4}-\d{2}-\d{2}',
-                    f'🗓️{next_due}',
-                    next_task_line,
-                    count=1,
-                )
-            else:
-                inline_field_match = re.search(r'\s+\w+::', next_task_line)
-                if inline_field_match:
-                    pos = inline_field_match.start()
-                    next_task_line = f"{next_task_line[:pos]} 🗓️{next_due}{next_task_line[pos:]}"
-                else:
-                    next_task_line = f"{next_task_line.rstrip()} 🗓️{next_due}"
-
-            new_content = content.replace(old_line, next_task_line, 1)
-        except ValueError as e:
-            print(f"⚠️ Could not create recurring task for '{task['title']}': {e}")
-            new_content = _remove_task_line(content, old_line)
-    else:
-        # Non-recurring: remove the task line entirely
-        new_content = _remove_task_line(content, old_line)
-
-    tasks_file.write_text(new_content)
-    task_type = "Personal" if args.personal else "Work"
-    print(f"✅ Completed {task_type} task: {task['title']}")
+    result = complete_by_id(query, personal=args.personal, source="user_command")
+    print_result(result)
+    if not result.get("ok"):
+        sys.exit(2)
 
 
 def show_blockers(args):
@@ -535,57 +463,70 @@ def _find_open_task(personal: bool, query: str) -> tuple[Path, dict | None, str]
 
 
 def cmd_state(args):
-    """First-class state transitions: pause/delegate/backlog/drop."""
-    from parking_lot import add_item
+    """First-class state transitions by canonical ID."""
+    task_id = args.query.strip()
+    if not re.fullmatch(r"[A-Za-z0-9._:-]+", task_id):
+        print_result(block_unsafe_query(args.query))
+        sys.exit(2)
 
-    tasks_file, task, err = _find_open_task(args.personal, args.query)
-    if err:
-        print(err)
-        return
-
-    content = tasks_file.read_text()
-    old_line = task.get('raw_line', '')
-    if not old_line:
-        print("❌ Task has no raw line; cannot transition.")
-        return
-
-    if args.state_command == 'pause':
-        new_line = old_line if 'paused::' in old_line else f"{old_line} paused::{datetime.now().date().isoformat()}"
+    state_map = {
+        "pause": "active",
+        "delegate": "delegated",
+        "backlog": "backlog",
+        "drop": "deleted",
+    }
+    metadata = {}
+    if args.state_command == "pause":
+        metadata["paused_at"] = datetime.now().date().isoformat()
         if args.until:
-            if 'pause_until::' in new_line:
-                new_line = re.sub(r'pause_until::\d{4}-\d{2}-\d{2}', f'pause_until::{args.until}', new_line)
-            else:
-                new_line = f"{new_line} pause_until::{args.until}"
-        tasks_file.write_text(content.replace(old_line, new_line, 1))
-        print(f"✅ Paused: {task['title']}")
-        return
+            metadata["due"] = args.until
+    if args.state_command == "delegate":
+        metadata.update({"assignee": args.to, "followup": args.followup})
+    if args.state_command == "backlog":
+        metadata.update({"dept": args.dept, "priority": args.priority})
 
-    if args.state_command == 'delegate':
-        item = delegation.add_item(delegation.resolve_delegation_file(), task['title'], args.to, args.followup, task.get('department'))
-        tasks_file.write_text(_remove_task_line(content, old_line))
-        print(f"✅ Delegated: {item['title']} → {item['assignee']} [followup::{item['followup']}]")
-        return
+    result = transition_by_id(
+        task_id,
+        state_map[args.state_command],
+        personal=args.personal,
+        reason=args.state_command,
+        metadata=metadata,
+    )
+    print_result(result)
+    if not result.get("ok"):
+        sys.exit(2)
 
-    if args.state_command == 'backlog':
-        pri = args.priority or task.get('priority') or 'low'
-        msg = add_item(tasks_file, task['title'], dept=args.dept or task.get('department'), priority=pri)
-        if not msg.startswith('✅'):
-            print(f"❌ Backlog move failed: {msg}", file=sys.stderr)
-            return
-        tasks_file.write_text(_remove_task_line(tasks_file.read_text(), old_line))
-        print(f"✅ Backlog: {task['title']} ({msg})")
-        return
 
-    if args.state_command == 'drop':
-        archive_dir = Path(os.getenv('TASK_TRACKER_ARCHIVE_DIR', str(tasks_file.parent / 'Done Archive')))
-        archive_dir.mkdir(parents=True, exist_ok=True)
-        archive_file = archive_dir / f"ARCHIVE-{get_current_quarter()}.md"
-        entry = f"- [x] ~~{task['title']}~~ (dropped) ✅ {datetime.now().date().isoformat()}\n"
-        with archive_file.open('a', encoding='utf-8') as fh:
-            fh.write(entry)
-        tasks_file.write_text(_remove_task_line(content, old_line))
-        print(f"✅ Dropped: {task['title']}")
+def cmd_identity_audit(args):
+    print_identity_json(audit_payload(personal=args.personal))
+
+
+def cmd_identity_repair(args):
+    payload = repair_missing_ids(personal=args.personal, apply=args.apply)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    if payload.get("blocked"):
+        sys.exit(2)
+
+
+def cmd_candidates(args):
+    if args.candidate_command == "list":
+        print(json.dumps({"schema_version": "v1", "command": "completion-candidates", "items": list_candidates()}, indent=2, sort_keys=True))
         return
+    if args.candidate_command == "add":
+        payload = create_candidate(
+            source_type=args.source_type,
+            source_pointer=args.source_pointer,
+            summary=args.summary,
+            matched_task_id=args.task_id,
+            confidence=args.confidence,
+        )
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    if args.candidate_command == "decide":
+        payload = decide_candidate(args.dedupe_key, args.decision, task_id=args.task_id)
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        if not payload.get("ok"):
+            sys.exit(2)
 
 
 def cmd_promote_from_backlog(args):
@@ -833,13 +774,15 @@ def _task_identifier_bundle(task: dict, fallback_id: str) -> dict:
     raw_line = str(task.get("raw_line") or "")
     title = str(task.get("title") or "")
     explicit_id = None
-    explicit_match = re.search(
-        r"\b(?:id|task_id|task)::([A-Za-z0-9._:-]+)",
-        raw_line,
-        flags=re.IGNORECASE,
-    )
-    if explicit_match:
-        explicit_id = explicit_match.group(1)
+    task_id_match = re.search(r"\btask_id::([A-Za-z0-9._:-]+)", raw_line, flags=re.IGNORECASE)
+    legacy_id_match = re.search(r"\bid::([A-Za-z0-9._:-]+)", raw_line, flags=re.IGNORECASE)
+    task_alias_match = re.search(r"\btask::([A-Za-z0-9._:-]+)", raw_line, flags=re.IGNORECASE)
+    if task_id_match:
+        explicit_id = task_id_match.group(1)
+    elif legacy_id_match:
+        explicit_id = legacy_id_match.group(1)
+    elif task_alias_match:
+        explicit_id = task_alias_match.group(1)
 
     raw_identifiers = _extract_inline_identifiers(raw_line)
     title_identifiers = _extract_inline_identifiers(title)
@@ -1462,9 +1405,32 @@ def main():
     add_parser.set_defaults(func=add_task)
     
     # Done command
-    done_parser = subparsers.add_parser('done', help='Mark task as done')
-    done_parser.add_argument('query', help='Task title (fuzzy match)')
+    done_parser = subparsers.add_parser('done', help='Mark task as done by canonical task_id')
+    done_parser.add_argument('query', help='Canonical task_id')
     done_parser.set_defaults(func=done_task)
+
+    identity_audit_parser = subparsers.add_parser('identity-audit', help='Read-only canonical identity audit')
+    identity_audit_parser.set_defaults(func=cmd_identity_audit)
+
+    identity_repair_parser = subparsers.add_parser('identity-repair', help='Repair missing task_id metadata')
+    identity_repair_parser.add_argument('--apply', action='store_true', help='Write safe task_id repairs')
+    identity_repair_parser.set_defaults(func=cmd_identity_repair)
+
+    candidate_parser = subparsers.add_parser('completion-candidates', help='Manage completion candidate inbox')
+    candidate_sub = candidate_parser.add_subparsers(dest='candidate_command', required=True)
+    candidate_sub.add_parser('list', help='List active candidates').set_defaults(func=cmd_candidates)
+    candidate_add = candidate_sub.add_parser('add', help='Add an evidence-only completion candidate')
+    candidate_add.add_argument('--source-type', required=True)
+    candidate_add.add_argument('--source-pointer', required=True)
+    candidate_add.add_argument('--summary', required=True)
+    candidate_add.add_argument('--task-id')
+    candidate_add.add_argument('--confidence', type=float, default=0.0)
+    candidate_add.set_defaults(func=cmd_candidates)
+    candidate_decide = candidate_sub.add_parser('decide', help='Decide a completion candidate')
+    candidate_decide.add_argument('dedupe_key')
+    candidate_decide.add_argument('decision', choices=['shown', 'confirmed', 'rejected', 'duplicate', 'snoozed', 'expired'])
+    candidate_decide.add_argument('--task-id')
+    candidate_decide.set_defaults(func=cmd_candidates)
     
     done_scan_parser = subparsers.add_parser('done-scan', help='Scan completed items from daily notes')
     done_scan_parser.add_argument('--window', choices=['24h', '7d', '30d'], default='24h')

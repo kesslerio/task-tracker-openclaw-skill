@@ -9,6 +9,10 @@ All `scripts/tasks.py` task primitives use a stable top-level envelope:
 }
 ```
 
+Task rows should expose canonical `task_id` values when available. Fallback
+identifiers may appear in read-only diagnostics, but mutation commands must use
+canonical IDs from `task_id::` or migrated legacy `id::` metadata.
+
 ## `standup-summary`
 
 ```json
