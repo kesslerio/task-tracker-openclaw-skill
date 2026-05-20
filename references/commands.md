@@ -31,17 +31,24 @@ python3 scripts/tasks.py blockers --person sarah
 ```bash
 python3 scripts/tasks.py add "Draft project proposal" --priority high --due 2026-01-23
 python3 scripts/tasks.py --personal add "Call mom" --priority high --due 2026-01-22
-python3 scripts/tasks.py done "proposal"
-python3 scripts/tasks.py --personal done "call mom"
+python3 scripts/tasks.py identity-audit
+python3 scripts/tasks.py identity-repair
+python3 scripts/tasks.py identity-repair --apply
+python3 scripts/tasks.py done "tsk_example"
+python3 scripts/tasks.py --personal done "tsk_personal"
 ```
+
+`done` and other active mutations require canonical `task_id::` values. Title
+queries are blocked because duplicate titles and board reorder can mutate the
+wrong task.
 
 ### State transitions
 
 ```bash
-python3 scripts/tasks.py state pause "task title" --until 2026-03-01
-python3 scripts/tasks.py state delegate "task title" --to Alex --followup 2026-03-01
-python3 scripts/tasks.py state backlog "task title"
-python3 scripts/tasks.py state drop "task title"
+python3 scripts/tasks.py state pause "tsk_example" --until 2026-03-01
+python3 scripts/tasks.py state delegate "tsk_example" --to Alex --followup 2026-03-01
+python3 scripts/tasks.py state backlog "tsk_example"
+python3 scripts/tasks.py state drop "tsk_example"
 ```
 
 ### Backlog workflows
@@ -73,6 +80,13 @@ python3 scripts/tasks.py weekly-review-summary --start 2026-02-16 --end 2026-02-
 python3 scripts/tasks.py ingest-daily-log --file /tmp/done-log.md
 cat /tmp/done-log.md | python3 scripts/tasks.py ingest-daily-log
 python3 scripts/tasks.py calendar-sync
+python3 scripts/tasks.py completion-candidates list
+python3 scripts/tasks.py completion-candidates add \
+  --source-type daily-note \
+  --source-pointer 2026-05-20.md:12 \
+  --summary "Shipped milestone" \
+  --task-id tsk_example
+python3 scripts/tasks.py completion-candidates decide <dedupe-key> confirmed
 ```
 
 All primitives return JSON with a stable envelope:

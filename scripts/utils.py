@@ -218,7 +218,7 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
     current_objective = None
     today = datetime.now().date()
     
-    for line in content.split('\n'):
+    for line_number, line in enumerate(content.split('\n'), start=1):
         # Detect section headers
         if line.startswith('## '):
             current_task = None
@@ -298,6 +298,8 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
             estimate = None
             depends = None
             sprint = None
+            task_id = None
+            legacy_id = None
 
             department = None
             priority = None
@@ -370,6 +372,14 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 sprint_match = re.search(r'(?<!\w)sprint::\s*(?!(\s|\w+::))([^\n]+?)(?=\s+\w+::|\s*🗓️|$)', rest)
                 if sprint_match:
                     sprint = sprint_match.group(2).strip()
+
+                task_id_match = re.search(r'(?<!\w)task_id::\s*([A-Za-z0-9._:-]+)', rest)
+                if task_id_match:
+                    task_id = task_id_match.group(1).strip()
+
+                legacy_id_match = re.search(r'(?<!\w)id::\s*([A-Za-z0-9._:-]+)', rest)
+                if legacy_id_match:
+                    legacy_id = legacy_id_match.group(1).strip()
             
             current_task = {
                 'title': title,
@@ -389,8 +399,11 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 'estimate': estimate,
                 'depends': depends,
                 'sprint': sprint,
+                'task_id': task_id,
+                'legacy_id': legacy_id,
                 'completed_date': completed_date,
                 'raw_line': line,
+                'line_number': line_number,
             }
             
             result['all'].append(current_task)

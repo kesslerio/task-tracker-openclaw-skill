@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Canonical task identity audit and export helpers."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+from utils import get_tasks_file, parse_tasks
+
+TASK_ID_RE = re.compile(r"\btask_id::([A-Za-z0-9._:-]+)")
+LEGACY_ID_RE = re.compile(r"\bid::([A-Za-z0-9._:-]+)")
+
+
+@dataclass(frozen=True)
+class IdentityRecord:
+    task_id: str | None
+    legacy_id: str | None
+    title: str
+    done: bool
+    section: str | None
+    area: str | None
+    line_number: int | None
+    raw_line: str
+    fallback_id: str
+
+    @property
+    def canonical_id(self) -> str | None:
+        return self.task_id or self.legacy_id
+
+    @property
+    def identity_source(self) -> str:
+        if self.task_id:
+            return "task_id"
+        if self.legacy_id:
+            return "legacy_id"
+        return "fallback"
+
+
+def fallback_id_for(raw_line: str, line_number: int | None) -> str:
+    material = f"{line_number or 0}\0{raw_line}".encode("utf-8")
+    return f"fallback-{hashlib.sha1(material).hexdigest()[:12]}"
+
+
+def opaque_task_id(raw_line: str, line_number: int | None) -> str:
+    material = f"task-v1\0{line_number or 0}\0{raw_line}".encode("utf-8")
+    return f"tsk_{hashlib.sha256(material).hexdigest()[:16]}"
+
+
+def task_records(content: str, personal: bool = False, fmt: str = "obsidian") -> list[IdentityRecord]:
+    parsed = parse_tasks(content, personal=personal, format=fmt)
+    records: list[IdentityRecord] = []
+    for task in parsed.get("all", []):
+        raw_line = str(task.get("raw_line") or "")
+        line_number = task.get("line_number")
+        records.append(
+            IdentityRecord(
+                task_id=task.get("task_id"),
+                legacy_id=task.get("legacy_id"),
+                title=str(task.get("title") or ""),
+                done=bool(task.get("done")),
+                section=task.get("section"),
+                area=task.get("area") or task.get("department"),
+                line_number=int(line_number) if line_number else None,
+                raw_line=raw_line,
+                fallback_id=fallback_id_for(raw_line, int(line_number) if line_number else None),
+            )
+        )
+    return records
+
+
+def load_records(personal: bool = False) -> tuple[Path, str, list[IdentityRecord]]:
+    tasks_file, fmt = get_tasks_file(personal)
+    content = tasks_file.read_text(encoding="utf-8")
+    return tasks_file, content, task_records(content, personal=personal, fmt=fmt)
+
+
+def active_records(records: Iterable[IdentityRecord]) -> list[IdentityRecord]:
+    return [record for record in records if not record.done and record.section != "backlog"]
+
+
+def export_active(records: Iterable[IdentityRecord]) -> list[dict]:
+    exported = []
+    for record in active_records(records):
+        exported.append(
+            {
+                "task_id": record.canonical_id,
+                "identity_source": record.identity_source,
+                "fallback_id": record.fallback_id,
+                "title": record.title,
+                "state": "active",
+                "section": record.section,
+                "area": record.area,
+                "line_number": record.line_number,
+                "raw_line": record.raw_line,
+                "missing_task_id": record.task_id is None,
+                "fallback_only": record.canonical_id is None,
+                "checked_candidate": record.done,
+            }
+        )
+    return exported
+
+
+def audit_identity(records: Iterable[IdentityRecord]) -> dict:
+    active = active_records(records)
+    by_id: dict[str, list[IdentityRecord]] = {}
+    by_title: dict[str, list[IdentityRecord]] = {}
+    missing: list[IdentityRecord] = []
+    proposed_repairs: list[dict] = []
+    malformed: list[dict] = []
+
+    for record in active:
+        if record.canonical_id:
+            by_id.setdefault(record.canonical_id, []).append(record)
+        else:
+            missing.append(record)
+            proposed_repairs.append(
+                {
+                    "line_number": record.line_number,
+                    "title": record.title,
+                    "task_id": opaque_task_id(record.raw_line, record.line_number),
+                    "raw_line": record.raw_line,
+                }
+            )
+        by_title.setdefault(record.title.casefold(), []).append(record)
+        if "task_id::" in record.raw_line and not TASK_ID_RE.search(record.raw_line):
+            malformed.append({"line_number": record.line_number, "title": record.title})
+
+    duplicate_ids = [
+        {
+            "task_id": task_id,
+            "items": [
+                {"line_number": r.line_number, "title": r.title, "raw_line": r.raw_line}
+                for r in group
+            ],
+        }
+        for task_id, group in sorted(by_id.items())
+        if len(group) > 1
+    ]
+    ambiguous_titles = [
+        {
+            "title": group[0].title,
+            "items": [
+                {"line_number": r.line_number, "task_id": r.canonical_id, "raw_line": r.raw_line}
+                for r in group
+            ],
+        }
+        for _, group in sorted(by_title.items())
+        if len(group) > 1
+    ]
+
+    blocking = []
+    if duplicate_ids:
+        blocking.append("duplicate-task-id")
+    if malformed:
+        blocking.append("malformed-task-id")
+
+    return {
+        "missing_task_ids": [
+            {"line_number": r.line_number, "title": r.title, "raw_line": r.raw_line}
+            for r in missing
+        ],
+        "duplicate_task_ids": duplicate_ids,
+        "ambiguous_titles": ambiguous_titles,
+        "malformed_task_ids": malformed,
+        "proposed_repairs": proposed_repairs,
+        "blocking_invariants": blocking,
+        "totals": {
+            "active": len(active),
+            "missing_task_ids": len(missing),
+            "duplicate_task_ids": len(duplicate_ids),
+            "ambiguous_titles": len(ambiguous_titles),
+            "malformed_task_ids": len(malformed),
+        },
+    }
+
+
+def audit_payload(personal: bool = False) -> dict:
+    tasks_file, _, records = load_records(personal)
+    return {
+        "schema_version": "v1",
+        "command": "identity-audit",
+        "tasks_file": str(tasks_file),
+        "active": export_active(records),
+        "audit": audit_identity(records),
+    }
+
+
+def print_json(payload: dict) -> None:
+    print(json.dumps(payload, indent=2, sort_keys=True))
