@@ -68,6 +68,59 @@ def test_done_by_title_is_blocked_without_writes(tmp_path):
     assert not (tmp_path / "events.jsonl").exists()
 
 
+def test_done_restricts_canonical_resolution_to_active_sections(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text("""# Work
+
+## 🔴 Q1
+- [ ] **Active task** task_id::tsk_same area:: Delivery
+
+## 🅿️ Parking Lot
+- [ ] **Backlog task** task_id::tsk_same #Ops #low created::2026-01-01
+""")
+    env = _env(tmp_path, work)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "done", "tsk_same"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 0
+    content = work.read_text()
+    assert "Active task" not in content
+    assert "Backlog task" in content
+
+
+def test_done_rolls_back_board_when_ledger_append_fails(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    original = """# Work
+
+## 🔴 Q1
+- [ ] **Ship milestone** task_id::tsk_ship area:: Delivery
+"""
+    work.write_text(original)
+    ledger_dir = tmp_path / "ledger-is-dir"
+    ledger_dir.mkdir()
+    env = _env(tmp_path, work)
+    env["TASK_TRACKER_LEDGER_FILE"] = str(ledger_dir)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "done", "tsk_ship"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 2
+    payload = json.loads(proc.stdout)
+    assert payload["error"]["code"] == "ledger-append-failed"
+    assert work.read_text() == original
+
+
 def test_done_id_survives_title_edit_and_reorder(tmp_path):
     work = tmp_path / "Work Tasks.md"
     work.write_text("""# Work
@@ -317,6 +370,30 @@ def test_state_backlog_preserves_priority_and_sanitizes_department(tmp_path):
     assert "#high" in content
     assert "#CustomerSuccess" in content
     assert "#Customer Success" not in content
+
+
+def test_state_backlog_priority_inference_is_deterministic(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text("""# Work
+
+## 🔴 Q1
+- [ ] **Backlog me** task_id::tsk_backlog area:: Ops #urgent #high
+
+## 🅿️ Parking Lot
+""")
+    env = _env(tmp_path, work)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "state", "backlog", "tsk_backlog"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 0
+    content = work.read_text()
+    assert "#urgent" in content
 
 
 def test_state_delegate_sanitizes_department(tmp_path):

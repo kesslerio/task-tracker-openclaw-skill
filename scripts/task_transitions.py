@@ -12,14 +12,14 @@ from pathlib import Path
 import delegation
 from log_done import log_task_completed
 from parking_lot import add_item as add_parking_item
-from task_identity import load_records
+from task_identity import active_records, load_records
 from task_ledger import append_event, ledger_path, new_event
 from utils import next_recurrence_date
 
 INLINE_FIELD_RE = re.compile(r"\s+[A-Za-z_][A-Za-z0-9_-]*::")
 RECURRENCE_RE = re.compile(r"\brecur::\s*(?!(?:\s|[A-Za-z_][A-Za-z0-9_-]*::))([^\n]+?)(?=\s+[A-Za-z_][A-Za-z0-9_-]*::|\s*[🗓️📅]|$)")
 DUE_RE = re.compile(r"(?:🗓️|📅\s*)(\d{4}-\d{2}-\d{2})")
-PRIORITY_VALUES = {"urgent", "high", "medium", "low"}
+PRIORITY_VALUES = ("urgent", "high", "medium", "low")
 
 
 def _remove_task_line(content: str, raw_line: str) -> str:
@@ -105,7 +105,7 @@ def _archive_dropped_task(record, tasks_file: Path, archive_dir: Path | None = N
 
 def _resolve_by_id(task_id: str, personal: bool = False):
     tasks_file, content, records = load_records(personal)
-    matches = [record for record in records if not record.done and record.canonical_id == task_id]
+    matches = [record for record in active_records(records) if record.canonical_id == task_id]
     if len(matches) != 1:
         return tasks_file, content, None, {
             "ok": False,
@@ -165,7 +165,17 @@ def complete_by_id(task_id: str, personal: bool = False, source: str = "user_com
         new_content = _remove_task_line(content, record.raw_line)
 
     tasks_file.write_text(new_content, encoding="utf-8")
-    append_event(event, path=ledger_path(tasks_file))
+    try:
+        append_event(event, path=ledger_path(tasks_file))
+    except OSError as exc:
+        tasks_file.write_text(content, encoding="utf-8")
+        return {
+            "ok": False,
+            "error": {
+                "code": "ledger-append-failed",
+                "message": f"Ledger append failed after board write; board was restored: {exc}",
+            },
+        }
     return {"ok": True, "task_id": task_id, "title": record.title, "event": event}
 
 
