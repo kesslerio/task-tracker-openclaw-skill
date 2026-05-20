@@ -34,11 +34,16 @@ def _preflight_ledger(tasks_file: Path) -> dict | None:
     return None
 
 
+def _restore_content(tasks_file: Path, content: str) -> None:
+    tasks_file.write_text(content, encoding="utf-8")
+
+
 def repair_missing_ids(personal: bool = False, apply: bool = False) -> dict:
     tasks_file, content, records = load_records(personal)
     audit = audit_identity(records)
+    proposed = audit.get("proposed_repairs", [])
     blocked = list(audit.get("blocking_invariants", []))
-    if audit.get("ambiguous_titles"):
+    if proposed and audit.get("ambiguous_titles"):
         blocked.append("ambiguous-title")
 
     if blocked:
@@ -51,7 +56,6 @@ def repair_missing_ids(personal: bool = False, apply: bool = False) -> dict:
             "proposed_repairs": audit.get("proposed_repairs", []),
         }
 
-    proposed = audit.get("proposed_repairs", [])
     if not apply:
         return {
             "schema_version": "v1",
@@ -100,7 +104,20 @@ def repair_missing_ids(personal: bool = False, apply: bool = False) -> dict:
         event_objects.append(event)
 
     tasks_file.write_text("\n".join(lines), encoding="utf-8")
-    events = [append_event(event, path=ledger_path(tasks_file)) for event in event_objects]
+    events = []
+    try:
+        for event in event_objects:
+            events.append(append_event(event, path=ledger_path(tasks_file)))
+    except OSError as exc:
+        _restore_content(tasks_file, content)
+        return {
+            "schema_version": "v1",
+            "command": "identity-repair",
+            "applied": False,
+            "blocked": True,
+            "blocking_invariants": ["ledger-append-failed"],
+            "error": f"Ledger append failed after metadata write; task metadata was restored: {exc}",
+        }
     return {
         "schema_version": "v1",
         "command": "identity-repair",

@@ -103,6 +103,26 @@ def _archive_dropped_task(record, tasks_file: Path, archive_dir: Path | None = N
     archive_file.write_text(existing.rstrip() + "\n\n## Dropped\n" + entry, encoding="utf-8")
 
 
+def _snapshot(path: Path) -> tuple[bool, str]:
+    return (path.exists(), path.read_text(encoding="utf-8") if path.exists() else "")
+
+
+def _restore_snapshots(snapshots: dict[Path, tuple[bool, str]]) -> None:
+    for path, (existed, content) in snapshots.items():
+        if existed:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        elif path.exists():
+            path.unlink()
+
+
+def _daily_log_file() -> Path | None:
+    raw_dir = os.getenv("TASK_TRACKER_DONE_LOG_DIR") or os.getenv("TASK_TRACKER_DAILY_NOTES_DIR")
+    if not raw_dir:
+        return None
+    return Path(raw_dir).expanduser() / f"{datetime.now().strftime('%Y-%m-%d')}.md"
+
+
 def _preflight_ledger(tasks_file: Path) -> dict | None:
     try:
         target = ledger_path(tasks_file)
@@ -155,6 +175,10 @@ def complete_by_id(task_id: str, personal: bool = False, source: str = "user_com
 
     due_value = _extract_due_date(record.raw_line)
     recur_value = _extract_recur_value(record.raw_line) or ""
+    daily_log_file = _daily_log_file()
+    snapshots = {tasks_file: (True, content)}
+    if daily_log_file is not None:
+        snapshots[daily_log_file] = _snapshot(daily_log_file)
 
     logged = log_task_completed(
         title=record.title,
@@ -188,7 +212,7 @@ def complete_by_id(task_id: str, personal: bool = False, source: str = "user_com
     try:
         append_event(event, path=ledger_path(tasks_file))
     except OSError as exc:
-        tasks_file.write_text(content, encoding="utf-8")
+        _restore_snapshots(snapshots)
         return {
             "ok": False,
             "error": {
@@ -223,8 +247,10 @@ def transition_by_id(
         reason=reason or f"move-to-{next_state}",
         metadata={"title": record.title, "line_number": record.line_number, **(metadata or {})},
     )
+    snapshots = {tasks_file: (True, content)}
     if next_state == "delegated":
         delegation_file = delegation.resolve_delegation_file()
+        snapshots[delegation_file] = _snapshot(delegation_file)
         delegation.ensure_file(delegation_file)
         delegation.add_item(
             delegation_file,
@@ -241,11 +267,17 @@ def transition_by_id(
             record.title,
             dept=_sanitize_department((metadata or {}).get("dept") or record.area),
             priority=priority,
+            task_id=task_id,
         )
         if not str(msg).startswith("✅"):
             return {"ok": False, "error": {"code": "backlog-write-failed", "message": msg}}
         tasks_file.write_text(_remove_task_line(tasks_file.read_text(encoding="utf-8"), record.raw_line), encoding="utf-8")
     elif next_state == "deleted":
+        today = datetime.now().date()
+        env_archive_dir = os.getenv("TASK_TRACKER_ARCHIVE_DIR")
+        archive_dir = Path(env_archive_dir).expanduser() if env_archive_dir else tasks_file.parent / "Done Archive"
+        archive_file = archive_dir / f"ARCHIVE-{today.year}-Q{((today.month - 1) // 3) + 1}.md"
+        snapshots[archive_file] = _snapshot(archive_file)
         _archive_dropped_task(record, tasks_file)
         tasks_file.write_text(_remove_task_line(content, record.raw_line), encoding="utf-8")
     elif next_state == "frozen":
@@ -268,7 +300,17 @@ def transition_by_id(
         if replacement != record.raw_line:
             tasks_file.write_text(content.replace(record.raw_line, replacement, 1), encoding="utf-8")
 
-    append_event(event, path=ledger_path(tasks_file))
+    try:
+        append_event(event, path=ledger_path(tasks_file))
+    except OSError as exc:
+        _restore_snapshots(snapshots)
+        return {
+            "ok": False,
+            "error": {
+                "code": "ledger-append-failed",
+                "message": f"Ledger append failed after state write; task state was restored: {exc}",
+            },
+        }
     return {"ok": True, "task_id": task_id, "title": record.title, "event": event}
 
 

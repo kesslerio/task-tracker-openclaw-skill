@@ -87,6 +87,31 @@ def test_identity_repair_blocks_duplicate_titles_without_writes(tmp_path):
     assert not (tmp_path / "events.jsonl").exists()
 
 
+def test_identity_repair_noops_when_ambiguous_titles_have_ids(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    original = """# Work
+
+## 🔴 Q1
+- [ ] **Same title** task_id::tsk_one area:: Delivery
+- [ ] **Same title** task_id::tsk_two area:: Ops
+"""
+    work.write_text(original)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "identity-repair", "--apply"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_env(tmp_path, work),
+    )
+
+    assert proc.returncode == 0
+    payload = json.loads(proc.stdout)
+    assert payload["applied"] is True
+    assert payload["changed"] == 0
+    assert work.read_text() == original
+
+
 def test_identity_repair_aborts_when_ledger_unwritable(tmp_path):
     work = tmp_path / "Work Tasks.md"
     original = """# Work
@@ -111,6 +136,33 @@ def test_identity_repair_aborts_when_ledger_unwritable(tmp_path):
     assert proc.returncode == 2
     payload = json.loads(proc.stdout)
     assert "ledger-unwritable" in payload["blocking_invariants"]
+    assert work.read_text() == original
+
+
+def test_identity_repair_rolls_back_when_ledger_append_fails(tmp_path):
+    if not os.path.exists("/dev/full"):
+        return
+    work = tmp_path / "Work Tasks.md"
+    original = """# Work
+
+## 🔴 Q1
+- [ ] **Ship milestone** area:: Delivery
+"""
+    work.write_text(original)
+    env = _env(tmp_path, work)
+    env["TASK_TRACKER_LEDGER_FILE"] = "/dev/full"
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "identity-repair", "--apply"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 2
+    payload = json.loads(proc.stdout)
+    assert "ledger-append-failed" in payload["blocking_invariants"]
     assert work.read_text() == original
 
 

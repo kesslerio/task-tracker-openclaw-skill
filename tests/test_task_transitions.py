@@ -121,6 +121,34 @@ def test_done_aborts_before_board_write_when_ledger_unwritable(tmp_path):
     assert work.read_text() == original
 
 
+def test_done_restores_board_and_completion_log_when_ledger_append_fails(tmp_path):
+    if not os.path.exists("/dev/full"):
+        return
+    work = tmp_path / "Work Tasks.md"
+    original = """# Work
+
+## 🔴 Q1
+- [ ] **Ship milestone** task_id::tsk_ship area:: Delivery
+"""
+    work.write_text(original)
+    env = _env(tmp_path, work)
+    env["TASK_TRACKER_LEDGER_FILE"] = "/dev/full"
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "done", "tsk_ship"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 2
+    payload = json.loads(proc.stdout)
+    assert payload["error"]["code"] == "ledger-append-failed"
+    assert work.read_text() == original
+    assert not list((tmp_path / "daily").glob("*.md"))
+
+
 def test_done_id_survives_title_edit_and_reorder(tmp_path):
     work = tmp_path / "Work Tasks.md"
     work.write_text("""# Work
@@ -347,6 +375,29 @@ def test_state_transition_aborts_when_ledger_unwritable(tmp_path):
     assert work.read_text() == original
 
 
+def test_state_transition_restores_board_when_ledger_append_fails(tmp_path):
+    if not os.path.exists("/dev/full"):
+        return
+    work = tmp_path / "Work Tasks.md"
+    original = "# Work\n\n## 🔴 Q1\n- [ ] **Pause me** task_id::tsk_pause\n"
+    work.write_text(original)
+    env = _env(tmp_path, work)
+    env["TASK_TRACKER_LEDGER_FILE"] = "/dev/full"
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "state", "pause", "tsk_pause"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 2
+    payload = json.loads(proc.stdout)
+    assert payload["error"]["code"] == "ledger-append-failed"
+    assert work.read_text() == original
+
+
 def test_state_drop_defaults_archive_next_to_tasks_file(tmp_path):
     work = tmp_path / "nested" / "Work Tasks.md"
     work.parent.mkdir()
@@ -393,6 +444,7 @@ def test_state_backlog_preserves_priority_and_sanitizes_department(tmp_path):
     assert "#high" in content
     assert "#CustomerSuccess" in content
     assert "#Customer Success" not in content
+    assert "task_id::tsk_backlog" in content
 
 
 def test_state_backlog_priority_inference_is_deterministic(tmp_path):
