@@ -16,6 +16,24 @@ def _insert_task_id(raw_line: str, task_id: str) -> str:
     return f"{raw_line.rstrip()} task_id::{task_id}"
 
 
+def _preflight_ledger(tasks_file: Path) -> dict | None:
+    try:
+        target = ledger_path(tasks_file)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("a", encoding="utf-8"):
+            pass
+    except OSError as exc:
+        return {
+            "schema_version": "v1",
+            "command": "identity-repair",
+            "applied": False,
+            "blocked": True,
+            "blocking_invariants": ["ledger-unwritable"],
+            "error": f"Ledger is not writable; no task metadata was changed: {exc}",
+        }
+    return None
+
+
 def repair_missing_ids(personal: bool = False, apply: bool = False) -> dict:
     tasks_file, content, records = load_records(personal)
     audit = audit_identity(records)
@@ -51,6 +69,10 @@ def repair_missing_ids(personal: bool = False, apply: bool = False) -> dict:
             "changed": 0,
             "events": [],
         }
+
+    ledger_error = _preflight_ledger(tasks_file)
+    if ledger_error:
+        return ledger_error
 
     lines = content.split("\n")
     event_objects = []

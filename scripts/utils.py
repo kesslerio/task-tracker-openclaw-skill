@@ -375,11 +375,11 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 if sprint_match:
                     sprint = sprint_match.group(2).strip()
 
-                task_id_match = re.search(r'(?<!\w)task_id::\s*([A-Za-z0-9._:-]+)', rest)
+                task_id_match = re.search(r'(?<!\w)task_id::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$)', rest)
                 if task_id_match:
                     task_id = task_id_match.group(1).strip()
 
-                legacy_id_match = re.search(r'(?<!\w)id::\s*([A-Za-z0-9._:-]+)', rest)
+                legacy_id_match = re.search(r'(?<!\w)id::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$)', rest)
                 if legacy_id_match:
                     legacy_id = legacy_id_match.group(1).strip()
             

@@ -87,6 +87,33 @@ def test_identity_repair_blocks_duplicate_titles_without_writes(tmp_path):
     assert not (tmp_path / "events.jsonl").exists()
 
 
+def test_identity_repair_aborts_when_ledger_unwritable(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    original = """# Work
+
+## 🔴 Q1
+- [ ] **Ship milestone** area:: Delivery
+"""
+    work.write_text(original)
+    ledger_dir = tmp_path / "ledger-is-dir"
+    ledger_dir.mkdir()
+    env = _env(tmp_path, work)
+    env["TASK_TRACKER_LEDGER_FILE"] = str(ledger_dir)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "identity-repair", "--apply"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 2
+    payload = json.loads(proc.stdout)
+    assert "ledger-unwritable" in payload["blocking_invariants"]
+    assert work.read_text() == original
+
+
 def test_personal_identity_repair_uses_personal_sidecar_by_default(tmp_path):
     work = tmp_path / "Work Tasks.md"
     personal = tmp_path / "Personal Tasks.md"

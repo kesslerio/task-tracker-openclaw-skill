@@ -103,6 +103,23 @@ def _archive_dropped_task(record, tasks_file: Path, archive_dir: Path | None = N
     archive_file.write_text(existing.rstrip() + "\n\n## Dropped\n" + entry, encoding="utf-8")
 
 
+def _preflight_ledger(tasks_file: Path) -> dict | None:
+    try:
+        target = ledger_path(tasks_file)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("a", encoding="utf-8"):
+            pass
+    except OSError as exc:
+        return {
+            "ok": False,
+            "error": {
+                "code": "ledger-unwritable",
+                "message": f"Ledger is not writable; no task state was changed: {exc}",
+            },
+        }
+    return None
+
+
 def _resolve_by_id(task_id: str, personal: bool = False):
     tasks_file, content, records = load_records(personal)
     matches = [record for record in active_records(records) if record.canonical_id == task_id]
@@ -122,6 +139,9 @@ def complete_by_id(task_id: str, personal: bool = False, source: str = "user_com
     tasks_file, content, record, error = _resolve_by_id(task_id, personal)
     if error:
         return error
+    ledger_error = _preflight_ledger(tasks_file)
+    if ledger_error:
+        return ledger_error
 
     event = new_event(
         "state_transition",
@@ -190,6 +210,9 @@ def transition_by_id(
     tasks_file, content, record, error = _resolve_by_id(task_id, personal)
     if error:
         return error
+    ledger_error = _preflight_ledger(tasks_file)
+    if ledger_error:
+        return ledger_error
 
     event = new_event(
         "state_transition",

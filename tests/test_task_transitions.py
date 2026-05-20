@@ -94,7 +94,7 @@ def test_done_restricts_canonical_resolution_to_active_sections(tmp_path):
     assert "Backlog task" in content
 
 
-def test_done_rolls_back_board_when_ledger_append_fails(tmp_path):
+def test_done_aborts_before_board_write_when_ledger_unwritable(tmp_path):
     work = tmp_path / "Work Tasks.md"
     original = """# Work
 
@@ -117,7 +117,7 @@ def test_done_rolls_back_board_when_ledger_append_fails(tmp_path):
 
     assert proc.returncode == 2
     payload = json.loads(proc.stdout)
-    assert payload["error"]["code"] == "ledger-append-failed"
+    assert payload["error"]["code"] == "ledger-unwritable"
     assert work.read_text() == original
 
 
@@ -322,6 +322,29 @@ def test_state_delegate_backlog_drop_write_destination_records(tmp_path):
     assert "Backlog me" in work.read_text()
     archive_text = "\n".join(path.read_text() for path in (tmp_path / "archive").glob("*.md"))
     assert "Drop me" in archive_text
+
+
+def test_state_transition_aborts_when_ledger_unwritable(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    original = "# Work\n\n## 🔴 Q1\n- [ ] **Pause me** task_id::tsk_pause\n"
+    work.write_text(original)
+    ledger_dir = tmp_path / "ledger-is-dir"
+    ledger_dir.mkdir()
+    env = _env(tmp_path, work)
+    env["TASK_TRACKER_LEDGER_FILE"] = str(ledger_dir)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "state", "pause", "tsk_pause"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 2
+    payload = json.loads(proc.stdout)
+    assert payload["error"]["code"] == "ledger-unwritable"
+    assert work.read_text() == original
 
 
 def test_state_drop_defaults_archive_next_to_tasks_file(tmp_path):
