@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+import uuid
 from difflib import SequenceMatcher
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -157,9 +158,11 @@ def add_task(args):
     priority_pattern = priority_patterns.get(args.priority, r'## 🟡')
     
     # Build task line
+    task_id = f"tsk_{uuid.uuid4().hex[:16]}"
     task_line = f'- [ ] **{args.title}**'
     if args.due:
         task_line += f' 🗓️{args.due}'
+    task_line += f' task_id::{task_id}'
     if args.area:
         task_line += f' area:: {args.area}'
     default_owner = os.getenv('TASK_TRACKER_DEFAULT_OWNER', 'me')
@@ -185,7 +188,7 @@ def add_task(args):
         new_content = content[:insert_pos] + task_line + '\n' + content[insert_pos:]
         tasks_file.write_text(new_content)
         task_type = "Personal" if args.personal else "Work"
-        print(f"✅ Added {task_type} task: {args.title}")
+        print(f"✅ Added {task_type} task: {args.title} ({task_id})")
     else:
         print(f"⚠️ Could not find section matching '{priority_pattern}'. Add manually.")
 

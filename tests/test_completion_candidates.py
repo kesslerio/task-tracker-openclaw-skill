@@ -87,8 +87,8 @@ def test_candidate_confirmation_uses_id_transition(tmp_path):
     events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
     assert [event["event_type"] for event in events] == [
         "completion_candidate",
-        "state_transition",
         "completion_candidate_decision",
+        "state_transition",
     ]
 
 
@@ -164,3 +164,48 @@ def test_candidate_decision_returns_structured_error_when_ledger_append_fails(mo
 
     assert payload["ok"] is False
     assert payload["error"]["code"] == "candidate-decision-ledger-failed"
+
+
+def test_confirmed_candidate_records_decision_before_apply_failure(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text("# Work\n\n## 🔴 Q1\n- [ ] **Other task** task_id::tsk_other\n")
+    env = _env(tmp_path, work)
+
+    add = subprocess.run(
+        [
+            "python3",
+            "scripts/tasks.py",
+            "completion-candidates",
+            "add",
+            "--source-type",
+            "done-topic",
+            "--source-pointer",
+            "telegram:77",
+            "--summary",
+            "Missing task",
+            "--task-id",
+            "tsk_missing",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    key = json.loads(add.stdout)["candidate"]["evidence"]["dedupe_key"]
+
+    decide = subprocess.run(
+        ["python3", "scripts/tasks.py", "completion-candidates", "decide", key, "confirmed"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert decide.returncode == 2
+    payload = json.loads(decide.stdout)
+    assert payload["ok"] is False
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    assert [event["metadata"].get("candidate_status") for event in events if event["event_type"] == "completion_candidate_decision"] == [
+        "confirmed",
+        "apply_failed",
+    ]

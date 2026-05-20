@@ -121,6 +121,23 @@ def test_done_aborts_before_board_write_when_ledger_unwritable(tmp_path):
     assert work.read_text() == original
 
 
+def test_done_reports_missing_tasks_file_as_json(tmp_path):
+    missing = tmp_path / "Missing Tasks.md"
+    env = _env(tmp_path, missing)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "done", "tsk_missing"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 2
+    payload = json.loads(proc.stdout)
+    assert payload["error"]["code"] == "tasks-file-missing"
+
+
 def test_done_restores_board_and_completion_log_when_ledger_append_fails(tmp_path):
     if not os.path.exists("/dev/full"):
         return
@@ -396,6 +413,23 @@ def test_state_transition_aborts_when_ledger_unwritable(tmp_path):
     payload = json.loads(proc.stdout)
     assert payload["error"]["code"] == "ledger-unwritable"
     assert work.read_text() == original
+
+
+def test_state_reports_missing_tasks_file_as_json(tmp_path):
+    missing = tmp_path / "Missing Tasks.md"
+    env = _env(tmp_path, missing)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "state", "pause", "tsk_missing"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 2
+    payload = json.loads(proc.stdout)
+    assert payload["error"]["code"] == "tasks-file-missing"
 
 
 def test_state_transition_restores_board_when_ledger_append_fails(tmp_path):

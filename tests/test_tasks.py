@@ -2,6 +2,9 @@
 
 from pathlib import Path
 from types import SimpleNamespace
+import os
+import re
+import subprocess
 
 import pytest
 
@@ -44,3 +47,24 @@ def test_cmd_delegated_take_back_write_failure_keeps_delegated_item(tmp_path, mo
         tasks.cmd_delegated(SimpleNamespace(del_command='take-back', id=1))
 
     assert 'Check merch delivery' in delegation_file.read_text()
+
+
+def test_add_command_emits_canonical_task_id(tmp_path):
+    tasks_file = tmp_path / "Work Tasks.md"
+    tasks_file.write_text("# Work\n\n## 🟡 Q2\n")
+    env = os.environ.copy()
+    env["TASK_TRACKER_WORK_FILE"] = str(tasks_file)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "add", "New task"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 0
+    content = tasks_file.read_text()
+    match = re.search(r"task_id::(tsk_[a-f0-9]{16})", content)
+    assert match
+    assert match.group(1) in proc.stdout

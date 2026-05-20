@@ -99,24 +99,8 @@ def decide_candidate(
         return {"ok": False, "error": {"code": "candidate-not-found"}}
 
     matched_task_id = task_id or (candidate.get("evidence") or {}).get("matched_task_id")
-    if decision == "confirmed":
-        if not matched_task_id:
-            return {"ok": False, "error": {"code": "candidate-missing-task-id"}}
-        try:
-            event_path.parent.mkdir(parents=True, exist_ok=True)
-            with event_path.open("a", encoding="utf-8"):
-                pass
-        except OSError as exc:
-            return {
-                "ok": False,
-                "error": {
-                    "code": "candidate-decision-ledger-failed",
-                    "message": f"Candidate decision ledger is not writable; task was not changed: {exc}",
-                },
-            }
-        applied = complete_by_id(matched_task_id, personal=personal, source="completion_candidate")
-        if not applied.get("ok"):
-            return applied
+    if decision == "confirmed" and not matched_task_id:
+        return {"ok": False, "error": {"code": "candidate-missing-task-id"}}
     event = new_event(
         "completion_candidate_decision",
         task_id=matched_task_id,
@@ -132,9 +116,25 @@ def decide_candidate(
             "ok": False,
             "error": {
                 "code": "candidate-decision-ledger-failed",
-                "message": f"Candidate decision ledger append failed: {exc}",
+                "message": f"Candidate decision ledger append failed; task was not changed: {exc}",
             },
         }
+    if decision == "confirmed":
+        applied = complete_by_id(matched_task_id, personal=personal, source="completion_candidate")
+        if not applied.get("ok"):
+            failure_event = new_event(
+                "completion_candidate_decision",
+                task_id=matched_task_id,
+                source="candidate_inbox",
+                next_state="candidate",
+                evidence=candidate.get("evidence"),
+                metadata={"candidate_status": "apply_failed", "dedupe_key": dedupe_key_value},
+            )
+            try:
+                append_event(failure_event, path=event_path)
+            except OSError:
+                pass
+            return applied
     return {"ok": True, "decision": decision, "event": event}
 
 

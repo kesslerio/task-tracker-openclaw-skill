@@ -147,7 +147,17 @@ def _preflight_ledger(tasks_file: Path) -> dict | None:
 
 
 def _resolve_by_id(task_id: str, personal: bool = False):
-    tasks_file, content, records = load_records(personal)
+    try:
+        tasks_file, content, records = load_records(personal)
+    except FileNotFoundError as exc:
+        return None, "", None, {
+            "ok": False,
+            "error": {
+                "code": "tasks-file-missing",
+                "message": str(exc),
+                "repair_choices": ["check TASK_TRACKER_WORK_FILE/TASK_TRACKER_PERSONAL_FILE"],
+            },
+        }
     matches = [record for record in active_records(records) if record.canonical_id == task_id]
     if len(matches) != 1:
         return tasks_file, content, None, {
