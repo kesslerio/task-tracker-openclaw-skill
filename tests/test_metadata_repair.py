@@ -85,3 +85,26 @@ def test_identity_repair_blocks_duplicate_titles_without_writes(tmp_path):
     assert "ambiguous-title" in payload["blocking_invariants"]
     assert work.read_text() == original
     assert not (tmp_path / "events.jsonl").exists()
+
+
+def test_personal_identity_repair_uses_personal_sidecar_by_default(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    personal = tmp_path / "Personal Tasks.md"
+    work.write_text("# Work\n\n## 🔴 Q1\n- [ ] **Work task** area:: Ops\n")
+    personal.write_text("# Personal\n\n## 🔴 Q1\n- [ ] **Personal task** area:: Home\n")
+    env = os.environ.copy()
+    env["TASK_TRACKER_WORK_FILE"] = str(work)
+    env["TASK_TRACKER_PERSONAL_FILE"] = str(personal)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "--personal", "identity-repair", "--apply"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 0
+    assert "task_id::" in personal.read_text()
+    assert personal.with_suffix(".md.events.jsonl").exists()
+    assert not work.with_suffix(".md.events.jsonl").exists()

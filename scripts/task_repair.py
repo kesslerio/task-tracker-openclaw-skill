@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 from task_identity import audit_identity, load_records, opaque_task_id
-from task_ledger import append_event, new_event
+from task_ledger import append_event, ledger_path, new_event
 
 
 def _insert_task_id(raw_line: str, task_id: str) -> str:
@@ -75,7 +75,7 @@ def repair_missing_ids(personal: bool = False, apply: bool = False) -> dict:
             reason="add-missing-task-id",
             metadata={"line_number": line_number, "title": repair.get("title")},
         )
-        events.append(append_event(event))
+        events.append(append_event(event, path=ledger_path(tasks_file)))
 
     tasks_file.write_text("\n".join(lines), encoding="utf-8")
     return {

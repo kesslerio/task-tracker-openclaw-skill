@@ -510,7 +510,7 @@ def cmd_identity_repair(args):
 
 def cmd_candidates(args):
     if args.candidate_command == "list":
-        print(json.dumps({"schema_version": "v1", "command": "completion-candidates", "items": list_candidates()}, indent=2, sort_keys=True))
+        print(json.dumps({"schema_version": "v1", "command": "completion-candidates", "items": list_candidates(personal=args.personal)}, indent=2, sort_keys=True))
         return
     if args.candidate_command == "add":
         payload = create_candidate(
@@ -519,11 +519,12 @@ def cmd_candidates(args):
             summary=args.summary,
             matched_task_id=args.task_id,
             confidence=args.confidence,
+            personal=args.personal,
         )
         print(json.dumps(payload, indent=2, sort_keys=True))
         return
     if args.candidate_command == "decide":
-        payload = decide_candidate(args.dedupe_key, args.decision, task_id=args.task_id)
+        payload = decide_candidate(args.dedupe_key, args.decision, task_id=args.task_id, personal=args.personal)
         print(json.dumps(payload, indent=2, sort_keys=True))
         if not payload.get("ok"):
             sys.exit(2)

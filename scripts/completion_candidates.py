@@ -8,8 +8,9 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from task_ledger import append_event, new_event, read_events
+from task_ledger import append_event, ledger_path, new_event, read_events
 from task_transitions import complete_by_id
+from utils import get_tasks_file
 
 
 def dedupe_key(source_type: str, source_pointer: str, summary: str, task_id: str | None = None) -> str:
@@ -25,9 +26,12 @@ def create_candidate(
     matched_task_id: str | None = None,
     confidence: float = 0.0,
     actor: str = "task-tracker",
+    personal: bool = False,
 ) -> dict[str, Any]:
+    tasks_file, _ = get_tasks_file(personal)
+    event_path = ledger_path(tasks_file)
     key = dedupe_key(source_type, source_pointer, summary, matched_task_id)
-    for event in read_events():
+    for event in read_events(event_path):
         evidence = event.get("evidence") or {}
         if evidence.get("dedupe_key") == key and event.get("event_type") == "completion_candidate":
             return {"created": False, "candidate": event}
@@ -52,14 +56,16 @@ def create_candidate(
         evidence=evidence,
         metadata={"candidate_status": "new"},
     )
-    append_event(event)
+    append_event(event, path=event_path)
     return {"created": True, "candidate": event}
 
 
-def list_candidates() -> list[dict[str, Any]]:
+def list_candidates(personal: bool = False) -> list[dict[str, Any]]:
+    tasks_file, _ = get_tasks_file(personal)
+    event_path = ledger_path(tasks_file)
     statuses: dict[str, str] = {}
     candidates: dict[str, dict[str, Any]] = {}
-    for event in read_events():
+    for event in read_events(event_path):
         evidence = event.get("evidence") or {}
         key = evidence.get("dedupe_key")
         if not key:
@@ -76,10 +82,17 @@ def list_candidates() -> list[dict[str, Any]]:
     ]
 
 
-def decide_candidate(dedupe_key_value: str, decision: str, task_id: str | None = None) -> dict[str, Any]:
+def decide_candidate(
+    dedupe_key_value: str,
+    decision: str,
+    task_id: str | None = None,
+    personal: bool = False,
+) -> dict[str, Any]:
+    tasks_file, _ = get_tasks_file(personal)
+    event_path = ledger_path(tasks_file)
     candidates = {
         (event.get("evidence") or {}).get("dedupe_key"): event
-        for event in list_candidates()
+        for event in list_candidates(personal=personal)
     }
     candidate = candidates.get(dedupe_key_value)
     if not candidate:
@@ -89,7 +102,7 @@ def decide_candidate(dedupe_key_value: str, decision: str, task_id: str | None =
     if decision == "confirmed":
         if not matched_task_id:
             return {"ok": False, "error": {"code": "candidate-missing-task-id"}}
-        applied = complete_by_id(matched_task_id, source="completion_candidate")
+        applied = complete_by_id(matched_task_id, personal=personal, source="completion_candidate")
         if not applied.get("ok"):
             return applied
     event = new_event(
@@ -100,7 +113,7 @@ def decide_candidate(dedupe_key_value: str, decision: str, task_id: str | None =
         evidence=candidate.get("evidence"),
         metadata={"candidate_status": decision, "dedupe_key": dedupe_key_value},
     )
-    append_event(event)
+    append_event(event, path=event_path)
     return {"ok": True, "decision": decision, "event": event}
 
 

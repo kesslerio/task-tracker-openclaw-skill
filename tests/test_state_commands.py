@@ -33,7 +33,10 @@ def test_state_pause_and_backlog(tmp_path):
     r = _run(["python3", "scripts/tasks.py", "state", "backlog", "tsk_roadmap"], env)
     assert r.returncode == 0
     content = work.read_text().lower()
-    assert "review roadmap" not in content
+    q2_section = content.split("## 🟡 q2", 1)[1].split("## 🅿️ parking lot", 1)[0]
+    parking_section = content.split("## 🅿️ parking lot", 1)[1]
+    assert "review roadmap" not in q2_section
+    assert "review roadmap" in parking_section
     assert "parking lot" in content
     events = [json.loads(line) for line in Path(env["TASK_TRACKER_LEDGER_FILE"]).read_text().splitlines()]
     assert [event["next_state"] for event in events] == ["active", "backlog"]

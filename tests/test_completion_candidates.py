@@ -86,3 +86,50 @@ def test_candidate_confirmation_uses_id_transition(tmp_path):
         "state_transition",
         "completion_candidate_decision",
     ]
+
+
+def test_personal_candidate_confirmation_uses_personal_board_and_ledger(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    personal = tmp_path / "Personal Tasks.md"
+    work.write_text("# Work\n\n## 🔴 Q1\n- [ ] **Work task** task_id::tsk_same\n")
+    personal.write_text("# Personal\n\n## 🔴 Q1\n- [ ] **Personal task** task_id::tsk_same\n")
+    env = _env(tmp_path, work)
+    env.pop("TASK_TRACKER_LEDGER_FILE")
+    env["TASK_TRACKER_PERSONAL_FILE"] = str(personal)
+
+    add = subprocess.run(
+        [
+            "python3",
+            "scripts/tasks.py",
+            "--personal",
+            "completion-candidates",
+            "add",
+            "--source-type",
+            "done-topic",
+            "--source-pointer",
+            "telegram:99",
+            "--summary",
+            "Personal task",
+            "--task-id",
+            "tsk_same",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    key = json.loads(add.stdout)["candidate"]["evidence"]["dedupe_key"]
+
+    decide = subprocess.run(
+        ["python3", "scripts/tasks.py", "--personal", "completion-candidates", "decide", key, "confirmed"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert decide.returncode == 0
+    assert "Personal task" not in personal.read_text()
+    assert "Work task" in work.read_text()
+    assert personal.with_suffix(".md.events.jsonl").exists()
+    assert not work.with_suffix(".md.events.jsonl").exists()
