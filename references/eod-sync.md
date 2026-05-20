@@ -1,9 +1,9 @@
 # EOD Sync and Weekly Embeds
 
 The legacy EOD workflow can sync completed items from daily notes into Weekly
-TODOs. Task Tracker vNext treats EOD extraction as evidence first: daily-note
-DONE lines, DONEs-topic text, email, calendar, and session evidence should
-create completion candidates before active-board tasks are marked complete.
+TODOs. The canonical identity kernel does not change this workflow yet; future
+completion evidence work should keep EOD extraction evidence-only until a user
+confirms an ID-based completion.
 
 ## Environment
 

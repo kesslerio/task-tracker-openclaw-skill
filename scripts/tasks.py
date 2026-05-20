@@ -26,11 +26,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 from daily_notes import extract_completed_tasks
 from log_done import log_task_completed
 from standup_common import get_calendar_events, flatten_calendar_events
-from completion_candidates import create_candidate, decide_candidate, list_candidates
 import delegation
 from task_identity import audit_payload, print_json as print_identity_json
 from task_repair import repair_missing_ids
-from task_transitions import block_unsafe_query, complete_by_id, print_result, transition_by_id
+from task_transitions import block_unsafe_query, complete_by_id, print_result
 from utils import (
     detect_format,
     get_tasks_file,
@@ -465,41 +464,6 @@ def _find_open_task(personal: bool, query: str) -> tuple[Path, dict | None, str]
     return tasks_file, matches[0], ""
 
 
-def cmd_state(args):
-    """First-class state transitions by canonical ID."""
-    task_id = args.query.strip()
-    if not re.fullmatch(r"[A-Za-z0-9._:-]+", task_id):
-        print_result(block_unsafe_query(args.query))
-        sys.exit(2)
-
-    state_map = {
-        "pause": "active",
-        "delegate": "delegated",
-        "backlog": "backlog",
-        "drop": "deleted",
-    }
-    metadata = {}
-    if args.state_command == "pause":
-        metadata["paused_at"] = datetime.now().date().isoformat()
-        if args.until:
-            metadata["due"] = args.until
-    if args.state_command == "delegate":
-        metadata.update({"assignee": args.to, "followup": args.followup})
-    if args.state_command == "backlog":
-        metadata.update({"dept": args.dept, "priority": args.priority})
-
-    result = transition_by_id(
-        task_id,
-        state_map[args.state_command],
-        personal=args.personal,
-        reason=args.state_command,
-        metadata=metadata,
-    )
-    print_result(result)
-    if not result.get("ok"):
-        sys.exit(2)
-
-
 def cmd_identity_audit(args):
     print_identity_json(audit_payload(personal=args.personal))
 
@@ -509,35 +473,6 @@ def cmd_identity_repair(args):
     print(json.dumps(payload, indent=2, sort_keys=True))
     if payload.get("blocked"):
         sys.exit(2)
-
-
-def cmd_candidates(args):
-    if args.candidate_command == "list":
-        items = list_candidates(personal=args.personal)
-        if isinstance(items, dict) and not items.get("ok", True):
-            payload = {"schema_version": "v1", "command": "completion-candidates", **items}
-            print(json.dumps(payload, indent=2, sort_keys=True))
-            sys.exit(2)
-        print(json.dumps({"schema_version": "v1", "command": "completion-candidates", "items": items}, indent=2, sort_keys=True))
-        return
-    if args.candidate_command == "add":
-        payload = create_candidate(
-            source_type=args.source_type,
-            source_pointer=args.source_pointer,
-            summary=args.summary,
-            matched_task_id=args.task_id,
-            confidence=args.confidence,
-            personal=args.personal,
-        )
-        print(json.dumps(payload, indent=2, sort_keys=True))
-        if payload.get("ok") is False:
-            sys.exit(2)
-        return
-    if args.candidate_command == "decide":
-        payload = decide_candidate(args.dedupe_key, args.decision, task_id=args.task_id, personal=args.personal)
-        print(json.dumps(payload, indent=2, sort_keys=True))
-        if not payload.get("ok"):
-            sys.exit(2)
 
 
 def cmd_promote_from_backlog(args):
@@ -1430,22 +1365,6 @@ def main():
     identity_repair_parser.add_argument('--apply', action='store_true', help='Write safe task_id repairs')
     identity_repair_parser.set_defaults(func=cmd_identity_repair)
 
-    candidate_parser = subparsers.add_parser('completion-candidates', help='Manage completion candidate inbox')
-    candidate_sub = candidate_parser.add_subparsers(dest='candidate_command', required=True)
-    candidate_sub.add_parser('list', help='List active candidates').set_defaults(func=cmd_candidates)
-    candidate_add = candidate_sub.add_parser('add', help='Add an evidence-only completion candidate')
-    candidate_add.add_argument('--source-type', required=True)
-    candidate_add.add_argument('--source-pointer', required=True)
-    candidate_add.add_argument('--summary', required=True)
-    candidate_add.add_argument('--task-id')
-    candidate_add.add_argument('--confidence', type=float, default=0.0)
-    candidate_add.set_defaults(func=cmd_candidates)
-    candidate_decide = candidate_sub.add_parser('decide', help='Decide a completion candidate')
-    candidate_decide.add_argument('dedupe_key')
-    candidate_decide.add_argument('decision', choices=['shown', 'confirmed', 'rejected', 'duplicate', 'snoozed', 'expired'])
-    candidate_decide.add_argument('--task-id')
-    candidate_decide.set_defaults(func=cmd_candidates)
-    
     done_scan_parser = subparsers.add_parser('done-scan', help='Scan completed items from daily notes')
     done_scan_parser.add_argument('--window', choices=['24h', '7d', '30d'], default='24h')
     done_scan_parser.add_argument('--json', action='store_true')
@@ -1576,30 +1495,6 @@ def main():
     del_takeback = del_sub.add_parser('take-back', help='Take back delegated task')
     del_takeback.add_argument('id', type=int, help='Item ID from list')
     del_takeback.set_defaults(func=cmd_delegated)
-
-    state_parser = subparsers.add_parser('state', help='Transition active task state')
-    state_sub = state_parser.add_subparsers(dest='state_command', required=True)
-
-    st_pause = state_sub.add_parser('pause', help='Pause an active task')
-    st_pause.add_argument('query', help='Task title query')
-    st_pause.add_argument('--until', help='Optional resume date YYYY-MM-DD')
-    st_pause.set_defaults(func=cmd_state)
-
-    st_delegate = state_sub.add_parser('delegate', help='Delegate an active task')
-    st_delegate.add_argument('query', help='Task title query')
-    st_delegate.add_argument('--to', required=True, help='Assignee')
-    st_delegate.add_argument('--followup', required=True, help='Follow-up date YYYY-MM-DD')
-    st_delegate.set_defaults(func=cmd_state)
-
-    st_backlog = state_sub.add_parser('backlog', help='Move active task to backlog')
-    st_backlog.add_argument('query', help='Task title query')
-    st_backlog.add_argument('--dept', help='Department tag')
-    st_backlog.add_argument('--priority', choices=['urgent', 'high', 'medium', 'low'])
-    st_backlog.set_defaults(func=cmd_state)
-
-    st_drop = state_sub.add_parser('drop', help='Drop active task and archive as dropped')
-    st_drop.add_argument('query', help='Task title query')
-    st_drop.set_defaults(func=cmd_state)
 
     promote_parser = subparsers.add_parser('promote-from-backlog', help='Promote top backlog item(s)')
     promote_parser.add_argument('--cap', type=int, default=1, help='Max items to promote')

@@ -85,13 +85,9 @@ python3 scripts/tasks.py done "tsk_example"
 python3 scripts/tasks.py --personal done "tsk_personal"
 ```
 
-### State transitions and backlog ops
+### Backlog ops
 
 ```bash
-python3 scripts/tasks.py state pause "tsk_example" --until 2026-03-01
-python3 scripts/tasks.py state delegate "tsk_example" --to Alex --followup 2026-03-01
-python3 scripts/tasks.py state backlog "tsk_example"
-python3 scripts/tasks.py state drop "tsk_example"
 python3 scripts/tasks.py promote-from-backlog --cap 3
 python3 scripts/tasks.py review-backlog --stale-days 45 --json
 ```

@@ -38,18 +38,9 @@ python3 scripts/tasks.py done "tsk_example"
 python3 scripts/tasks.py --personal done "tsk_personal"
 ```
 
-`done` and other active mutations require canonical `task_id::` values. Title
+`done` requires canonical `task_id::` values. Title
 queries are blocked because duplicate titles and board reorder can mutate the
 wrong task.
-
-### State transitions
-
-```bash
-python3 scripts/tasks.py state pause "tsk_example" --until 2026-03-01
-python3 scripts/tasks.py state delegate "tsk_example" --to Alex --followup 2026-03-01
-python3 scripts/tasks.py state backlog "tsk_example"
-python3 scripts/tasks.py state drop "tsk_example"
-```
 
 ### Backlog workflows
 
@@ -80,13 +71,6 @@ python3 scripts/tasks.py weekly-review-summary --start 2026-02-16 --end 2026-02-
 python3 scripts/tasks.py ingest-daily-log --file /tmp/done-log.md
 cat /tmp/done-log.md | python3 scripts/tasks.py ingest-daily-log
 python3 scripts/tasks.py calendar-sync
-python3 scripts/tasks.py completion-candidates list
-python3 scripts/tasks.py completion-candidates add \
-  --source-type daily-note \
-  --source-pointer 2026-05-20.md:12 \
-  --summary "Shipped milestone" \
-  --task-id tsk_example
-python3 scripts/tasks.py completion-candidates decide <dedupe-key> confirmed
 ```
 
 All primitives return JSON with a stable envelope:

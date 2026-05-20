@@ -32,7 +32,6 @@ graph TD
         TL["task_ledger.py"]
         TR["task_repair.py"]
         TT["task_transitions.py"]
-        CC["completion_candidates.py"]
         SC["standup_common.py"]
     end
 
@@ -55,7 +54,6 @@ graph TD
     TASKS --> TL
     TASKS --> TR
     TASKS --> TT
-    TASKS --> CC
     STANDUP --> UTILS
     STANDUP --> DN
     STANDUP --> SC
@@ -76,7 +74,6 @@ graph TD
     TL -->|append| LEDGER
     TR -->|repair IDs| WT
     TT -->|ID mutations| WT
-    CC -->|candidate decisions| TL
     DN -->|read| DAILY
     WEEKLY -->|write| ARCHIVE
 

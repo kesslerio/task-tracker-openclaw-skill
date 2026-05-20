@@ -34,13 +34,12 @@ python3 scripts/weekly_review.py
 
 - Task list/add/done workflows for work and personal boards
 - Canonical task identity audit/repair with inline `task_id::` metadata
-- Append-only JSONL event ledger for repairs, transitions, and candidates
+- Append-only JSONL event ledger for repairs and ID-based completions
 - Daily standup summaries (`standup.py`, `personal_standup.py`)
 - Weekly review + archive workflows (`weekly_review.py`, `archive.py`)
-- State transitions and backlog hygiene (`tasks.py state ...`)
+- Backlog and delegated-task hygiene
 - Action extraction from notes (`extract_tasks.py`)
-- Completion candidate inbox for EOD review
-- End-of-day sync helpers retained while candidate flows replace fuzzy mutation
+- End-of-day sync helpers retained as legacy workflows
 - Weekly transclusion refresh for Obsidian (`update_weekly_embeds.py`)
 
 ## Compatibility
