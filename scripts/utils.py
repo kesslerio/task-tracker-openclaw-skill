@@ -151,7 +151,7 @@ def _extract_tags_from_title(title: str) -> tuple[str, str | None, str | None]:
 def _split_plain_task_body(task_body: str) -> tuple[str, str]:
     """Split plain task body into title and metadata suffix."""
     marker_match = re.search(
-        r'\s+(🗓️\d{4}-\d{2}-\d{2}|📅\d{4}-\d{2}-\d{2}|📅\s+\d{4}-\d{2}-\d{2}|🔺|⏫|🔼|🔽|⏬|(?:area|goal|owner|blocks|type|recur|estimate|depends|sprint)::)',
+        r'\s+(🗓️\s*\d{4}-\d{2}-\d{2}|📅\d{4}-\d{2}-\d{2}|📅\s+\d{4}-\d{2}-\d{2}|🔺|⏫|🔼|🔽|⏬|(?:area|goal|owner|blocks|type|recur|estimate|depends|sprint|task_id|id)::)',
         task_body,
     )
     if marker_match:
@@ -218,7 +218,7 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
     current_objective = None
     today = datetime.now().date()
     
-    for line in content.split('\n'):
+    for line_number, line in enumerate(content.split('\n'), start=1):
         # Detect section headers
         if line.startswith('## '):
             current_task = None
@@ -300,6 +300,8 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
             estimate = None
             depends = None
             sprint = None
+            task_id = None
+            legacy_id = None
 
             department = None
             priority = None
@@ -317,9 +319,9 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 else:
                     current_objective = None
 
-            if parsed_format in ('obsidian', 'objectives'):
+            if parsed_format in ('obsidian', 'objectives', 'legacy'):
                 # Parse emoji date
-                date_match = re.search(r'🗓️(\d{4}-\d{2}-\d{2})', rest)
+                date_match = re.search(r'🗓️\s*(\d{4}-\d{2}-\d{2})', rest)
                 if date_match:
                     due_str = date_match.group(1)
                 
@@ -372,6 +374,14 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 sprint_match = re.search(r'(?<!\w)sprint::\s*(?!(\s|\w+::))([^\n]+?)(?=\s+\w+::|\s*🗓️|$)', rest)
                 if sprint_match:
                     sprint = sprint_match.group(2).strip()
+
+                task_id_match = re.search(r'(?<!\w)task_id::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$|[),.;!?])', rest)
+                if task_id_match:
+                    task_id = task_id_match.group(1).strip()
+
+                legacy_id_match = re.search(r'(?<!\w)id::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$|[),.;!?])', rest)
+                if legacy_id_match:
+                    legacy_id = legacy_id_match.group(1).strip()
             
             current_task = {
                 'title': title,
@@ -391,8 +401,11 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 'estimate': estimate,
                 'depends': depends,
                 'sprint': sprint,
+                'task_id': task_id,
+                'legacy_id': legacy_id,
                 'completed_date': completed_date,
                 'raw_line': line,
+                'line_number': line_number,
             }
             
             result['all'].append(current_task)

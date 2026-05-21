@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import tempfile
 from datetime import date, timedelta
 from pathlib import Path
@@ -110,6 +111,7 @@ def test_add_item(tasks_file):
 
     content = tasks_file.read_text()
     assert '**New backlog task**' in content
+    assert re.search(r'\btask_id::tsk_[a-f0-9]{16}\b', content)
     assert '#Sales' in content
     assert f'created::{date.today().isoformat()}' in content
 
@@ -140,6 +142,7 @@ def test_promote_item(tasks_file):
     # Should appear in objectives section (before parking lot)
     pl_start = content.index('## 🅿️ Parking Lot')
     assert '**Set up webhook integration**' in content[:pl_start]
+    assert re.search(r'\btask_id::tsk_[a-f0-9]{16}\b', content[:pl_start])
     # created:: field should be stripped
     obj_section = content[:pl_start]
     assert 'created::' not in obj_section or 'Set up webhook' not in obj_section.split('created::')[0]

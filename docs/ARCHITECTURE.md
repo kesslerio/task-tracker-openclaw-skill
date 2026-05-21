@@ -1,6 +1,9 @@
 # Task Tracker Architecture
 
-A markdown-based personal task management system with daily standups, weekly reviews, and automated priority escalation. All data lives in plain markdown files — no database, no server.
+A markdown-based personal task management system with daily standups, weekly
+reviews, and automated priority escalation. Active tasks stay editable in plain
+markdown, while durable lifecycle history lives in an append-only JSONL sidecar
+ledger.
 
 ---
 
@@ -25,12 +28,17 @@ graph TD
         UTILS["utils.py"]
         DN["daily_notes.py"]
         LD["log_done.py"]
+        TI["task_identity.py"]
+        TL["task_ledger.py"]
+        TR["task_repair.py"]
+        TT["task_transitions.py"]
         SC["standup_common.py"]
     end
 
     subgraph "Data Files"
         DAILY["Daily Notes<br/>YYYY-MM-DD.md"]
         ARCHIVE["Quarterly Archive<br/>ARCHIVE-YYYY-QN.md"]
+        LEDGER["Task Event Ledger<br/>*.events.jsonl"]
     end
 
     subgraph "Integrations"
@@ -42,6 +50,10 @@ graph TD
     TASKS --> UTILS
     TASKS --> DN
     TASKS --> LD
+    TASKS --> TI
+    TASKS --> TL
+    TASKS --> TR
+    TASKS --> TT
     STANDUP --> UTILS
     STANDUP --> DN
     STANDUP --> SC
@@ -59,6 +71,9 @@ graph TD
     WEEKLY -->|read| WT
 
     LD -->|append| DAILY
+    TL -->|append| LEDGER
+    TR -->|repair IDs| WT
+    TT -->|ID mutations| WT
     DN -->|read| DAILY
     WEEKLY -->|write| ARCHIVE
 

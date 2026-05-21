@@ -16,6 +16,7 @@
 | Field | Required | Description |
 |-------|----------|-------------|
 | title | Yes | Brief, actionable (verb + noun) |
+| task_id | Yes for active mutations | Opaque canonical ID stored inline as `task_id::tsk_example` |
 | description | No | Additional context after `—` |
 | Owner | No | Person responsible (default: configurable via TASK_TRACKER_DEFAULT_OWNER) |
 | Due | No | ASAP, YYYY-MM-DD, or "Before [event]" |
@@ -27,6 +28,9 @@
 
 - `[ ]` — Open task
 - `[x]` — Completed task
+
+Active task mutations use `task_id::` as the durable identity. Legacy `id::`
+values are readable during migration, but new repair output writes `task_id::`.
 
 ## Priority Sections
 

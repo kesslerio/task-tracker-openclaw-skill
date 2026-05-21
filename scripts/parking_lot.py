@@ -14,6 +14,7 @@ import json
 import os
 import re
 import tempfile
+import uuid
 from datetime import datetime, date
 from pathlib import Path
 
@@ -103,6 +104,8 @@ def _parse_items(lines: list[str], start: int, end: int) -> list[dict]:
         # Clean title: strip bold, inline fields, tags
         title = body
         title = re.sub(r'\*\*(.+?)\*\*', r'\1', title)  # strip bold
+        title = re.sub(r'\s*task_id::\s*\S+', '', title)
+        title = re.sub(r'\s*id::\s*\S+', '', title)
         title = re.sub(r'\s*created::\S+', '', title)
         title = re.sub(r'\s*stale::\S+', '', title)
         title = re.sub(r'\s*#\w+', '', title)
@@ -146,6 +149,20 @@ def _is_stale(item: dict) -> bool:
     threshold = _parking_lot_stale_days()
     age = _days_since(item.get('created'))
     return age is not None and age >= threshold
+
+
+def _new_task_id() -> str:
+    return f"tsk_{uuid.uuid4().hex[:16]}"
+
+
+def _has_inline_id(line: str) -> bool:
+    return bool(re.search(r'\b(?:task_id|id)::\s*[A-Za-z0-9._:-]+', line))
+
+
+def _ensure_task_id(line: str, task_id: str | None = None) -> str:
+    if _has_inline_id(line):
+        return line
+    return f"{line.rstrip()} task_id::{task_id or _new_task_id()}"
 
 
 # ── Public API ───────────────────────────────────────────────
@@ -203,7 +220,7 @@ def list_stale(tasks_file: Path) -> str:
 
 
 def add_item(tasks_file: Path, title: str, dept: str | None = None,
-             priority: str = 'low') -> str:
+             priority: str = 'low', task_id: str | None = None) -> str:
     """Add an item to the parking lot. Returns status message."""
     content = tasks_file.read_text()
     lines = content.split('\n')
@@ -220,6 +237,7 @@ def add_item(tasks_file: Path, title: str, dept: str | None = None,
     # Build task line
     today_str = date.today().isoformat()
     task_line = f'- [ ] **{title}**'
+    task_line = _ensure_task_id(task_line, task_id)
     if dept:
         task_line += f' #{dept}'
     if priority and priority != 'low':
@@ -260,7 +278,7 @@ def promote_item(tasks_file: Path, item_id: int) -> str:
     promoted = removed_block[0]
     promoted = re.sub(r'\s*created::\S+', '', promoted)
     promoted = re.sub(r'\s*stale::\S+', '', promoted)
-    promoted = promoted.rstrip()
+    promoted = _ensure_task_id(promoted.rstrip())
     promoted_block = [promoted] + removed_block[1:]
 
     # Find insertion target: Objectives header > 🔴 header > before parking lot

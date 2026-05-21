@@ -1,6 +1,9 @@
 # EOD Sync and Weekly Embeds
 
-The EOD workflow syncs completed items from daily notes into Weekly TODOs.
+The legacy EOD workflow can sync completed items from daily notes into Weekly
+TODOs. The canonical identity kernel does not change this workflow yet; future
+completion evidence work should keep EOD extraction evidence-only until a user
+confirms an ID-based completion.
 
 ## Environment
 
@@ -38,4 +41,5 @@ python3 scripts/update_weekly_embeds.py
 python3 scripts/update_weekly_embeds.py --week 2026-02-17
 ```
 
-This refreshes the `## 📊 Daily Progress` section in Weekly TODOs with Obsidian transclusion links.
+This refreshes the `## 📊 Daily Progress` section in Weekly TODOs with Obsidian
+transclusion links.

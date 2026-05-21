@@ -6,7 +6,7 @@ Usage:
     tasks.py list [--priority high|medium|low] [--status open|done] [--completed-since 24h|7d|30d] [--due today|this-week|overdue|due-or-overdue]
     tasks.py --personal list
     tasks.py add "Task title" [--priority high|medium|low] [--due YYYY-MM-DD]
-    tasks.py done "task query"
+    tasks.py done "task_id"
     tasks.py blockers [--person NAME]
     tasks.py archive
 """
@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+import uuid
 from difflib import SequenceMatcher
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -26,6 +27,9 @@ from daily_notes import extract_completed_tasks
 from log_done import log_task_completed
 from standup_common import get_calendar_events, flatten_calendar_events
 import delegation
+from task_identity import audit_payload, print_json as print_identity_json
+from task_repair import repair_missing_ids
+from task_transitions import block_unsafe_query, complete_by_id, print_result
 from utils import (
     detect_format,
     get_tasks_file,
@@ -153,9 +157,11 @@ def add_task(args):
     priority_pattern = priority_patterns.get(args.priority, r'## 🟡')
     
     # Build task line
+    task_id = f"tsk_{uuid.uuid4().hex[:16]}"
     task_line = f'- [ ] **{args.title}**'
     if args.due:
         task_line += f' 🗓️{args.due}'
+    task_line += f' task_id::{task_id}'
     if args.area:
         task_line += f' area:: {args.area}'
     default_owner = os.getenv('TASK_TRACKER_DEFAULT_OWNER', 'me')
@@ -181,7 +187,7 @@ def add_task(args):
         new_content = content[:insert_pos] + task_line + '\n' + content[insert_pos:]
         tasks_file.write_text(new_content)
         task_type = "Personal" if args.personal else "Work"
-        print(f"✅ Added {task_type} task: {args.title}")
+        print(f"✅ Added {task_type} task: {args.title} ({task_id})")
     else:
         print(f"⚠️ Could not find section matching '{priority_pattern}'. Add manually.")
 
@@ -223,92 +229,16 @@ def _remove_task_line(content: str, raw_line: str) -> str:
 
 
 def done_task(args):
-    """Complete a task: log to daily notes and remove from the board."""
-    tasks_file, format = get_tasks_file(args.personal)
+    """Complete a task by canonical ID only."""
+    query = args.query.strip()
+    if not re.fullmatch(r"[A-Za-z0-9._:-]+", query):
+        print_result(block_unsafe_query(args.query))
+        sys.exit(2)
 
-    if not tasks_file.exists():
-        print(f"❌ Tasks file not found: {tasks_file}")
-        return
-
-    content = tasks_file.read_text()
-    tasks_data = parse_tasks(content, args.personal, format)
-    tasks = tasks_data['all']
-
-    query = args.query.lower()
-    matches = [t for t in tasks if query in t['title'].lower() and not t['done']]
-
-    if not matches:
-        print(f"No matching task found for: {args.query}")
-        return
-
-    if len(matches) > 1:
-        print(f"Multiple matches found:")
-        for i, t in enumerate(matches, 1):
-            print(f"  {i}. {t['title']}")
-        print("\nBe more specific.")
-        return
-
-    task = matches[0]
-
-    old_line = task.get('raw_line', '')
-    if not old_line:
-        print("⚠️ Could not find task line to update.")
-        return
-
-    # Log completion to daily notes — abort board changes if this fails
-    logged = log_task_completed(
-        title=task['title'],
-        section=task.get('section'),
-        area=task.get('area'),
-        due=task.get('due'),
-        recur=task.get('recur'),
-    )
-    if not logged:
-        print(
-            "❌ Could not log completion to daily notes. "
-            "Task was NOT removed from the board to prevent data loss.\n"
-            "Check that TASK_TRACKER_DAILY_NOTES_DIR (or TASK_TRACKER_DONE_LOG_DIR) "
-            "is set and writable.",
-            file=sys.stderr,
-        )
-        return
-
-    completed_today = datetime.now().strftime('%Y-%m-%d')
-    recur_value = (task.get('recur') or '').strip()
-
-    if recur_value:
-        # Recurring: replace with next instance (no completed line on board)
-        from_date = task.get('due') or completed_today
-        try:
-            next_due = next_recurrence_date(recur_value, from_date)
-            next_task_line = old_line
-
-            if re.search(r'🗓️\d{4}-\d{2}-\d{2}', next_task_line):
-                next_task_line = re.sub(
-                    r'🗓️\d{4}-\d{2}-\d{2}',
-                    f'🗓️{next_due}',
-                    next_task_line,
-                    count=1,
-                )
-            else:
-                inline_field_match = re.search(r'\s+\w+::', next_task_line)
-                if inline_field_match:
-                    pos = inline_field_match.start()
-                    next_task_line = f"{next_task_line[:pos]} 🗓️{next_due}{next_task_line[pos:]}"
-                else:
-                    next_task_line = f"{next_task_line.rstrip()} 🗓️{next_due}"
-
-            new_content = content.replace(old_line, next_task_line, 1)
-        except ValueError as e:
-            print(f"⚠️ Could not create recurring task for '{task['title']}': {e}")
-            new_content = _remove_task_line(content, old_line)
-    else:
-        # Non-recurring: remove the task line entirely
-        new_content = _remove_task_line(content, old_line)
-
-    tasks_file.write_text(new_content)
-    task_type = "Personal" if args.personal else "Work"
-    print(f"✅ Completed {task_type} task: {task['title']}")
+    result = complete_by_id(query, personal=args.personal, source="user_command")
+    print_result(result)
+    if not result.get("ok"):
+        sys.exit(2)
 
 
 def show_blockers(args):
@@ -478,7 +408,8 @@ def cmd_delegated(args):
             tasks_file, _ = get_tasks_file(personal=False)
             content = tasks_file.read_text()
             dept_tag = f" #{item.get('department')}" if item.get('department') else ''
-            task_line = f"- [ ] **{item['title']}**{dept_tag}"
+            task_id = f"tsk_{uuid.uuid4().hex[:16]}"
+            task_line = f"- [ ] **{item['title']}** task_id::{task_id}{dept_tag}"
             # Insert at beginning of first section
             lines = content.split('\n')
             insert_at = 0
@@ -534,58 +465,15 @@ def _find_open_task(personal: bool, query: str) -> tuple[Path, dict | None, str]
     return tasks_file, matches[0], ""
 
 
-def cmd_state(args):
-    """First-class state transitions: pause/delegate/backlog/drop."""
-    from parking_lot import add_item
+def cmd_identity_audit(args):
+    print_identity_json(audit_payload(personal=args.personal))
 
-    tasks_file, task, err = _find_open_task(args.personal, args.query)
-    if err:
-        print(err)
-        return
 
-    content = tasks_file.read_text()
-    old_line = task.get('raw_line', '')
-    if not old_line:
-        print("❌ Task has no raw line; cannot transition.")
-        return
-
-    if args.state_command == 'pause':
-        new_line = old_line if 'paused::' in old_line else f"{old_line} paused::{datetime.now().date().isoformat()}"
-        if args.until:
-            if 'pause_until::' in new_line:
-                new_line = re.sub(r'pause_until::\d{4}-\d{2}-\d{2}', f'pause_until::{args.until}', new_line)
-            else:
-                new_line = f"{new_line} pause_until::{args.until}"
-        tasks_file.write_text(content.replace(old_line, new_line, 1))
-        print(f"✅ Paused: {task['title']}")
-        return
-
-    if args.state_command == 'delegate':
-        item = delegation.add_item(delegation.resolve_delegation_file(), task['title'], args.to, args.followup, task.get('department'))
-        tasks_file.write_text(_remove_task_line(content, old_line))
-        print(f"✅ Delegated: {item['title']} → {item['assignee']} [followup::{item['followup']}]")
-        return
-
-    if args.state_command == 'backlog':
-        pri = args.priority or task.get('priority') or 'low'
-        msg = add_item(tasks_file, task['title'], dept=args.dept or task.get('department'), priority=pri)
-        if not msg.startswith('✅'):
-            print(f"❌ Backlog move failed: {msg}", file=sys.stderr)
-            return
-        tasks_file.write_text(_remove_task_line(tasks_file.read_text(), old_line))
-        print(f"✅ Backlog: {task['title']} ({msg})")
-        return
-
-    if args.state_command == 'drop':
-        archive_dir = Path(os.getenv('TASK_TRACKER_ARCHIVE_DIR', str(tasks_file.parent / 'Done Archive')))
-        archive_dir.mkdir(parents=True, exist_ok=True)
-        archive_file = archive_dir / f"ARCHIVE-{get_current_quarter()}.md"
-        entry = f"- [x] ~~{task['title']}~~ (dropped) ✅ {datetime.now().date().isoformat()}\n"
-        with archive_file.open('a', encoding='utf-8') as fh:
-            fh.write(entry)
-        tasks_file.write_text(_remove_task_line(content, old_line))
-        print(f"✅ Dropped: {task['title']}")
-        return
+def cmd_identity_repair(args):
+    payload = repair_missing_ids(personal=args.personal, apply=args.apply)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    if payload.get("blocked"):
+        sys.exit(2)
 
 
 def cmd_promote_from_backlog(args):
@@ -808,7 +696,7 @@ def _extract_inline_identifiers(text: str) -> dict[str, set[str]]:
     if not text:
         return {"exact": exact_identifiers, "fallback": fallback_identifiers}
 
-    for match in re.findall(r"\b(?:id|task_id|task)::([A-Za-z0-9._:-]+)", text, flags=re.IGNORECASE):
+    for match in re.findall(r"\b(?:id|task_id|task)::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$|[),.;!?])", text, flags=re.IGNORECASE):
         exact_identifiers.add(match.casefold())
 
     for url in re.findall(r"https?://[^\s)>\]]+", text):
@@ -833,13 +721,18 @@ def _task_identifier_bundle(task: dict, fallback_id: str) -> dict:
     raw_line = str(task.get("raw_line") or "")
     title = str(task.get("title") or "")
     explicit_id = None
-    explicit_match = re.search(
-        r"\b(?:id|task_id|task)::([A-Za-z0-9._:-]+)",
-        raw_line,
-        flags=re.IGNORECASE,
-    )
-    if explicit_match:
-        explicit_id = explicit_match.group(1)
+    parsed_task_id = str(task.get("task_id") or "").strip()
+    parsed_legacy_id = str(task.get("legacy_id") or "").strip()
+    legacy_id_match = re.search(r"\bid::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$|[),.;!?])", raw_line, flags=re.IGNORECASE)
+    task_alias_match = re.search(r"\btask::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$|[),.;!?])", raw_line, flags=re.IGNORECASE)
+    if parsed_task_id:
+        explicit_id = parsed_task_id
+    elif parsed_legacy_id:
+        explicit_id = parsed_legacy_id
+    elif legacy_id_match:
+        explicit_id = legacy_id_match.group(1)
+    elif task_alias_match:
+        explicit_id = task_alias_match.group(1)
 
     raw_identifiers = _extract_inline_identifiers(raw_line)
     title_identifiers = _extract_inline_identifiers(title)
@@ -1462,10 +1355,17 @@ def main():
     add_parser.set_defaults(func=add_task)
     
     # Done command
-    done_parser = subparsers.add_parser('done', help='Mark task as done')
-    done_parser.add_argument('query', help='Task title (fuzzy match)')
+    done_parser = subparsers.add_parser('done', help='Mark task as done by canonical task_id')
+    done_parser.add_argument('query', help='Canonical task_id')
     done_parser.set_defaults(func=done_task)
-    
+
+    identity_audit_parser = subparsers.add_parser('identity-audit', help='Read-only canonical identity audit')
+    identity_audit_parser.set_defaults(func=cmd_identity_audit)
+
+    identity_repair_parser = subparsers.add_parser('identity-repair', help='Repair missing task_id metadata')
+    identity_repair_parser.add_argument('--apply', action='store_true', help='Write safe task_id repairs')
+    identity_repair_parser.set_defaults(func=cmd_identity_repair)
+
     done_scan_parser = subparsers.add_parser('done-scan', help='Scan completed items from daily notes')
     done_scan_parser.add_argument('--window', choices=['24h', '7d', '30d'], default='24h')
     done_scan_parser.add_argument('--json', action='store_true')
@@ -1596,30 +1496,6 @@ def main():
     del_takeback = del_sub.add_parser('take-back', help='Take back delegated task')
     del_takeback.add_argument('id', type=int, help='Item ID from list')
     del_takeback.set_defaults(func=cmd_delegated)
-
-    state_parser = subparsers.add_parser('state', help='Transition active task state')
-    state_sub = state_parser.add_subparsers(dest='state_command', required=True)
-
-    st_pause = state_sub.add_parser('pause', help='Pause an active task')
-    st_pause.add_argument('query', help='Task title query')
-    st_pause.add_argument('--until', help='Optional resume date YYYY-MM-DD')
-    st_pause.set_defaults(func=cmd_state)
-
-    st_delegate = state_sub.add_parser('delegate', help='Delegate an active task')
-    st_delegate.add_argument('query', help='Task title query')
-    st_delegate.add_argument('--to', required=True, help='Assignee')
-    st_delegate.add_argument('--followup', required=True, help='Follow-up date YYYY-MM-DD')
-    st_delegate.set_defaults(func=cmd_state)
-
-    st_backlog = state_sub.add_parser('backlog', help='Move active task to backlog')
-    st_backlog.add_argument('query', help='Task title query')
-    st_backlog.add_argument('--dept', help='Department tag')
-    st_backlog.add_argument('--priority', choices=['urgent', 'high', 'medium', 'low'])
-    st_backlog.set_defaults(func=cmd_state)
-
-    st_drop = state_sub.add_parser('drop', help='Drop active task and archive as dropped')
-    st_drop.add_argument('query', help='Task title query')
-    st_drop.set_defaults(func=cmd_state)
 
     promote_parser = subparsers.add_parser('promote-from-backlog', help='Promote top backlog item(s)')
     promote_parser.add_argument('--cap', type=int, default=1, help='Max items to promote')

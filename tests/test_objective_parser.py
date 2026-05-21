@@ -132,6 +132,31 @@ def test_plain_and_bold_task_patterns_are_both_parsed():
     assert plain["area"] == "Marketing"
 
 
+def test_plain_task_line_task_id_metadata_is_parsed():
+    content = """## 🔴 Q1: Urgent & Important
+- [ ] Plain task task_id::tsk_plain area:: Ops
+"""
+
+    tasks = parse_tasks(content, format="obsidian")
+    item = tasks["all"][0]
+
+    assert item["title"] == "Plain task"
+    assert item["task_id"] == "tsk_plain"
+    assert item["area"] == "Ops"
+
+
+def test_legacy_task_id_metadata_is_parsed():
+    content = """## 🔴 Q1: Urgent & Important
+- [ ] Legacy task task_id::tsk_legacy
+"""
+
+    tasks = parse_tasks(content, format="legacy")
+    item = tasks["all"][0]
+
+    assert item["title"] == "Legacy task"
+    assert item["task_id"] == "tsk_legacy"
+
+
 def test_remove_task_line_removes_parent_and_subtasks():
     content = """## Objectives
 - [ ] Parent objective

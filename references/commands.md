@@ -31,18 +31,16 @@ python3 scripts/tasks.py blockers --person sarah
 ```bash
 python3 scripts/tasks.py add "Draft project proposal" --priority high --due 2026-01-23
 python3 scripts/tasks.py --personal add "Call mom" --priority high --due 2026-01-22
-python3 scripts/tasks.py done "proposal"
-python3 scripts/tasks.py --personal done "call mom"
+python3 scripts/tasks.py identity-audit
+python3 scripts/tasks.py identity-repair
+python3 scripts/tasks.py identity-repair --apply
+python3 scripts/tasks.py done "tsk_example"
+python3 scripts/tasks.py --personal done "tsk_personal"
 ```
 
-### State transitions
-
-```bash
-python3 scripts/tasks.py state pause "task title" --until 2026-03-01
-python3 scripts/tasks.py state delegate "task title" --to Alex --followup 2026-03-01
-python3 scripts/tasks.py state backlog "task title"
-python3 scripts/tasks.py state drop "task title"
-```
+`done` requires canonical `task_id::` values. Title
+queries are blocked because duplicate titles and board reorder can mutate the
+wrong task.
 
 ### Backlog workflows
 

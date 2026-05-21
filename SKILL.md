@@ -79,17 +79,15 @@ python3 scripts/tasks.py blockers
 ```bash
 python3 scripts/tasks.py add "Draft proposal" --priority high --due 2026-01-23
 python3 scripts/tasks.py --personal add "Call mom" --priority high --due 2026-01-22
-python3 scripts/tasks.py done "proposal"
-python3 scripts/tasks.py --personal done "call mom"
+python3 scripts/tasks.py identity-audit
+python3 scripts/tasks.py identity-repair --apply
+python3 scripts/tasks.py done "tsk_example"
+python3 scripts/tasks.py --personal done "tsk_personal"
 ```
 
-### State transitions and backlog ops
+### Backlog ops
 
 ```bash
-python3 scripts/tasks.py state pause "task title" --until 2026-03-01
-python3 scripts/tasks.py state delegate "task title" --to Alex --followup 2026-03-01
-python3 scripts/tasks.py state backlog "task title"
-python3 scripts/tasks.py state drop "task title"
 python3 scripts/tasks.py promote-from-backlog --cap 3
 python3 scripts/tasks.py review-backlog --stale-days 45 --json
 ```
