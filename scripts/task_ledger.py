@@ -5,12 +5,29 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
+from dataclasses import dataclass
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from utils import get_tasks_file
+
+
+@dataclass(frozen=True)
+class MalformedLedgerLine:
+    path: str
+    line_number: int
+    message: str
+    raw_line: str
+
+
+class MalformedLedgerError(ValueError):
+    def __init__(self, malformed: list[MalformedLedgerLine]):
+        self.malformed = malformed
+        summary = ", ".join(f"{item.path}:{item.line_number}: {item.message}" for item in malformed)
+        super().__init__(f"Malformed ledger JSONL line(s): {summary}")
 
 
 def ledger_path(tasks_file: Path | None = None) -> Path:
@@ -58,16 +75,38 @@ def append_event(event: dict[str, Any], path: Path | None = None) -> dict[str, A
     return event
 
 
-def read_events(path: Path | None = None) -> list[dict[str, Any]]:
+def read_events_report(path: Path | None = None) -> tuple[list[dict[str, Any]], list[MalformedLedgerLine]]:
     target = path or ledger_path()
     if not target.exists():
-        return []
+        return [], []
     events: list[dict[str, Any]] = []
-    for line in target.read_text(encoding="utf-8").splitlines():
+    malformed: list[MalformedLedgerLine] = []
+    for line_number, line in enumerate(target.read_text(encoding="utf-8").splitlines(), start=1):
         if not line.strip():
             continue
         try:
             events.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
+        except json.JSONDecodeError as exc:
+            malformed.append(
+                MalformedLedgerLine(
+                    path=str(target),
+                    line_number=line_number,
+                    message=str(exc),
+                    raw_line=line,
+                )
+            )
+    return events, malformed
+
+
+def read_events(path: Path | None = None, *, strict: bool = False) -> list[dict[str, Any]]:
+    events, malformed = read_events_report(path)
+    if malformed:
+        if strict:
+            raise MalformedLedgerError(malformed)
+        warnings.warn(
+            f"Ignored {len(malformed)} malformed ledger JSONL line(s); "
+            "use read_events_report() or strict=True for details.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return events

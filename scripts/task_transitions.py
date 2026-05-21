@@ -61,6 +61,14 @@ def _restore_snapshots(snapshots: dict[Path, tuple[bool, str]]) -> None:
             path.unlink()
 
 
+def _restore_after_failure(snapshots: dict[Path, tuple[bool, str]]) -> str | None:
+    try:
+        _restore_snapshots(snapshots)
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
 def _daily_log_file() -> Path | None:
     raw_dir = os.getenv("TASK_TRACKER_DONE_LOG_DIR") or os.getenv("TASK_TRACKER_DAILY_NOTES_DIR")
     if not raw_dir:
@@ -174,34 +182,41 @@ def complete_by_id(task_id: str, personal: bool = False, source: str = "user_com
     if ledger_snapshot is not None:
         snapshots[ledger_file] = ledger_snapshot
 
-    logged = log_task_completed(
-        title=record.title,
-        section=record.section,
-        area=record.area,
-        due=due_value,
-        recur=recur_value or None,
-        context={"task_id": task_id, "source": source},
-    )
-    if not logged:
-        return {
-            "ok": False,
-            "error": {
-                "code": "completion-log-failed",
-                "message": "Daily-note completion log failed; active board was not changed.",
-            },
-        }
-
-    tasks_file.write_text(new_content, encoding="utf-8")
+    write_stage = "completion-log"
     try:
+        logged = log_task_completed(
+            title=record.title,
+            section=record.section,
+            area=record.area,
+            due=due_value,
+            recur=recur_value or None,
+            context={"task_id": task_id, "source": source},
+        )
+        if not logged:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "completion-log-failed",
+                    "message": "Daily-note completion log failed; active board was not changed.",
+                },
+            }
+
+        write_stage = "board-write"
+        tasks_file.write_text(new_content, encoding="utf-8")
+        write_stage = "ledger-append"
         append_event(event, path=ledger_path(tasks_file))
     except OSError as exc:
-        _restore_snapshots(snapshots)
+        restore_error = _restore_after_failure(snapshots)
+        code = "ledger-append-failed" if write_stage == "ledger-append" else "task-state-write-failed"
+        error = {
+            "code": code,
+            "message": f"Task completion write failed; snapshots were restored: {exc}",
+        }
+        if restore_error:
+            error["restore_error"] = restore_error
         return {
             "ok": False,
-            "error": {
-                "code": "ledger-append-failed",
-                "message": f"Ledger append failed after board write; board was restored: {exc}",
-            },
+            "error": error,
         }
     return {"ok": True, "task_id": task_id, "title": record.title, "event": event}
 
