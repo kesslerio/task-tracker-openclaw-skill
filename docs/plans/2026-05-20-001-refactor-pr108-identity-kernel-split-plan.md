@@ -455,8 +455,9 @@ For #108A, only the solid arrows are in scope. The dashed evidence path is delib
 
 1. **PR #108A:** Canonical identity kernel. Land U1 through U5.
 2. **PR #108B:** Parser and mutation consolidation. Land U6.
-3. **PR #108C:** Completion evidence inbox. Land U7.
-4. **Later workflow PR:** Update Lobster/Telegram/standup/weekly/EOD workflows to consume canonical IDs and evidence suggestions.
+3. **PR #108B hardening:** Close the post-108B Oracle P1s before evidence inbox: ledger malformed-line reporting, complete-by-ID rollback around daily-log/board/ledger writes, and weekly archive cleanup through the shared line helper. See `docs/plans/2026-05-21-002-hardening-108b-before-evidence-inbox-plan.md`.
+4. **PR #108C:** Completion evidence inbox. Land U7.
+5. **Later workflow PR:** Update Lobster/Telegram/standup/weekly/EOD workflows to consume canonical IDs and evidence suggestions.
 
 ---
 
@@ -472,6 +473,7 @@ For #108A, only the solid arrows are in scope. The dashed evidence path is delib
 
 - #108A is ready when identity, repair, ledger, ID-only done, recurrence, and docs/hygiene tests pass without candidate or broad-state tests.
 - #108B is ready when standup, weekly, EOD, and primitive summaries consume one canonical task record shape and no write path bypasses the kernel.
+- #108B hardening is ready when malformed ledger lines are no longer silent, completion rollback covers daily-log and board write failures, and weekly stale cleanup uses line-number-verified removal.
 - #108C is ready when evidence candidates can be created, deduped, decided, retried, and applied only through ID-only done.
 
 ---

@@ -2,6 +2,13 @@ import json
 import os
 import subprocess
 from datetime import datetime
+from pathlib import Path
+
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
+import task_transitions
+import task_records
 
 
 def _env(tmp_path, work):
@@ -212,6 +219,42 @@ def test_done_restores_board_and_completion_log_when_ledger_append_fails(tmp_pat
     assert payload["error"]["code"] == "ledger-append-failed"
     assert work.read_text() == original
     assert not list((tmp_path / "daily").glob("*.md"))
+
+
+def test_done_restores_completion_log_when_board_write_fails(tmp_path, monkeypatch):
+    work = tmp_path / "Work Tasks.md"
+    original = """# Work
+
+## 🔴 Q1
+- [ ] **Ship milestone** task_id::tsk_ship area:: Delivery
+"""
+    work.write_text(original)
+    env = _env(tmp_path, work)
+    monkeypatch.setenv("TASK_TRACKER_WORK_FILE", env["TASK_TRACKER_WORK_FILE"])
+    monkeypatch.setenv("TASK_TRACKER_DAILY_NOTES_DIR", env["TASK_TRACKER_DAILY_NOTES_DIR"])
+    monkeypatch.setenv("TASK_TRACKER_DONE_LOG_DIR", env["TASK_TRACKER_DONE_LOG_DIR"])
+    monkeypatch.setenv("TASK_TRACKER_LEDGER_FILE", env["TASK_TRACKER_LEDGER_FILE"])
+    monkeypatch.setattr(task_records, "get_tasks_file", lambda personal=False: (work, "obsidian"))
+
+    original_write_text = Path.write_text
+    failed = False
+
+    def fail_first_board_write(path_obj, content, *args, **kwargs):
+        nonlocal failed
+        if path_obj == work and not failed:
+            failed = True
+            raise OSError("simulated board write failure")
+        return original_write_text(path_obj, content, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_first_board_write)
+
+    result = task_transitions.complete_by_id("tsk_ship")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "task-state-write-failed"
+    assert work.read_text() == original
+    assert not list((tmp_path / "daily").glob("*.md"))
+    assert (tmp_path / "events.jsonl").read_text() == ""
 
 
 def test_done_handles_date_named_daily_log_directory(tmp_path):

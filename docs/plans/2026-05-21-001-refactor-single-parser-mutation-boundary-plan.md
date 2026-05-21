@@ -424,6 +424,7 @@ The important boundary is that read surfaces may consume fallback diagnostics, b
 | Output schema changes break Lobster consumers | Preserve existing fields where possible and add identity diagnostics rather than renaming stable fields casually. |
 | Shared helper placement creates circular imports | Keep pure read helpers in `scripts/task_records.py` and pure line-edit helpers in `scripts/task_lines.py`, with workflow modules depending downward. |
 | Fallback IDs leak back into mutation commands | Test `done <fallback-id>` and duplicate-title cases explicitly. |
+| Evidence inbox builds on remaining P1 foundation gaps | Close `docs/plans/2026-05-21-002-hardening-108b-before-evidence-inbox-plan.md` before starting 108C. |
 
 ---
 
@@ -436,6 +437,7 @@ The important boundary is that read surfaces may consume fallback diagnostics, b
 5. Centralize active-board line mutation helpers.
 6. Make EOD/daily-log fuzzy matching report-only by default.
 7. Update docs/help and run the full local verification suite.
+8. Follow up with 108B hardening before 108C: malformed ledger reporting, completion rollback hardening, and weekly archive cleanup through shared line helpers.
 
 ---
 

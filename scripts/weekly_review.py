@@ -12,6 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from daily_notes import extract_completed_actions, extract_completed_tasks
+from task_lines import remove_task_line
 from utils import (
     get_tasks_file,
     ARCHIVE_DIR,
@@ -235,10 +236,12 @@ def _clean_stale_done_lines(tasks_file: Path, done_tasks: list[dict]) -> int:
 
     content = tasks_file.read_text()
     removed = 0
-    for task in done_tasks:
+    for task in sorted(done_tasks, key=lambda item: item.get('line_number') or 0, reverse=True):
         raw_line = task.get('raw_line', '')
-        if raw_line and raw_line in content:
-            content = content.replace(raw_line + '\n', '', 1)
+        line_number = task.get('line_number')
+        updated = remove_task_line(content, raw_line, line_number)
+        if updated is not None:
+            content = updated
             removed += 1
 
     if removed:
