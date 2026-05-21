@@ -7,7 +7,8 @@ metadata: {"openclaw":{"emoji":"📋","requires":{"env":["TASK_TRACKER_WORK_FILE
 
 # Task Tracker
 
-Personal task management for work + personal workflows, with daily standups and weekly reviews.
+Personal task management for work + personal workflows, with daily standups and
+weekly reviews.
 
 ## When to Use
 
@@ -18,7 +19,9 @@ Use this skill when the user asks to:
 - Add, list, update, or complete tasks
 - Check blockers or due dates
 - Extract actions from meeting notes
-- Report completed daily items against weekly todos without changing canonical task state
+- Report completed daily items against weekly todos without changing canonical
+  task state
+- Review completion evidence candidates before confirming task completion
 
 ## Quick Start
 
@@ -83,7 +86,13 @@ python3 scripts/tasks.py identity-audit
 python3 scripts/tasks.py identity-repair --apply
 python3 scripts/tasks.py done "tsk_example"
 python3 scripts/tasks.py --personal done "tsk_personal"
+python3 scripts/tasks.py completion-candidates scan --file /tmp/done-log.md
+python3 scripts/tasks.py completion-candidates list
+python3 scripts/tasks.py completion-candidates confirm cand_example --task-id tsk_example
 ```
+
+Completion candidates are evidence suggestions. Scanning does not mutate active
+tasks; confirmation must resolve to a canonical `task_id::`.
 
 ### Backlog ops
 
@@ -145,7 +154,9 @@ Detailed docs moved to `references/`:
 
 ## Compatibility Notes
 
-- Active task mutations require canonical `task_id::` values; fallback IDs are diagnostics only.
-- `scripts/eod_sync.py` is report-only by default. `--apply` is a legacy Weekly TODO checkbox helper and does not complete canonical tasks.
+- Active task mutations require canonical `task_id::` values; fallback IDs are
+  diagnostics only.
+- `scripts/eod_sync.py` is report-only by default. `--apply` is a legacy Weekly
+  TODO checkbox helper and does not complete canonical tasks.
 - Legacy file fallback (`TASK_TRACKER_LEGACY_FILE`) is still supported.
 - Migration guidance remains available in `references/migration.md`.

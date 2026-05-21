@@ -8,6 +8,7 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 from log_done import log_task_completed
 from task_lines import remove_task_line, replace_task_line
@@ -118,7 +119,12 @@ def _resolve_by_id(task_id: str, personal: bool = False):
     return tasks_file, content, matches[0], None
 
 
-def complete_by_id(task_id: str, personal: bool = False, source: str = "user_command") -> dict:
+def complete_by_id(
+    task_id: str,
+    personal: bool = False,
+    source: str = "user_command",
+    extra_events_factory: Callable[[dict], list[dict]] | None = None,
+) -> dict:
     tasks_file, content, record, error = _resolve_by_id(task_id, personal)
     if error:
         return error
@@ -135,6 +141,7 @@ def complete_by_id(task_id: str, personal: bool = False, source: str = "user_com
         reason="explicit-done-by-canonical-id",
         metadata={"title": record.title, "line_number": record.line_number},
     )
+    extra_events = extra_events_factory(event) if extra_events_factory else []
 
     due_value = _extract_due_date(record.raw_line)
     recur_value = _extract_recur_value(record.raw_line) or ""
@@ -205,6 +212,8 @@ def complete_by_id(task_id: str, personal: bool = False, source: str = "user_com
         tasks_file.write_text(new_content, encoding="utf-8")
         write_stage = "ledger-append"
         append_event(event, path=ledger_path(tasks_file))
+        for extra_event in extra_events:
+            append_event(extra_event, path=ledger_path(tasks_file))
     except OSError as exc:
         restore_error = _restore_after_failure(snapshots)
         code = "ledger-append-failed" if write_stage == "ledger-append" else "task-state-write-failed"
@@ -218,7 +227,13 @@ def complete_by_id(task_id: str, personal: bool = False, source: str = "user_com
             "ok": False,
             "error": error,
         }
-    return {"ok": True, "task_id": task_id, "title": record.title, "event": event}
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "title": record.title,
+        "event": event,
+        "extra_events": extra_events,
+    }
 
 
 def block_unsafe_query(query: str) -> dict:

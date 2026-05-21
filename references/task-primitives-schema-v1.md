@@ -62,11 +62,13 @@ canonical IDs from `task_id::` or migrated legacy `id::` metadata.
 ## `ingest-daily-log`
 
 Pipeline order is deterministic:
+
 1. exact id/link match
 2. normalized title exact match
 3. fuzzy match with threshold bands
 
 Threshold decision bands:
+
 - `score >= evidence_link threshold` -> `evidence-link`
 - `review_threshold <= score < evidence_link threshold` -> `needs-review`
 - `score < review_threshold` -> `no-match`
@@ -141,3 +143,70 @@ Optional helper command. It must not hard-fail if calendar/task sources are unav
   }
 }
 ```
+
+## `completion-candidates`
+
+The completion evidence inbox stores candidate lifecycle events in the JSONL
+ledger. Candidate projection uses strict ledger reads; malformed JSONL returns a
+structured `malformed-ledger` error instead of producing a partial inbox.
+
+Scanning commands accept stdin, `--file PATH`, or `--date YYYY-MM-DD` with
+`TASK_TRACKER_DAILY_NOTES_DIR` / `--notes-dir`. Scan only appends
+`candidate_seen` events for new evidence. It does not write the board, daily
+completion log, or task state. `no-match` lines remain report-only and are not
+persisted as candidates.
+
+```json
+{
+  "schema_version": "v1",
+  "command": "completion-candidates scan",
+  "created": [
+    {
+      "candidate_id": "cand_abc123",
+      "status": "new",
+      "source": {
+        "type": "file|stdin|daily_note",
+        "path": "/tmp/done-log.md",
+        "date": "2026-05-21",
+        "line_number": 4
+      },
+      "raw_summary": "- [x] Ship alpha milestone task_id::tsk_ship",
+      "summary": "Ship alpha milestone task_id::tsk_ship",
+      "normalized_summary": "ship alpha milestone task id tsk_ship",
+      "matched_task_id": "tsk_ship",
+      "suggested_match": {
+        "task_id": "tsk_ship",
+        "title": "Ship alpha milestone",
+        "fallback_only": false
+      },
+      "match_metadata": {
+        "matched_task_id": "tsk_ship",
+        "score": 1.0,
+        "decision": "evidence-link",
+        "match_type": "exact-id-or-link"
+      }
+    }
+  ],
+  "existing": [],
+  "totals": {
+    "parsed_evidence": 1,
+    "created": 1,
+    "existing": 0
+  }
+}
+```
+
+Decision commands use the same envelope with command names such as
+`completion-candidates confirm`, `completion-candidates reject`, and
+`completion-candidates duplicate`. Candidate statuses are `new`, `shown`,
+`confirmed`, `rejected`, `duplicate`, `snoozed`, `expired`, and `apply_failed`.
+
+Confirmation rules:
+
+- exact `task_id::` or exact link evidence may confirm without `--task-id`
+- title, fuzzy, issue-number fallback, and fallback-only matches require
+  explicit `--task-id`
+- confirmation calls the canonical ID-only completion path and writes a
+  `candidate_confirmed` event only after task completion succeeds
+- failed application writes `candidate_apply_failed` and leaves the candidate
+  retryable
