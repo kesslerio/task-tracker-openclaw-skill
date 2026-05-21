@@ -11,6 +11,7 @@ from typing import Any
 
 from task_ledger import append_event, ledger_path, new_event, read_events
 from task_transitions import complete_by_id
+from utils import get_tasks_file
 
 ACTIVE_STATUSES = {"new", "shown", "snoozed", "apply_failed"}
 TERMINAL_STATUSES = {"confirmed", "rejected", "duplicate", "expired"}
@@ -24,6 +25,11 @@ DECISION_EVENTS = {
     "candidate_expired",
     "candidate_apply_failed",
 }
+
+
+def _candidate_ledger_path(personal: bool = False) -> Path:
+    tasks_file, _ = get_tasks_file(personal)
+    return ledger_path(tasks_file)
 
 
 def _normalize_summary(value: str) -> str:
@@ -53,8 +59,13 @@ def _candidate_from_seen(event: dict[str, Any]) -> dict[str, Any]:
     return candidate
 
 
-def project_candidates(path: Path | None = None, *, include_terminal: bool = False) -> list[dict[str, Any]]:
-    events = read_events(path or ledger_path(), strict=True)
+def project_candidates(
+    path: Path | None = None,
+    *,
+    include_terminal: bool = False,
+    personal: bool = False,
+) -> list[dict[str, Any]]:
+    events = read_events(path or _candidate_ledger_path(personal), strict=True)
     candidates: dict[str, dict[str, Any]] = {}
 
     for event in events:
@@ -116,8 +127,13 @@ def project_candidates(path: Path | None = None, *, include_terminal: bool = Fal
     return sorted(projected, key=lambda item: item.get("candidate_id", ""))
 
 
-def get_candidate(candidate_id: str, *, include_terminal: bool = True) -> dict[str, Any] | None:
-    for candidate in project_candidates(include_terminal=include_terminal):
+def get_candidate(
+    candidate_id: str,
+    *,
+    include_terminal: bool = True,
+    personal: bool = False,
+) -> dict[str, Any] | None:
+    for candidate in project_candidates(include_terminal=include_terminal, personal=personal):
         if candidate.get("candidate_id") == candidate_id:
             return candidate
     return None
@@ -190,7 +206,10 @@ def _match_evidence_lines(content: str, source: dict[str, Any], *, personal: boo
 
 def scan_content(content: str, source: dict[str, Any], *, personal: bool = False) -> dict[str, Any]:
     candidates = _match_evidence_lines(content, source, personal=personal)
-    existing = {candidate["candidate_id"]: candidate for candidate in project_candidates(include_terminal=True)}
+    existing = {
+        candidate["candidate_id"]: candidate
+        for candidate in project_candidates(include_terminal=True, personal=personal)
+    }
     created: list[dict[str, Any]] = []
     already_seen: list[dict[str, Any]] = []
 
@@ -204,7 +223,7 @@ def scan_content(content: str, source: dict[str, Any], *, personal: bool = False
             source="completion_candidate_scan",
             metadata={"candidate": candidate},
         )
-        append_event(event)
+        append_event(event, path=_candidate_ledger_path(personal))
         created.append(candidate)
 
     return {
@@ -228,18 +247,21 @@ def scan_daily_note(notes_dir: Path, day: date, *, personal: bool = False) -> di
     return scan_content(content, source, personal=personal)
 
 
-def mark_shown(candidate_id: str) -> dict[str, Any]:
-    candidate = get_candidate(candidate_id)
+def mark_shown(candidate_id: str, *, personal: bool = False) -> dict[str, Any]:
+    candidate = get_candidate(candidate_id, personal=personal)
     if candidate is None:
         return {"ok": False, "error": {"code": "candidate-not-found"}}
     if candidate.get("status") in TERMINAL_STATUSES:
         return {"ok": False, "error": {"code": "candidate-terminal", "status": candidate.get("status")}}
-    append_event(new_event("candidate_shown", task_id=candidate_id, source="completion_candidate_cli"))
-    return {"ok": True, "candidate": get_candidate(candidate_id)}
+    append_event(
+        new_event("candidate_shown", task_id=candidate_id, source="completion_candidate_cli"),
+        path=_candidate_ledger_path(personal),
+    )
+    return {"ok": True, "candidate": get_candidate(candidate_id, personal=personal)}
 
 
-def reject_candidate(candidate_id: str, *, reason: str | None = None) -> dict[str, Any]:
-    candidate = get_candidate(candidate_id)
+def reject_candidate(candidate_id: str, *, reason: str | None = None, personal: bool = False) -> dict[str, Any]:
+    candidate = get_candidate(candidate_id, personal=personal)
     if candidate is None:
         return {"ok": False, "error": {"code": "candidate-not-found"}}
     if candidate.get("status") in TERMINAL_STATUSES:
@@ -250,18 +272,21 @@ def reject_candidate(candidate_id: str, *, reason: str | None = None) -> dict[st
             task_id=candidate_id,
             source="completion_candidate_cli",
             metadata={"reason": reason},
-        )
+        ),
+        path=_candidate_ledger_path(personal),
     )
-    return {"ok": True, "candidate": get_candidate(candidate_id, include_terminal=True)}
+    return {"ok": True, "candidate": get_candidate(candidate_id, include_terminal=True, personal=personal)}
 
 
-def duplicate_candidate(candidate_id: str, *, duplicate_of: str) -> dict[str, Any]:
-    candidate = get_candidate(candidate_id)
+def duplicate_candidate(candidate_id: str, *, duplicate_of: str, personal: bool = False) -> dict[str, Any]:
+    candidate = get_candidate(candidate_id, personal=personal)
     if candidate is None:
         return {"ok": False, "error": {"code": "candidate-not-found"}}
     if candidate.get("status") in TERMINAL_STATUSES:
         return {"ok": False, "error": {"code": "candidate-terminal", "status": candidate.get("status")}}
-    if not get_candidate(duplicate_of, include_terminal=True):
+    if candidate_id == duplicate_of:
+        return {"ok": False, "error": {"code": "self-duplicate-blocked"}}
+    if not get_candidate(duplicate_of, include_terminal=True, personal=personal):
         return {"ok": False, "error": {"code": "duplicate-target-not-found"}}
     append_event(
         new_event(
@@ -269,17 +294,18 @@ def duplicate_candidate(candidate_id: str, *, duplicate_of: str) -> dict[str, An
             task_id=candidate_id,
             source="completion_candidate_cli",
             metadata={"duplicate_of": duplicate_of},
-        )
+        ),
+        path=_candidate_ledger_path(personal),
     )
-    return {"ok": True, "candidate": get_candidate(candidate_id, include_terminal=True)}
+    return {"ok": True, "candidate": get_candidate(candidate_id, include_terminal=True, personal=personal)}
 
 
-def snooze_candidate(candidate_id: str, *, until: str) -> dict[str, Any]:
+def snooze_candidate(candidate_id: str, *, until: str, personal: bool = False) -> dict[str, Any]:
     try:
         datetime.strptime(until, "%Y-%m-%d")
     except ValueError:
         return {"ok": False, "error": {"code": "invalid-snooze-date"}}
-    candidate = get_candidate(candidate_id)
+    candidate = get_candidate(candidate_id, personal=personal)
     if candidate is None:
         return {"ok": False, "error": {"code": "candidate-not-found"}}
     if candidate.get("status") in TERMINAL_STATUSES:
@@ -290,9 +316,10 @@ def snooze_candidate(candidate_id: str, *, until: str) -> dict[str, Any]:
             task_id=candidate_id,
             source="completion_candidate_cli",
             metadata={"until": until},
-        )
+        ),
+        path=_candidate_ledger_path(personal),
     )
-    return {"ok": True, "candidate": get_candidate(candidate_id)}
+    return {"ok": True, "candidate": get_candidate(candidate_id, personal=personal)}
 
 
 def _candidate_task_id(candidate: dict[str, Any], explicit_task_id: str | None) -> tuple[str | None, dict[str, Any] | None]:
@@ -312,7 +339,7 @@ def _candidate_task_id(candidate: dict[str, Any], explicit_task_id: str | None) 
 
 
 def confirm_candidate(candidate_id: str, *, task_id: str | None = None, personal: bool = False) -> dict[str, Any]:
-    candidate = get_candidate(candidate_id)
+    candidate = get_candidate(candidate_id, personal=personal)
     if candidate is None:
         return {"ok": False, "error": {"code": "candidate-not-found"}}
     if candidate.get("status") in TERMINAL_STATUSES:
@@ -348,8 +375,17 @@ def confirm_candidate(candidate_id: str, *, task_id: str | None = None, personal
                 task_id=candidate_id,
                 source="completion_candidate_cli",
                 metadata={"task_id": resolved_task_id, "error": result.get("error")},
-            )
+            ),
+            path=_candidate_ledger_path(personal),
         )
-        return {"ok": False, "candidate": get_candidate(candidate_id), "error": result.get("error")}
+        return {
+            "ok": False,
+            "candidate": get_candidate(candidate_id, personal=personal),
+            "error": result.get("error"),
+        }
 
-    return {"ok": True, "candidate": get_candidate(candidate_id, include_terminal=True), "completion": result}
+    return {
+        "ok": True,
+        "candidate": get_candidate(candidate_id, include_terminal=True, personal=personal),
+        "completion": result,
+    }

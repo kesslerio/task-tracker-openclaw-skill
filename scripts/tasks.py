@@ -1243,6 +1243,17 @@ def _print_candidate_result(result: dict, *, command: str, exit_on_error: bool =
         sys.exit(2)
 
 
+def _visible_completion_candidates(candidates: list[dict], *, include_all: bool = False) -> list[dict]:
+    if include_all:
+        return candidates
+    today = date.today().isoformat()
+    return [
+        candidate for candidate in candidates
+        if candidate.get("status") != "snoozed"
+        or (candidate.get("snoozed_until") or "") <= today
+    ]
+
+
 def cmd_completion_candidates(args):
     from completion_candidates import (
         confirm_candidate,
@@ -1260,6 +1271,18 @@ def cmd_completion_candidates(args):
 
     try:
         if args.candidate_command == "scan":
+            if args.file and args.date:
+                _print_candidate_result(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "conflicting-scan-sources",
+                            "message": "Use either --file or --date, not both.",
+                        },
+                    },
+                    command="completion-candidates scan",
+                )
+                return
             if args.file:
                 result = scan_file(Path(args.file), personal=args.personal)
                 _print_candidate_result(result, command="completion-candidates scan", exit_on_error=False)
@@ -1291,19 +1314,18 @@ def cmd_completion_candidates(args):
             return
 
         if args.candidate_command == "list":
-            candidates = project_candidates(include_terminal=args.all)
-            if not args.all:
-                today = date.today().isoformat()
-                candidates = [
-                    candidate for candidate in candidates
-                    if candidate.get("status") != "snoozed"
-                    or (candidate.get("snoozed_until") or "") <= today
-                ]
+            candidates = _visible_completion_candidates(
+                project_candidates(include_terminal=args.all, personal=args.personal),
+                include_all=args.all,
+            )
             if args.mark_shown:
                 for candidate in candidates:
                     if candidate.get("status") == "new":
-                        mark_shown(candidate["candidate_id"])
-                candidates = project_candidates(include_terminal=args.all)
+                        mark_shown(candidate["candidate_id"], personal=args.personal)
+                candidates = _visible_completion_candidates(
+                    project_candidates(include_terminal=args.all, personal=args.personal),
+                    include_all=args.all,
+                )
             _print_candidate_result(
                 {"candidates": candidates, "total": len(candidates)},
                 command="completion-candidates list",
@@ -1312,7 +1334,7 @@ def cmd_completion_candidates(args):
             return
 
         if args.candidate_command == "show":
-            candidate = get_candidate(args.candidate_id, include_terminal=True)
+            candidate = get_candidate(args.candidate_id, include_terminal=True, personal=args.personal)
             if candidate is None:
                 _print_candidate_result(
                     {"ok": False, "error": {"code": "candidate-not-found"}},
@@ -1320,7 +1342,7 @@ def cmd_completion_candidates(args):
                 )
                 return
             if args.mark_shown and candidate.get("status") == "new":
-                result = mark_shown(args.candidate_id)
+                result = mark_shown(args.candidate_id, personal=args.personal)
                 candidate = result.get("candidate")
             _print_candidate_result(
                 {"candidate": candidate},
@@ -1330,17 +1352,25 @@ def cmd_completion_candidates(args):
             return
 
         if args.candidate_command == "reject":
-            result = reject_candidate(args.candidate_id, reason=args.reason)
+            result = reject_candidate(
+                args.candidate_id,
+                reason=args.reason,
+                personal=args.personal,
+            )
             _print_candidate_result(result, command="completion-candidates reject")
             return
 
         if args.candidate_command == "snooze":
-            result = snooze_candidate(args.candidate_id, until=args.until)
+            result = snooze_candidate(args.candidate_id, until=args.until, personal=args.personal)
             _print_candidate_result(result, command="completion-candidates snooze")
             return
 
         if args.candidate_command == "duplicate":
-            result = duplicate_candidate(args.candidate_id, duplicate_of=args.duplicate_of)
+            result = duplicate_candidate(
+                args.candidate_id,
+                duplicate_of=args.duplicate_of,
+                personal=args.personal,
+            )
             _print_candidate_result(result, command="completion-candidates duplicate")
             return
 

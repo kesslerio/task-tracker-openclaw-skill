@@ -27,6 +27,18 @@ def _write_work_file(tmp_path, content=None):
     return work
 
 
+def _write_personal_file(tmp_path):
+    personal = tmp_path / "Personal Tasks.md"
+    personal.write_text(
+        """# Personal
+
+## 🔴 Q1
+- [ ] **Buy replacement filter** task_id::tsk_filter area:: Home
+"""
+    )
+    return personal
+
+
 def _env(tmp_path, work):
     env = os.environ.copy()
     env["TASK_TRACKER_WORK_FILE"] = str(work)
@@ -189,6 +201,24 @@ def test_reject_and_snooze_remove_candidates_from_default_list(tmp_path):
     assert statuses[snoozed_id] == "snoozed"
 
 
+def test_list_mark_shown_preserves_default_snooze_filter(tmp_path):
+    work = _write_work_file(tmp_path)
+    env = _env(tmp_path, work)
+    scan = _scan_file(tmp_path, env, "- Ship alpha milestone task_id::tsk_ship\n")
+    candidate_id = _candidate_id(scan)
+    snooze_until = (date.today() + timedelta(days=7)).isoformat()
+
+    snooze = _run(["completion-candidates", "snooze", candidate_id, "--until", snooze_until], env)
+    listed = _run(["completion-candidates", "list", "--mark-shown"], env)
+    listed_all = _run(["completion-candidates", "list", "--all"], env)
+
+    assert snooze.returncode == 0
+    assert _payload(listed)["total"] == 0
+    all_candidates = _payload(listed_all)["candidates"]
+    assert all_candidates[0]["candidate_id"] == candidate_id
+    assert all_candidates[0]["status"] == "snoozed"
+
+
 def test_duplicate_candidate_is_terminal_and_links_target(tmp_path):
     work = _write_work_file(tmp_path)
     env = _env(tmp_path, work)
@@ -212,6 +242,20 @@ def test_duplicate_candidate_is_terminal_and_links_target(tmp_path):
     assert duplicate_id in {item["candidate_id"] for item in _payload(listed_all)["candidates"]}
 
 
+def test_duplicate_candidate_rejects_self_reference(tmp_path):
+    work = _write_work_file(tmp_path)
+    env = _env(tmp_path, work)
+    scan = _scan_file(tmp_path, env, "- Ship alpha milestone task_id::tsk_ship\n")
+    candidate_id = _candidate_id(scan)
+
+    proc = _run(["completion-candidates", "duplicate", candidate_id, "--of", candidate_id], env)
+    payload = _payload(proc)
+
+    assert proc.returncode == 2
+    assert payload["error"]["code"] == "self-duplicate-blocked"
+    assert _payload(_run(["completion-candidates", "list"], env))["total"] == 1
+
+
 def test_apply_failed_keeps_candidate_retryable_and_board_unchanged(tmp_path):
     work = _write_work_file(tmp_path)
     env = _env(tmp_path, work)
@@ -227,6 +271,69 @@ def test_apply_failed_keeps_candidate_retryable_and_board_unchanged(tmp_path):
     assert payload["error"]["code"] == "canonical-id-resolution-failed"
     assert payload["candidate"]["status"] == "apply_failed"
     assert any(event["event_type"] == "candidate_apply_failed" for event in _ledger_events(tmp_path))
+
+
+def test_scan_rejects_conflicting_file_and_date_sources(tmp_path):
+    work = _write_work_file(tmp_path)
+    env = _env(tmp_path, work)
+    source = tmp_path / "done.md"
+    source.write_text("- Ship alpha milestone task_id::tsk_ship\n")
+
+    proc = _run(
+        [
+            "completion-candidates",
+            "scan",
+            "--file",
+            str(source),
+            "--date",
+            date.today().isoformat(),
+        ],
+        env,
+    )
+    payload = _payload(proc)
+
+    assert proc.returncode == 2
+    assert payload["error"]["code"] == "conflicting-scan-sources"
+    assert not (tmp_path / "events.jsonl").exists()
+
+
+def test_personal_candidate_lifecycle_uses_personal_ledger_without_override(tmp_path):
+    work = _write_work_file(tmp_path)
+    personal = _write_personal_file(tmp_path)
+    env = _env(tmp_path, work)
+    env["TASK_TRACKER_PERSONAL_FILE"] = str(personal)
+    env.pop("TASK_TRACKER_LEDGER_FILE")
+
+    scan = _run(
+        [
+            "--personal",
+            "completion-candidates",
+            "scan",
+        ],
+        env,
+        input_text="- Buy replacement filter task_id::tsk_filter\n",
+    )
+    scan_payload = _payload(scan)
+    candidate_id = _candidate_id(scan_payload)
+    confirm = _run(["--personal", "completion-candidates", "confirm", candidate_id], env)
+    list_payload = _payload(_run(["--personal", "completion-candidates", "list"], env))
+
+    work_ledger = work.with_suffix(work.suffix + ".events.jsonl")
+    personal_ledger = personal.with_suffix(personal.suffix + ".events.jsonl")
+    personal_events = [
+        json.loads(line) for line in personal_ledger.read_text().splitlines() if line.strip()
+    ]
+
+    assert scan.returncode == 0
+    assert confirm.returncode == 0
+    assert list_payload["total"] == 0
+    assert not work_ledger.exists()
+    assert [event["event_type"] for event in personal_events] == [
+        "candidate_seen",
+        "state_transition",
+        "candidate_confirmed",
+    ]
+    assert "Buy replacement filter" not in personal.read_text()
 
 
 def test_confirm_restores_task_state_when_candidate_event_append_fails(tmp_path, monkeypatch):
