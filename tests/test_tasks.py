@@ -12,6 +12,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
 
 import tasks
+from evidence_matching import extract_inline_identifiers
 
 
 def test_cmd_delegated_take_back_write_failure_keeps_delegated_item(tmp_path, monkeypatch):
@@ -96,7 +97,7 @@ def test_add_command_emits_canonical_task_id(tmp_path):
 
 
 def test_extract_inline_identifiers_accepts_trailing_punctuation():
-    identifiers = tasks._extract_inline_identifiers("Completed task_id::tsk_ship, and id::legacy-1)")
+    identifiers = extract_inline_identifiers("Completed task_id::tsk_ship, and id::legacy-1)")
 
     assert "tsk_ship" in identifiers["exact"]
     assert "legacy-1" in identifiers["exact"]

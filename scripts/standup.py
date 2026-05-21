@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).parent))
+from candidate_review import candidate_review_summary
 from daily_notes import extract_completed_actions, extract_completed_tasks
 from standup_common import (
     flatten_calendar_events,
@@ -267,6 +268,7 @@ def build_compact_standup_sections(output: dict) -> dict:
         "calendar_dos": calendar_dos,
         "calendar_dones": calendar_dones,
         "dos": dos,
+        "completion_candidates": output.get("completion_candidates") or {},
         "links": _build_daily_note_links(output.get("date")),
     }
 
@@ -360,6 +362,7 @@ def generate_standup(
         output['completed'] = tasks_data.get('done', [])
 
     output['objective_progress'] = summarize_objective_progress(tasks_data)
+    output['completion_candidates'] = candidate_review_summary()
     
     if json_output:
         return output
@@ -459,6 +462,18 @@ def generate_standup(
             lines.append(f"  • {t['title']}{rec}")
         if len(output['completed']) > 5:
             lines.append(f"  • ... and {len(output['completed']) - 5} more")
+
+    candidates = output.get('completion_candidates') or {}
+    if candidates.get('review_required'):
+        lines.append("")
+        lines.append(f"🧾 **Completion Candidates:** {candidates.get('total', 0)} review required")
+        for candidate in candidates.get('items', [])[:3]:
+            task_hint = candidate.get('confirmable_task_id') or candidate.get('suggested_task_id')
+            suffix = f" → {task_hint}" if task_hint else ""
+            lines.append(f"  • {candidate.get('candidate_id')}: {candidate.get('summary')}{suffix}")
+        if candidates.get('overflow'):
+            lines.append(f"  • ... and {candidates['overflow']} more")
+        lines.append("  Review required; do not auto-complete from this summary.")
 
     objective_progress = output.get('objective_progress') or {}
     if objective_progress.get('total_objectives', 0) > 0:

@@ -21,6 +21,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from candidate_review import candidate_review_summary
 from utils import load_tasks
 
 OBSIDIAN_VAULT = Path(os.getenv('OBSIDIAN_VAULT', Path.home() / "Obsidian"))
@@ -179,6 +180,7 @@ def generate_eod(target_date: datetime = None) -> dict:
         'done': done,
         'not_done': not_done,
         'tomorrows_top3': tomorrows_top3,
+        'completion_candidates': candidate_review_summary(),
         'source': source,
     }
 
@@ -215,6 +217,19 @@ def format_markdown(data: dict) -> str:
     else:
         lines.append('_No open Q1/Q2 items_')
 
+    candidates = data.get('completion_candidates') or {}
+    lines.extend(['', '## Completion Candidates'])
+    if candidates.get('review_required'):
+        lines.append(f"{candidates.get('total', 0)} candidate(s) need review.")
+        for candidate in candidates.get('items', [])[:5]:
+            task_hint = candidate.get('confirmable_task_id') or candidate.get('suggested_task_id')
+            suffix = f" -> {task_hint}" if task_hint else ""
+            lines.append(f"- {candidate.get('candidate_id')}: {candidate.get('summary')}{suffix}")
+        lines.append("")
+        lines.append("Review required; do not auto-complete from this summary.")
+    else:
+        lines.append('_No active completion candidates_')
+
     lines.extend([
         '',
         f"_Generated {datetime.now().isoformat()} via eod_review.py_",
@@ -247,6 +262,15 @@ def format_telegram(data: dict) -> str:
             lines.append(f"{i}. {item}")
     else:
         lines.append('- TBD')
+
+    candidates = data.get('completion_candidates') or {}
+    lines.extend(['', 'Completion candidates:'])
+    if candidates.get('review_required'):
+        lines.append(f"- {candidates.get('total', 0)} need review")
+        for candidate in candidates.get('items', [])[:3]:
+            lines.append(f"- {candidate.get('candidate_id')}: {candidate.get('summary')}")
+    else:
+        lines.append('- None')
 
     return '\n'.join(lines)
 

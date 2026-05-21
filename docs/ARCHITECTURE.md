@@ -33,6 +33,7 @@ graph TD
         TR["task_repair.py"]
         TT["task_transitions.py"]
         REC["task_records.py"]
+        EM["evidence_matching.py"]
         LINES["task_lines.py"]
         SC["standup_common.py"]
     end
@@ -282,6 +283,7 @@ sequenceDiagram
 | `completion-candidates list/show` | `--all`, `--mark-shown` | Review candidate inbox and event history |
 | `completion-candidates confirm` | `--task-id TASK_ID` | Complete through canonical ID-only `done` semantics |
 | `completion-candidates reject/duplicate/snooze` | `--reason`, `--of`, `--until YYYY-MM-DD` | Record candidate decisions without task writes |
+| `completion_inbox_control.py` | `list/show/reject/snooze/confirm` | Workflow-safe control wrapper over existing inbox commands |
 | `blockers` | `--person NAME` | Show blocking tasks |
 | `archive` | | Archive done tasks to quarterly file |
 
@@ -349,6 +351,7 @@ sequenceDiagram
 | `tasks.py completion-candidates list/show` | Ledger | Ledger only with `--mark-shown` |
 | `tasks.py completion-candidates confirm` | Ledger, task board, daily notes | Task board, daily note, ledger |
 | `tasks.py completion-candidates reject/duplicate/snooze` | Ledger | Ledger candidate events |
+| `completion_inbox_control.py` | Ledger, task board through confirm only | Delegates to existing inbox decision paths |
 | `tasks.py archive` | Daily notes | Quarterly archive |
 | `standup.py` | Task board, daily notes, calendar | — |
 | `personal_standup.py` | Task board, daily notes, calendar | — |

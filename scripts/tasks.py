@@ -17,13 +17,22 @@ import os
 import re
 import sys
 import uuid
-from difflib import SequenceMatcher
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).parent))
 from daily_notes import extract_completed_tasks
+from candidate_review import candidate_review_summary
+from evidence_matching import (
+    FUZZY_EVIDENCE_LINK_THRESHOLD,
+    FUZZY_REVIEW_THRESHOLD,
+    build_task_catalog,
+    canonical_record as _canonical_record,
+    extract_done_lines,
+    match_evidence_line,
+    safe_load_task_records as _safe_load_task_records,
+)
 from standup_common import get_calendar_events, flatten_calendar_events
 import delegation
 from task_identity import audit_payload, print_json as print_identity_json
@@ -33,7 +42,6 @@ from task_transitions import block_unsafe_query, complete_by_id, print_result
 from task_records import (
     active_records,
     record_to_task_dict,
-    task_records as build_task_records,
 )
 from utils import (
     detect_format,
@@ -48,8 +56,6 @@ from utils import (
 )
 
 TASK_PRIMITIVES_SCHEMA_VERSION = "v1"
-FUZZY_EVIDENCE_LINK_THRESHOLD = 0.90
-FUZZY_REVIEW_THRESHOLD = 0.70
 
 
 def list_tasks(args):
@@ -683,73 +689,6 @@ def _safe_load_tasks(personal: bool = False) -> dict:
         return empty
 
 
-def _safe_load_task_records(personal: bool = False) -> list:
-    tasks_file, fmt = get_tasks_file(personal)
-    if not tasks_file.exists():
-        return []
-    try:
-        content = tasks_file.read_text()
-    except OSError:
-        return []
-    try:
-        return build_task_records(content, personal=personal, fmt=fmt)
-    except Exception:
-        return []
-
-
-def _normalize_title(title: str) -> str:
-    lowered = (title or "").strip().casefold()
-    lowered = re.sub(r"\[x\]|\[ \]|✅|☑️", " ", lowered)
-    lowered = re.sub(r"\*\*|__|~~", "", lowered)
-    lowered = re.sub(r"[^\w\s/-]", " ", lowered)
-    lowered = re.sub(r"\s+", " ", lowered)
-    return lowered.strip()
-
-
-def _extract_inline_identifiers(text: str) -> dict[str, set[str]]:
-    exact_identifiers: set[str] = set()
-    fallback_identifiers: set[str] = set()
-    if not text:
-        return {"exact": exact_identifiers, "fallback": fallback_identifiers}
-
-    for match in re.findall(r"\b(?:id|task_id|task)::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$|[),.;!?])", text, flags=re.IGNORECASE):
-        exact_identifiers.add(match.casefold())
-
-    for url in re.findall(r"https?://[^\s)>\]]+", text):
-        lowered_url = url.casefold()
-        exact_identifiers.add(lowered_url)
-        github_issue_match = re.search(
-            r"^https?://(?:www\.)?github\.com/([^/\s]+)/([^/\s]+)/issues/(\d+)\b",
-            lowered_url,
-        )
-        if github_issue_match:
-            owner, repo, issue_num = github_issue_match.groups()
-            exact_identifiers.add(f"gh:{owner}/{repo}#{issue_num}")
-            fallback_identifiers.add(f"gh-issue-num:{issue_num}")
-
-    for match in re.findall(r"\b#(\d+)\b", text):
-        fallback_identifiers.add(f"gh-issue-num:{match}")
-
-    return {"exact": exact_identifiers, "fallback": fallback_identifiers}
-
-
-def _record_identifier_bundle(record) -> dict:
-    raw_identifiers = _extract_inline_identifiers(record.raw_line)
-    title_identifiers = _extract_inline_identifiers(record.title)
-    exact_identifiers = raw_identifiers["exact"] | title_identifiers["exact"]
-    fallback_identifiers = raw_identifiers["fallback"] | title_identifiers["fallback"]
-    if record.canonical_id:
-        exact_identifiers.add(record.canonical_id.casefold())
-    return {
-        "exact_identifiers": exact_identifiers,
-        "fallback_identifiers": fallback_identifiers,
-    }
-
-
-def _canonical_record(record) -> dict:
-    return record_to_task_dict(record)
-
-
 def _group_tasks_by_area(tasks: list[dict]) -> dict[str, list[dict]]:
     grouped: dict[str, list[dict]] = {}
     for task in tasks:
@@ -800,164 +739,6 @@ def _parse_range_inputs(week: str | None, start_raw: str | None, end_raw: str | 
         raise ValueError("Invalid --week format. Use YYYY-WNN (example: 2026-W07).")
     start_date = date.fromisocalendar(int(match.group(1)), int(match.group(2)), 1)
     return start_date, start_date + timedelta(days=6), "iso-week"
-
-
-def _extract_done_lines(content: str) -> list[dict]:
-    parsed: list[dict] = []
-    for line_number, raw in enumerate(content.splitlines(), start=1):
-        line = raw.strip()
-        if not line:
-            continue
-
-        is_checkbox = bool(re.match(r"^\s*[-*+]\s+\[(?:x|X| )\]\s+", raw))
-        is_checked = bool(re.match(r"^\s*[-*+]\s+\[(?:x|X)\]\s+", raw))
-
-        is_plain_bullet = bool(re.match(r"^\s*[-*+]\s+", raw))
-        if is_checkbox and not is_checked:
-            continue
-        if not is_checkbox and not is_plain_bullet and not line.startswith("✅"):
-            # Plain lines are accepted as completed actions too.
-            pass
-
-        cleaned = re.sub(r"^\s*[-*+]\s+", "", raw).strip()
-        cleaned = re.sub(r"^\[(?:x|X| )\]\s+", "", cleaned)
-        cleaned = re.sub(r"^\d{1,2}:\d{2}(?::\d{2})?\s+", "", cleaned)
-        cleaned = re.sub(r"^✅\s*", "", cleaned)
-        cleaned = re.sub(r"\s*✅\s*\d{4}-\d{2}-\d{2}\s*$", "", cleaned)
-        cleaned = cleaned.strip()
-        if not cleaned:
-            continue
-
-        identifiers = _extract_inline_identifiers(cleaned)
-        parsed.append(
-            {
-                "raw_line": raw.rstrip("\n"),
-                "line_number": line_number,
-                "title": cleaned,
-                "normalized_title": _normalize_title(cleaned),
-                "exact_identifiers": identifiers["exact"],
-                "fallback_identifiers": identifiers["fallback"],
-            }
-        )
-    return parsed
-
-
-def _fuzzy_score(left: str, right: str) -> float:
-    if not left or not right:
-        return 0.0
-    return SequenceMatcher(None, left, right).ratio()
-
-
-def _build_task_catalog(records: list) -> list[dict]:
-    catalog: list[dict] = []
-    for record in records:
-        bundle = _record_identifier_bundle(record)
-        canonical = _canonical_record(record)
-        catalog.append(
-            {
-                "record": record,
-                "canonical": canonical,
-                "normalized_title": _normalize_title(canonical["title"]),
-                "exact_identifiers": bundle["exact_identifiers"],
-                "fallback_identifiers": bundle["fallback_identifiers"],
-            }
-        )
-    return catalog
-
-
-def _ingest_match_line(
-    line: dict,
-    catalog: list[dict],
-    auto_threshold: float,
-    review_threshold: float,
-) -> dict:
-    def _sort_key(candidate: dict) -> str:
-        canonical = candidate["canonical"]
-        return canonical.get("task_id") or canonical.get("fallback_id") or canonical.get("title") or ""
-
-    exact_matches = [
-        candidate
-        for candidate in catalog
-        if line["exact_identifiers"] and (line["exact_identifiers"] & candidate["exact_identifiers"])
-    ]
-    if exact_matches:
-        chosen = sorted(exact_matches, key=_sort_key)[0]
-        return {
-            "raw_line": line["raw_line"],
-            "parsed_title": line["title"],
-            "normalized_title": line["normalized_title"],
-            "canonical_task": chosen["canonical"],
-            "match_metadata": {
-                "matched_task_id": chosen["canonical"]["task_id"],
-                "score": 1.0,
-                "decision": "evidence-link",
-                "match_type": "exact-id-or-link",
-            },
-        }
-
-    fallback_matches = [
-        candidate
-        for candidate in catalog
-        if line["fallback_identifiers"] and (line["fallback_identifiers"] & candidate["fallback_identifiers"])
-    ]
-    if fallback_matches:
-        chosen = sorted(fallback_matches, key=_sort_key)[0]
-        return {
-            "raw_line": line["raw_line"],
-            "parsed_title": line["title"],
-            "normalized_title": line["normalized_title"],
-            "canonical_task": chosen["canonical"],
-            "match_metadata": {
-                "matched_task_id": chosen["canonical"]["task_id"],
-                "score": 0.6,
-                "decision": "needs-review",
-                "match_type": "issue-number-fallback",
-            },
-        }
-
-    exact_title_matches = [
-        candidate for candidate in catalog if candidate["normalized_title"] == line["normalized_title"]
-    ]
-    if exact_title_matches:
-        chosen = sorted(exact_title_matches, key=_sort_key)[0]
-        return {
-            "raw_line": line["raw_line"],
-            "parsed_title": line["title"],
-            "normalized_title": line["normalized_title"],
-            "canonical_task": chosen["canonical"],
-            "match_metadata": {
-                "matched_task_id": chosen["canonical"]["task_id"],
-                "score": 1.0,
-                "decision": "evidence-link",
-                "match_type": "normalized-title",
-            },
-        }
-
-    scored = []
-    for candidate in catalog:
-        score = _fuzzy_score(line["normalized_title"], candidate["normalized_title"])
-        scored.append((score, _sort_key(candidate), candidate))
-    scored.sort(key=lambda item: (-item[0], item[1]))
-    best_score, _, best = scored[0] if scored else (0.0, "", None)
-
-    decision = "no-match"
-    if best and best_score >= auto_threshold:
-        decision = "evidence-link"
-    elif best and best_score >= review_threshold:
-        decision = "needs-review"
-
-    return {
-        "raw_line": line["raw_line"],
-        "parsed_title": line["title"],
-        "normalized_title": line["normalized_title"],
-        "canonical_task": best["canonical"] if best and decision != "no-match" else None,
-        "match_metadata": {
-            "matched_task_id": best["canonical"]["task_id"] if best and decision != "no-match" else None,
-            "score": round(float(best_score), 4),
-            "decision": decision,
-            "match_type": "fuzzy",
-        },
-    }
 
 
 def cmd_standup_summary(args):
@@ -1030,6 +811,7 @@ def cmd_standup_summary(args):
             "dos": dos,
             "overdue": overdue,
             "carryover_suggestions": carryover_suggestions,
+            "completion_candidates": candidate_review_summary(personal=args.personal),
             "groups": {
                 "dones_by_area": _group_tasks_by_area(dones),
                 "dos_by_area": _group_tasks_by_area(dos),
@@ -1162,6 +944,7 @@ def cmd_weekly_review_summary(args):
                 "by_area": _group_tasks_by_area(do_items),
                 "by_category": _group_tasks_by_category(do_items),
             },
+            "completion_candidates": candidate_review_summary(personal=args.personal),
         }
     )
     print(json.dumps(payload, indent=2))
@@ -1190,9 +973,9 @@ def cmd_ingest_daily_log(args):
         source_content = sys.stdin.read()
         source = {"type": "stdin"}
 
-    parsed_lines = _extract_done_lines(source_content)
+    parsed_lines = extract_done_lines(source_content)
     records = _safe_load_task_records(args.personal)
-    catalog = _build_task_catalog(records)
+    catalog = build_task_catalog(records)
     auto_threshold = float(args.auto_threshold)
     review_threshold = float(args.review_threshold)
     if review_threshold > auto_threshold:
@@ -1200,7 +983,7 @@ def cmd_ingest_daily_log(args):
         sys.exit(2)
 
     matched = [
-        _ingest_match_line(line, catalog, auto_threshold=auto_threshold, review_threshold=review_threshold)
+        match_evidence_line(line, catalog, auto_threshold=auto_threshold, review_threshold=review_threshold)
         for line in parsed_lines
     ]
 

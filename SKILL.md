@@ -89,10 +89,15 @@ python3 scripts/tasks.py --personal done "tsk_personal"
 python3 scripts/tasks.py completion-candidates scan --file /tmp/done-log.md
 python3 scripts/tasks.py completion-candidates list
 python3 scripts/tasks.py completion-candidates confirm cand_example --task-id tsk_example
+python3 scripts/completion_inbox_control.py list
+python3 scripts/completion_inbox_control.py confirm cand_example --task-id tsk_example
 ```
 
 Completion candidates are evidence suggestions. Scanning does not mutate active
-tasks; confirmation must resolve to a canonical `task_id::`.
+tasks; confirmation must resolve to a canonical `task_id::`. Workflow wrappers
+such as Telegram/Lobster should call `completion_inbox_control.py` or the
+`completion-candidates` command group by candidate ID. They must not call
+`done` by title, fuzzy match, fallback ID, quick ID, or list position.
 
 ### Backlog ops
 

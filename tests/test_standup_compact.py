@@ -11,6 +11,7 @@ def test_compact_standup_sections(tmp_path):
     env = os.environ.copy()
     env["TASK_TRACKER_WORK_FILE"] = str(work)
     env["TASK_TRACKER_DAILY_NOTES_DIR"] = str(tmp_path)
+    env["TASK_TRACKER_LEDGER_FILE"] = str(tmp_path / "events.jsonl")
     env["STANDUP_CALENDARS"] = "{}"
 
     proc = subprocess.run(
@@ -27,6 +28,7 @@ def test_compact_standup_sections(tmp_path):
     assert "calendar_dos" in payload
     assert "calendar_dones" in payload
     assert "dos" in payload
+    assert "completion_candidates" in payload
     assert "links" in payload
     assert payload["dos"]
     assert payload["calendar_dones"]
