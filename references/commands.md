@@ -84,6 +84,27 @@ All primitives return JSON with a stable envelope:
 
 Detailed shape: `references/task-primitives-schema-v1.md`.
 
+### Completion evidence inbox
+
+```bash
+python3 scripts/tasks.py completion-candidates scan --file /tmp/done-log.md
+cat /tmp/done-log.md | python3 scripts/tasks.py completion-candidates scan
+python3 scripts/tasks.py completion-candidates scan --date 2026-05-21
+python3 scripts/tasks.py completion-candidates list
+python3 scripts/tasks.py completion-candidates show cand_example
+python3 scripts/tasks.py completion-candidates confirm cand_example --task-id tsk_example
+python3 scripts/tasks.py completion-candidates reject cand_example \
+  --reason "not actually done"
+python3 scripts/tasks.py completion-candidates duplicate cand_example --of cand_original
+python3 scripts/tasks.py completion-candidates snooze cand_example --until 2026-05-28
+```
+
+Scanning creates durable candidate events in the ledger, but never mutates the
+task board or completion log. Confirmation is the only task-changing candidate
+action, and it completes through the same canonical-ID `done` path. Exact
+`task_id::` evidence can confirm directly; title, fuzzy, and fallback-only
+suggestions require `--task-id`.
+
 ## Wrapper shortcuts
 
 ```bash

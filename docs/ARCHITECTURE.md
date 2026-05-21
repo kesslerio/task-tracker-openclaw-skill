@@ -278,6 +278,10 @@ sequenceDiagram
 | `identity-audit` | | Report missing, duplicate, and malformed task IDs without writing |
 | `identity-repair` | `--apply` | Add safe missing `task_id::` metadata |
 | `ingest-daily-log` | `--file PATH` | Report completion evidence links; no task writes |
+| `completion-candidates scan` | `--file PATH`, `--date YYYY-MM-DD` | Persist completion evidence candidates; no task writes |
+| `completion-candidates list/show` | `--all`, `--mark-shown` | Review candidate inbox and event history |
+| `completion-candidates confirm` | `--task-id TASK_ID` | Complete through canonical ID-only `done` semantics |
+| `completion-candidates reject/duplicate/snooze` | `--reason`, `--of`, `--until YYYY-MM-DD` | Record candidate decisions without task writes |
 | `blockers` | `--person NAME` | Show blocking tasks |
 | `archive` | | Archive done tasks to quarterly file |
 
@@ -341,6 +345,10 @@ sequenceDiagram
 | `tasks.py done` | Task board, daily notes | Task board (remove/update line), daily note (append) |
 | `tasks.py identity-audit` | Task board | — |
 | `tasks.py ingest-daily-log` | Task board, done text | — |
+| `tasks.py completion-candidates scan` | Task board, done text, ledger | Ledger candidate events |
+| `tasks.py completion-candidates list/show` | Ledger | Ledger only with `--mark-shown` |
+| `tasks.py completion-candidates confirm` | Ledger, task board, daily notes | Task board, daily note, ledger |
+| `tasks.py completion-candidates reject/duplicate/snooze` | Ledger | Ledger candidate events |
 | `tasks.py archive` | Daily notes | Quarterly archive |
 | `standup.py` | Task board, daily notes, calendar | — |
 | `personal_standup.py` | Task board, daily notes, calendar | — |
@@ -355,6 +363,8 @@ sequenceDiagram
 - Priority escalation is read-only — task files are never mutated for display
 - Fuzzy/title evidence is read-only by default and cannot complete canonical tasks
 - Fallback IDs in JSON are diagnostics only; writes require `task_id::` or readable legacy `id::`
+- Completion candidates are suggestions until confirmed through the canonical
+  ID-only completion path
 
 ---
 

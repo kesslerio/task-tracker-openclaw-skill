@@ -35,11 +35,13 @@ python3 scripts/weekly_review.py
 - Task list/add/done workflows for work and personal boards
 - Canonical task identity audit/repair with inline `task_id::` metadata
 - Append-only JSONL event ledger for repairs and ID-based completions
+- Durable completion evidence inbox for review/confirm/reject/snooze decisions
 - Daily standup summaries (`standup.py`, `personal_standup.py`)
 - Weekly review + archive workflows (`weekly_review.py`, `archive.py`)
 - Backlog and delegated-task hygiene
 - Action extraction from notes (`extract_tasks.py`)
-- End-of-day evidence reporting retained, with legacy Weekly TODO writes behind `--apply`
+- End-of-day evidence reporting retained, with legacy Weekly TODO writes behind
+  `--apply`
 - Weekly transclusion refresh for Obsidian (`update_weekly_embeds.py`)
 
 ## Compatibility
@@ -49,6 +51,10 @@ matching remains useful for read-only review and migration diagnostics, but
 write paths block when they cannot resolve exactly one canonical task.
 Fallback IDs may appear in JSON output for diagnostics; they are not valid
 mutation targets.
+
+Completion evidence candidates are suggestions stored in the ledger. Scanning
+daily-log/EOD-style evidence never changes active tasks. Candidate confirmation
+uses the same canonical-ID completion path as `tasks.py done`.
 
 ## Development
 

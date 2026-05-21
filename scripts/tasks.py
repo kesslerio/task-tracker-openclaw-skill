@@ -804,7 +804,7 @@ def _parse_range_inputs(week: str | None, start_raw: str | None, end_raw: str | 
 
 def _extract_done_lines(content: str) -> list[dict]:
     parsed: list[dict] = []
-    for raw in content.splitlines():
+    for line_number, raw in enumerate(content.splitlines(), start=1):
         line = raw.strip()
         if not line:
             continue
@@ -832,6 +832,7 @@ def _extract_done_lines(content: str) -> list[dict]:
         parsed.append(
             {
                 "raw_line": raw.rstrip("\n"),
+                "line_number": line_number,
                 "title": cleaned,
                 "normalized_title": _normalize_title(cleaned),
                 "exact_identifiers": identifiers["exact"],
@@ -1228,6 +1229,160 @@ def cmd_ingest_daily_log(args):
     print(json.dumps(payload, indent=2))
 
 
+def _candidate_payload(command: str, **fields) -> dict:
+    payload = _new_schema(command)
+    payload.update(fields)
+    return payload
+
+
+def _print_candidate_result(result: dict, *, command: str, exit_on_error: bool = True) -> None:
+    if "schema_version" not in result:
+        result = _candidate_payload(command, **result)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    if exit_on_error and result.get("ok") is False:
+        sys.exit(2)
+
+
+def cmd_completion_candidates(args):
+    from completion_candidates import (
+        confirm_candidate,
+        duplicate_candidate,
+        get_candidate,
+        mark_shown,
+        project_candidates,
+        reject_candidate,
+        scan_content,
+        scan_daily_note,
+        scan_file,
+        snooze_candidate,
+    )
+    from task_ledger import MalformedLedgerError
+
+    try:
+        if args.candidate_command == "scan":
+            if args.file:
+                result = scan_file(Path(args.file), personal=args.personal)
+                _print_candidate_result(result, command="completion-candidates scan", exit_on_error=False)
+                return
+            if args.date:
+                notes_dir_raw = args.notes_dir or os.getenv("TASK_TRACKER_DAILY_NOTES_DIR")
+                if not notes_dir_raw:
+                    _print_candidate_result(
+                        {"ok": False, "error": {"code": "daily-notes-dir-required"}},
+                        command="completion-candidates scan",
+                    )
+                    return
+                notes_dir = Path(notes_dir_raw).expanduser()
+                day = datetime.strptime(args.date, "%Y-%m-%d").date()
+                result = scan_daily_note(notes_dir, day, personal=args.personal)
+                _print_candidate_result(
+                    result,
+                    command="completion-candidates scan",
+                    exit_on_error=False,
+                )
+                return
+            content = sys.stdin.read()
+            result = scan_content(content, {"type": "stdin"}, personal=args.personal)
+            _print_candidate_result(
+                result,
+                command="completion-candidates scan",
+                exit_on_error=False,
+            )
+            return
+
+        if args.candidate_command == "list":
+            candidates = project_candidates(include_terminal=args.all)
+            if not args.all:
+                today = date.today().isoformat()
+                candidates = [
+                    candidate for candidate in candidates
+                    if candidate.get("status") != "snoozed"
+                    or (candidate.get("snoozed_until") or "") <= today
+                ]
+            if args.mark_shown:
+                for candidate in candidates:
+                    if candidate.get("status") == "new":
+                        mark_shown(candidate["candidate_id"])
+                candidates = project_candidates(include_terminal=args.all)
+            _print_candidate_result(
+                {"candidates": candidates, "total": len(candidates)},
+                command="completion-candidates list",
+                exit_on_error=False,
+            )
+            return
+
+        if args.candidate_command == "show":
+            candidate = get_candidate(args.candidate_id, include_terminal=True)
+            if candidate is None:
+                _print_candidate_result(
+                    {"ok": False, "error": {"code": "candidate-not-found"}},
+                    command="completion-candidates show",
+                )
+                return
+            if args.mark_shown and candidate.get("status") == "new":
+                result = mark_shown(args.candidate_id)
+                candidate = result.get("candidate")
+            _print_candidate_result(
+                {"candidate": candidate},
+                command="completion-candidates show",
+                exit_on_error=False,
+            )
+            return
+
+        if args.candidate_command == "reject":
+            result = reject_candidate(args.candidate_id, reason=args.reason)
+            _print_candidate_result(result, command="completion-candidates reject")
+            return
+
+        if args.candidate_command == "snooze":
+            result = snooze_candidate(args.candidate_id, until=args.until)
+            _print_candidate_result(result, command="completion-candidates snooze")
+            return
+
+        if args.candidate_command == "duplicate":
+            result = duplicate_candidate(args.candidate_id, duplicate_of=args.duplicate_of)
+            _print_candidate_result(result, command="completion-candidates duplicate")
+            return
+
+        if args.candidate_command == "confirm":
+            result = confirm_candidate(
+                args.candidate_id,
+                task_id=args.task_id,
+                personal=args.personal,
+            )
+            _print_candidate_result(result, command="completion-candidates confirm")
+            return
+    except MalformedLedgerError as exc:
+        _print_candidate_result(
+            {
+                "ok": False,
+                "error": {
+                    "code": "malformed-ledger",
+                    "malformed": [
+                        {
+                            "path": item.path,
+                            "line_number": item.line_number,
+                            "message": item.message,
+                            "raw_line": item.raw_line,
+                        }
+                        for item in exc.malformed
+                    ],
+                },
+            },
+            command=f"completion-candidates {args.candidate_command}",
+        )
+    except OSError as exc:
+        _print_candidate_result(
+            {"ok": False, "error": {"code": "io-error", "message": str(exc)}},
+            command=f"completion-candidates {args.candidate_command}",
+        )
+    except ValueError as exc:
+        _print_candidate_result(
+            {"ok": False, "error": {"code": "invalid-input", "message": str(exc)}},
+            command=f"completion-candidates {args.candidate_command}",
+        )
+
+
 def cmd_calendar_sync_primitive(args):
     payload = _new_schema("calendar-sync")
     warnings: list[str] = []
@@ -1437,6 +1592,92 @@ def main():
         help='Fuzzy score threshold for needs-review',
     )
     ingest_daily_log_parser.set_defaults(func=cmd_ingest_daily_log)
+
+    candidates_parser = subparsers.add_parser(
+        'completion-candidates',
+        help='Manage durable completion evidence candidates',
+    )
+    candidates_sub = candidates_parser.add_subparsers(
+        dest='candidate_command',
+        required=True,
+    )
+
+    candidates_scan = candidates_sub.add_parser(
+        'scan',
+        help='Scan done evidence into the candidate inbox',
+    )
+    candidates_scan.add_argument('--file', help='Input log file; default is stdin')
+    candidates_scan.add_argument('--date', help='Daily note date to scan (YYYY-MM-DD)')
+    candidates_scan.add_argument(
+        '--notes-dir',
+        help='Daily notes directory; defaults to TASK_TRACKER_DAILY_NOTES_DIR',
+    )
+    candidates_scan.set_defaults(func=cmd_completion_candidates)
+
+    candidates_list = candidates_sub.add_parser(
+        'list',
+        help='List active completion candidates',
+    )
+    candidates_list.add_argument(
+        '--all',
+        action='store_true',
+        help='Include terminal and future-snoozed candidates',
+    )
+    candidates_list.add_argument(
+        '--mark-shown',
+        action='store_true',
+        help='Record shown events for new listed candidates',
+    )
+    candidates_list.set_defaults(func=cmd_completion_candidates)
+
+    candidates_show = candidates_sub.add_parser(
+        'show',
+        help='Show one completion candidate and its history',
+    )
+    candidates_show.add_argument('candidate_id', help='Candidate ID')
+    candidates_show.add_argument(
+        '--mark-shown',
+        action='store_true',
+        help='Record a shown event for a new candidate',
+    )
+    candidates_show.set_defaults(func=cmd_completion_candidates)
+
+    candidates_confirm = candidates_sub.add_parser(
+        'confirm',
+        help='Confirm a candidate through ID-only completion',
+    )
+    candidates_confirm.add_argument('candidate_id', help='Candidate ID')
+    candidates_confirm.add_argument('--task-id', help='Canonical task_id to complete')
+    candidates_confirm.set_defaults(func=cmd_completion_candidates)
+
+    candidates_reject = candidates_sub.add_parser(
+        'reject',
+        help='Reject a completion candidate',
+    )
+    candidates_reject.add_argument('candidate_id', help='Candidate ID')
+    candidates_reject.add_argument('--reason', help='Optional rejection reason')
+    candidates_reject.set_defaults(func=cmd_completion_candidates)
+
+    candidates_duplicate = candidates_sub.add_parser(
+        'duplicate',
+        help='Mark a candidate as a duplicate of another candidate',
+    )
+    candidates_duplicate.add_argument('candidate_id', help='Candidate ID')
+    candidates_duplicate.add_argument(
+        '--of',
+        dest='duplicate_of',
+        required=True,
+        help='Canonical candidate ID',
+    )
+    candidates_duplicate.set_defaults(func=cmd_completion_candidates)
+
+    candidates_snooze = candidates_sub.add_parser(
+        'snooze',
+        help='Hide a candidate until a future date',
+    )
+    candidates_snooze.add_argument('candidate_id', help='Candidate ID')
+    candidates_snooze.add_argument('--until', required=True, help='Snooze-until date (YYYY-MM-DD)')
+    candidates_snooze.set_defaults(func=cmd_completion_candidates)
 
     calendar_sync_parser = subparsers.add_parser(
         'calendar-sync',
