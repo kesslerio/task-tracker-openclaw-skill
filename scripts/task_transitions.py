@@ -10,60 +10,14 @@ from datetime import datetime
 from pathlib import Path
 
 from log_done import log_task_completed
-from task_identity import active_records, load_records
+from task_lines import remove_task_line, replace_task_line
+from task_records import active_records, load_records
 from task_ledger import append_event, ledger_path, new_event
 from utils import next_recurrence_date
 
 INLINE_FIELD_RE = re.compile(r"\s+[A-Za-z_][A-Za-z0-9_-]*::")
 RECURRENCE_RE = re.compile(r"\brecur::\s*(?!(?:\s|[A-Za-z_][A-Za-z0-9_-]*::))([^\n]+?)(?=\s+[A-Za-z_][A-Za-z0-9_-]*::|\s*[🗓️📅]|$)")
 DUE_RE = re.compile(r"(?:🗓️\s*|📅\s*)(\d{4}-\d{2}-\d{2})")
-
-
-def _line_index(lines: list[str], raw_line: str, line_number: int | None) -> int | None:
-    if line_number is None:
-        return None
-    index = line_number - 1
-    if index < 0 or index >= len(lines):
-        return None
-    if lines[index] != raw_line:
-        return None
-    return index
-
-
-def _remove_task_line(content: str, raw_line: str, line_number: int | None) -> str | None:
-    lines = content.split("\n")
-    target_index = _line_index(lines, raw_line, line_number)
-    if target_index is None:
-        return None
-    target_indent = len(raw_line) - len(raw_line.lstrip(" "))
-    remove_until = target_index + 1
-    while remove_until < len(lines):
-        line = lines[remove_until]
-        if not line.strip():
-            lookahead = remove_until + 1
-            while lookahead < len(lines) and not lines[lookahead].strip():
-                lookahead += 1
-            if lookahead < len(lines):
-                next_indent = len(lines[lookahead]) - len(lines[lookahead].lstrip(" "))
-                if next_indent > target_indent:
-                    remove_until += 1
-                    continue
-            break
-        indent = len(line) - len(line.lstrip(" "))
-        if indent > target_indent:
-            remove_until += 1
-            continue
-        break
-    return "\n".join(lines[:target_index] + lines[remove_until:])
-
-
-def _replace_task_line(content: str, raw_line: str, replacement: str, line_number: int | None) -> str | None:
-    lines = content.split("\n")
-    target_index = _line_index(lines, raw_line, line_number)
-    if target_index is None:
-        return None
-    lines[target_index] = replacement
-    return "\n".join(lines)
 
 
 def _set_due_date(raw_line: str, due_date: str) -> str:
@@ -189,7 +143,7 @@ def complete_by_id(task_id: str, personal: bool = False, source: str = "user_com
             from_date = due_value or datetime.now().date().isoformat()
             next_due = next_recurrence_date(recur_value, from_date)
             next_line = _set_due_date(record.raw_line, next_due)
-            new_content = _replace_task_line(content, record.raw_line, next_line, record.line_number)
+            new_content = replace_task_line(content, record.raw_line, next_line, record.line_number)
         except ValueError as exc:
             return {
                 "ok": False,
@@ -199,7 +153,7 @@ def complete_by_id(task_id: str, personal: bool = False, source: str = "user_com
                 },
             }
     else:
-        new_content = _remove_task_line(content, record.raw_line, record.line_number)
+        new_content = remove_task_line(content, record.raw_line, record.line_number)
     if new_content is None:
         return {
             "ok": False,

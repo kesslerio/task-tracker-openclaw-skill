@@ -39,6 +39,33 @@ def test_get_archive_dir(tmp_path, monkeypatch):
     assert archive_dir == custom_dir
 
 
+def test_archive_week_removes_multiple_done_lines_bottom_up(tmp_path, monkeypatch):
+    class FakeDate(date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 2, 19)
+
+    monkeypatch.setattr(archive, "date", FakeDate)
+
+    objectives = tmp_path / "objectives.md"
+    objectives.write_text("""# Objectives 2026
+
+## Dev
+
+- [x] First completed task ✅ 2026-02-18
+- [x] Second completed task ✅ 2026-02-18
+- [ ] Active task
+""")
+
+    result = archive_week(tasks_file=objectives, personal=False)
+
+    assert result["removed"] == 2
+    updated = objectives.read_text()
+    assert "First completed task" not in updated
+    assert "Second completed task" not in updated
+    assert "- [ ] Active task" in updated
+
+
 def test_consolidate_month_includes_previous_iso_year_week(tmp_path):
     archive_dir = tmp_path / "Done Archive"
     archive_dir.mkdir()

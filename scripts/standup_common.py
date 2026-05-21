@@ -126,9 +126,11 @@ def format_missed_tasks_block(missed_buckets: dict | None) -> str:
         missed_lines.append("\n  **Yesterday:**")
         for task in missed_buckets["yesterday"]:
             title = task.get("title", "")
-            missed_lines.append(
-                f'    • {title} — say "done {title}" to mark complete'
-            )
+            task_id = task.get("task_id") or task.get("legacy_id")
+            if task_id:
+                missed_lines.append(f'    • {title} — say "done {task_id}" to mark complete')
+            else:
+                missed_lines.append(f"    • {title} — missing task_id::; repair identity before completion")
 
     if missed_buckets.get("last7"):
         missed_lines.append("\n  **Last 7 Days:**")

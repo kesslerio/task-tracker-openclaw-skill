@@ -139,8 +139,8 @@ def test_ingest_daily_log_plain_bullets_and_exact_matching(tmp_path):
     assert payload["schema_version"] == "v1"
     assert payload["command"] == "ingest-daily-log"
     assert payload["totals"]["parsed_done_lines"] == 2
-    assert payload["totals"]["auto_linked"] == 2
-    assert payload["items"][0]["match_metadata"]["decision"] == "auto-link"
+    assert payload["totals"]["evidence_linked"] == 2
+    assert payload["items"][0]["match_metadata"]["decision"] == "evidence-link"
     assert payload["items"][0]["match_metadata"]["match_type"] in {"normalized-title", "exact-id-or-link"}
     assert payload["items"][1]["match_metadata"]["match_type"] == "exact-id-or-link"
 
@@ -212,11 +212,16 @@ def test_fallback_task_ids_are_unique_and_consistent_across_primitives(tmp_path)
     )
     assert standup.returncode == 0
     standup_payload = json.loads(standup.stdout)
-    standup_duplicate_ids = [
-        item["task_id"] for item in standup_payload["dos"] if item["title"] == "Duplicate title"
+    standup_duplicate_fallback_ids = [
+        item["fallback_id"] for item in standup_payload["dos"] if item["title"] == "Duplicate title"
     ]
-    assert len(standup_duplicate_ids) == 2
-    assert len(set(standup_duplicate_ids)) == 2
+    assert len(standup_duplicate_fallback_ids) == 2
+    assert len(set(standup_duplicate_fallback_ids)) == 2
+    assert all(
+        item["task_id"] is None and item["fallback_only"]
+        for item in standup_payload["dos"]
+        if item["title"] == "Duplicate title"
+    )
 
     week_start = date.today() - timedelta(days=date.today().weekday())
     week_end = week_start + timedelta(days=6)
@@ -237,10 +242,10 @@ def test_fallback_task_ids_are_unique_and_consistent_across_primitives(tmp_path)
     )
     assert weekly.returncode == 0
     weekly_payload = json.loads(weekly.stdout)
-    weekly_duplicate_ids = [
-        item["task_id"] for item in weekly_payload["DO"]["items"] if item["title"] == "Duplicate title"
+    weekly_duplicate_fallback_ids = [
+        item["fallback_id"] for item in weekly_payload["DO"]["items"] if item["title"] == "Duplicate title"
     ]
-    assert standup_duplicate_ids == weekly_duplicate_ids
+    assert standup_duplicate_fallback_ids == weekly_duplicate_fallback_ids
 
     ingest = subprocess.run(
         ["python3", "scripts/tasks.py", "ingest-daily-log"],
@@ -252,8 +257,8 @@ def test_fallback_task_ids_are_unique_and_consistent_across_primitives(tmp_path)
     )
     assert ingest.returncode == 0
     ingest_payload = json.loads(ingest.stdout)
-    mapped_id = ingest_payload["items"][0]["canonical_task"]["task_id"]
-    assert mapped_id == sorted(standup_duplicate_ids)[0]
+    assert ingest_payload["items"][0]["canonical_task"]["task_id"] is None
+    assert ingest_payload["items"][0]["canonical_task"]["fallback_only"] is True
 
 
 def test_ingest_daily_log_strips_time_prefix_before_checkmark(tmp_path):
@@ -272,7 +277,7 @@ def test_ingest_daily_log_strips_time_prefix_before_checkmark(tmp_path):
     payload = json.loads(proc.stdout)
     assert payload["totals"]["parsed_done_lines"] == 1
     assert payload["items"][0]["parsed_title"] == "Ship alpha milestone"
-    assert payload["items"][0]["match_metadata"]["decision"] == "auto-link"
+    assert payload["items"][0]["match_metadata"]["decision"] == "evidence-link"
     assert payload["items"][0]["match_metadata"]["match_type"] == "normalized-title"
 
 
@@ -291,7 +296,7 @@ def test_ingest_daily_log_disambiguates_cross_repo_issue_urls(tmp_path):
     assert proc.returncode == 0
     payload = json.loads(proc.stdout)
     assert payload["totals"]["parsed_done_lines"] == 1
-    assert payload["totals"]["auto_linked"] == 1
-    assert payload["items"][0]["match_metadata"]["decision"] == "auto-link"
+    assert payload["totals"]["evidence_linked"] == 1
+    assert payload["items"][0]["match_metadata"]["decision"] == "evidence-link"
     assert payload["items"][0]["match_metadata"]["match_type"] == "exact-id-or-link"
     assert payload["items"][0]["canonical_task"]["title"] == "Repo B issue 42"

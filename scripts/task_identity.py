@@ -3,128 +3,19 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
-import re
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Iterable
 
-from utils import get_tasks_file, parse_tasks
-
-TASK_ID_RE = re.compile(r"\btask_id::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$|[),.;!?])")
-LEGACY_ID_RE = re.compile(r"\bid::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$|[),.;!?])")
-
-
-@dataclass(frozen=True)
-class IdentityRecord:
-    task_id: str | None
-    legacy_id: str | None
-    title: str
-    done: bool
-    section: str | None
-    area: str | None
-    line_number: int | None
-    raw_line: str
-    fallback_id: str
-
-    @property
-    def canonical_id(self) -> str | None:
-        return self.task_id or self.legacy_id
-
-    @property
-    def identity_source(self) -> str:
-        if self.task_id:
-            return "task_id"
-        if self.legacy_id:
-            return "legacy_id"
-        return "fallback"
-
-
-def fallback_id_for(raw_line: str, line_number: int | None) -> str:
-    material = f"{line_number or 0}\0{raw_line}".encode("utf-8")
-    return f"fallback-{hashlib.sha1(material).hexdigest()[:12]}"
-
-
-def opaque_task_id(raw_line: str, line_number: int | None) -> str:
-    material = f"task-v1\0{line_number or 0}\0{raw_line}".encode("utf-8")
-    return f"tsk_{hashlib.sha256(material).hexdigest()[:16]}"
-
-
-def _parking_lot_line_numbers(content: str) -> set[int]:
-    parking_lines: set[int] = set()
-    in_parking_lot = False
-    for idx, line in enumerate(content.splitlines(), start=1):
-        if re.match(r"##\s+(?:🅿️\s*)?Parking Lot\b", line, re.IGNORECASE):
-            in_parking_lot = True
-            continue
-        if in_parking_lot and re.match(r"##\s+", line):
-            in_parking_lot = False
-        if in_parking_lot:
-            parking_lines.add(idx)
-    return parking_lines
-
-
-def task_records(content: str, personal: bool = False, fmt: str = "obsidian") -> list[IdentityRecord]:
-    parsed = parse_tasks(content, personal=personal, format=fmt)
-    parking_lot_lines = _parking_lot_line_numbers(content)
-    records: list[IdentityRecord] = []
-    for task in parsed.get("all", []):
-        raw_line = str(task.get("raw_line") or "")
-        line_number = task.get("line_number")
-        line_number_int = int(line_number) if line_number else None
-        section = task.get("section")
-        if line_number_int in parking_lot_lines:
-            section = "parking_lot"
-        records.append(
-            IdentityRecord(
-                task_id=task.get("task_id"),
-                legacy_id=task.get("legacy_id"),
-                title=str(task.get("title") or ""),
-                done=bool(task.get("done")),
-                section=section,
-                area=task.get("area") or task.get("department"),
-                line_number=line_number_int,
-                raw_line=raw_line,
-                fallback_id=fallback_id_for(raw_line, line_number_int),
-            )
-        )
-    return records
-
-
-def load_records(personal: bool = False) -> tuple[Path, str, list[IdentityRecord]]:
-    tasks_file, fmt = get_tasks_file(personal)
-    if not tasks_file.exists():
-        raise FileNotFoundError(f"Tasks file not found: {tasks_file}")
-    content = tasks_file.read_text(encoding="utf-8")
-    return tasks_file, content, task_records(content, personal=personal, fmt=fmt)
-
-
-def active_records(records: Iterable[IdentityRecord]) -> list[IdentityRecord]:
-    inactive_sections = {"backlog", "parking_lot"}
-    return [record for record in records if not record.done and record.section not in inactive_sections]
-
-
-def export_active(records: Iterable[IdentityRecord]) -> list[dict]:
-    exported = []
-    for record in active_records(records):
-        exported.append(
-            {
-                "task_id": record.canonical_id,
-                "identity_source": record.identity_source,
-                "fallback_id": record.fallback_id,
-                "title": record.title,
-                "state": "active",
-                "section": record.section,
-                "area": record.area,
-                "line_number": record.line_number,
-                "raw_line": record.raw_line,
-                "missing_task_id": record.task_id is None,
-                "fallback_only": record.canonical_id is None,
-                "checked_candidate": record.done,
-            }
-        )
-    return exported
+from task_records import (
+    IdentityRecord,
+    TASK_ID_RE,
+    active_records,
+    export_active,
+    load_records,
+    opaque_task_id,
+    task_records,
+)
+from utils import get_tasks_file
 
 
 def audit_identity(records: Iterable[IdentityRecord]) -> dict:

@@ -10,6 +10,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from utils import parse_tasks
+from task_lines import remove_task_line
 
 
 DEPARTMENT_DISPLAY = {"HR": "HR/People"}
@@ -20,6 +21,7 @@ class ArchiveRecord:
     title: str
     completed_date: str | None
     raw_line: str
+    line_number: int | None
 
 
 def atomic_write(path: Path, content: str) -> None:
@@ -34,21 +36,6 @@ def atomic_write(path: Path, content: str) -> None:
     finally:
         if os.path.exists(tmp_name):
             os.unlink(tmp_name)
-
-
-def _remove_task_line(content: str, raw_line: str) -> str:
-    lines = content.splitlines(keepends=True)
-    result = []
-    i = 0
-    while i < len(lines):
-        if lines[i].rstrip() == raw_line.rstrip():
-            i += 1
-            while i < len(lines) and lines[i].startswith(('  ', '\t')):
-                i += 1
-        else:
-            result.append(lines[i])
-            i += 1
-    return ''.join(result)
 
 
 def get_archive_dir(tasks_file: Path) -> Path:
@@ -91,7 +78,13 @@ def archive_week(tasks_file: Path, personal: bool) -> dict:
             title = task.get('title', raw_line)
             completed_date = task.get('completed_date')
             dept = objective_depts.get(parent, 'Uncategorized')
-            record = ArchiveRecord(department=dept, title=title, completed_date=completed_date, raw_line=raw_line)
+            record = ArchiveRecord(
+                department=dept,
+                title=title,
+                completed_date=completed_date,
+                raw_line=raw_line,
+                line_number=task.get('line_number'),
+            )
             completed_by_dept[dept].append(record)
     
     if not completed_by_dept:
@@ -122,11 +115,16 @@ def archive_week(tasks_file: Path, personal: bool) -> dict:
     
     updated_content = tasks_file.read_text()
     removed = 0
-    for dept_records in completed_by_dept.values():
-        for record in dept_records:
-            if record.raw_line and record.raw_line in updated_content:
-                updated_content = _remove_task_line(updated_content, record.raw_line)
-                removed += 1
+    records_to_remove = [
+        record
+        for dept_records in completed_by_dept.values()
+        for record in dept_records
+    ]
+    for record in sorted(records_to_remove, key=lambda r: r.line_number or 0, reverse=True):
+        updated = remove_task_line(updated_content, record.raw_line, record.line_number)
+        if updated is not None:
+            updated_content = updated
+            removed += 1
     
     if removed > 0:
         atomic_write(tasks_file, updated_content)

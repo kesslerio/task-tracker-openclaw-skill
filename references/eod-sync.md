@@ -1,9 +1,8 @@
 # EOD Sync and Weekly Embeds
 
-The legacy EOD workflow can sync completed items from daily notes into Weekly
-TODOs. The canonical identity kernel does not change this workflow yet; future
-completion evidence work should keep EOD extraction evidence-only until a user
-confirms an ID-based completion.
+The EOD workflow reports completed items from daily notes against Weekly TODOs.
+It is evidence-only by default. Legacy Weekly TODO checkbox writes are still
+available behind `--apply`, but they do not complete canonical tasks.
 
 ## Environment
 
@@ -17,6 +16,7 @@ export TASK_TRACKER_DAILY_NOTES_DIR="$HOME/path/to/Daily"
 ```bash
 python3 scripts/eod_sync.py --dry-run
 python3 scripts/eod_sync.py
+python3 scripts/eod_sync.py --apply
 python3 scripts/eod_sync.py --date 2026-02-18
 python3 scripts/eod_sync.py --verbose
 ```
@@ -25,11 +25,13 @@ Behavior:
 
 - Reads `## ✅ Done` from the selected daily note
 - Fuzzy-matches against open tasks in weekly TODOs
-- Marks matched items complete as `- [x] ... ✅ YYYY-MM-DD`
+- Reports evidence links without writing by default
+- With `--apply`, marks matched Weekly TODO items as `- [x] ... ✅ YYYY-MM-DD`
+- Never updates canonical task state; use `tasks.py done <task_id>` for that
 
 Match thresholds:
 
-- `>= 80%`: auto-sync
+- `>= 80%`: evidence-link
 - `60-79%`: uncertain, manual review
 - `< 60%`: skipped
 

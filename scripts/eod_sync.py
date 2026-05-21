@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-eod_sync.py — Auto-sync EOD completions from daily notes to Weekly TODOs.
+eod_sync.py — Report EOD completion evidence from daily notes to Weekly TODOs.
 
 For each completed item in the daily note's ✅ Done section, fuzzy-match
-against unchecked tasks in Weekly TODOs and mark them complete.
+against unchecked tasks in Weekly TODOs and report likely evidence links.
+Writes require explicit --apply and remain a legacy weekly TODO helper; they
+do not update canonical task state.
 
 Thresholds:
-  ≥ 80%  → auto-sync (mark done)
+  ≥ 80%  → evidence-link
   60-79% → log as uncertain (manual review needed)
   < 60%  → skip
 
@@ -15,9 +17,9 @@ Configuration via environment variables:
   TASK_TRACKER_DAILY_NOTES_DIR  Directory containing YYYY-MM-DD.md files
 
 Usage:
-  python3 eod_sync.py                   # sync today
-  python3 eod_sync.py --dry-run         # preview without writing
-  python3 eod_sync.py --date 2026-02-18 # sync a specific day
+  python3 eod_sync.py                   # report today, no writes
+  python3 eod_sync.py --apply           # legacy write to Weekly TODOs
+  python3 eod_sync.py --date 2026-02-18 # report a specific day
   python3 eod_sync.py --verbose         # show all match scores
 """
 
@@ -53,7 +55,7 @@ DAILY_NOTES_DIR = Path(
 # Threshold constants
 # ---------------------------------------------------------------------------
 
-AUTO_SYNC_THRESHOLD = 0.80   # ≥ 80% → auto-sync
+AUTO_SYNC_THRESHOLD = 0.80   # >= 80% -> evidence-link
 UNCERTAIN_THRESHOLD = 0.60   # 60-79% → log uncertain
 
 # ---------------------------------------------------------------------------
@@ -194,7 +196,7 @@ def build_sync_plan(
     For each done_item, find the best-matching open task.
 
     Returns list of result dicts:
-      status: 'sync' | 'uncertain' | 'skip'
+    status: 'evidence' | 'uncertain' | 'skip'
       done_item: original done item text
       match: matched task dict or None
       score: float 0-1
@@ -223,7 +225,7 @@ def build_sync_plan(
             matched_task_indices.add(best_idx)
             results.append(
                 {
-                    "status": "sync",
+                    "status": "evidence",
                     "done_item": done_item,
                     "match": best_task,
                     "score": best_score,
@@ -263,7 +265,7 @@ def apply_sync_plan(
     updated = list(weekly_lines)
 
     for result in plan:
-        if result["status"] != "sync":
+        if result["status"] not in {"sync", "evidence"}:
             continue
         task = result["match"]
         idx = task["line_idx"]
@@ -292,12 +294,12 @@ def apply_sync_plan(
 
 def print_report(plan: list[SyncResult], dry_run: bool, verbose: bool = False) -> None:
     """Print a human-readable sync report."""
-    synced = [r for r in plan if r["status"] == "sync"]
+    synced = [r for r in plan if r["status"] in {"sync", "evidence"}]
     uncertain = [r for r in plan if r["status"] == "uncertain"]
     skipped = [r for r in plan if r["status"] == "skip"]
 
     mode = "DRY RUN — " if dry_run else ""
-    print(f"\n{mode}EOD Sync Report")
+    print(f"\n{mode}EOD Evidence Report")
     print("=" * 50)
 
     if verbose:
@@ -305,15 +307,15 @@ def print_report(plan: list[SyncResult], dry_run: bool, verbose: bool = False) -
         print("\n📊 All match attempts:")
         for r in plan:
             pct = int(r["score"] * 100)
-            status_icon = {"sync": "✅", "uncertain": "⚠️", "skip": "⏭️"}[r["status"]]
+            status_icon = {"sync": "✅", "evidence": "🔎", "uncertain": "⚠️", "skip": "⏭️"}[r["status"]]
             weekly_title = r["match"]["body"] if r["match"] else "(no match)"
             print(f"  {status_icon} [{pct}%] {normalize(r['done_item'])}")
             if r["match"]:
                 print(f"         → {normalize(weekly_title)}")
     else:
-        # Default: show only synced, uncertain, skipped summaries
+        # Default: show only evidence, uncertain, skipped summaries
         if synced:
-            print(f"\n✅ Auto-synced ({len(synced)}):")
+            print(f"\n🔎 Evidence links ({len(synced)}):")
             for r in synced:
                 pct = int(r["score"] * 100)
                 weekly_title = r["match"]["body"] if r["match"] else "?"
@@ -336,7 +338,7 @@ def print_report(plan: list[SyncResult], dry_run: bool, verbose: bool = False) -
                 print(f"  {label}{normalize(r['done_item'])!r}")
 
     print()
-    action = "Would sync" if dry_run else "Synced"
+    action = "Would legacy-apply" if dry_run else "Legacy-applied"
     print(
         f"Summary: {action} {len(synced)}, uncertain {len(uncertain)}, "
         f"skipped {len(skipped)}"
@@ -350,19 +352,24 @@ def print_report(plan: list[SyncResult], dry_run: bool, verbose: bool = False) -
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Sync EOD completions from daily notes to Weekly TODOs.",
+        description="Report EOD completion evidence from daily notes to Weekly TODOs.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     parser.add_argument(
         "--date",
         default=None,
-        help="Date to sync (YYYY-MM-DD). Defaults to today.",
+        help="Date to report (YYYY-MM-DD). Defaults to today.",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Preview what would change without writing files.",
+        help="Preview what would change without writing files. This is now the default.",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Legacy weekly TODO write mode. Does not update canonical task state.",
     )
     parser.add_argument(
         "--verbose",
@@ -373,7 +380,7 @@ def main() -> None:
         "--threshold",
         type=float,
         default=None,
-        help="Override auto-sync threshold (0-1, default 0.80).",
+        help="Override evidence-link threshold (0-1, default 0.80).",
     )
     args = parser.parse_args()
 
@@ -428,10 +435,17 @@ def main() -> None:
     plan = build_sync_plan(done_items, open_tasks, sync_date, verbose=args.verbose)
 
     # Print report
-    print_report(plan, dry_run=args.dry_run, verbose=args.verbose)
+    report_only = args.dry_run or not args.apply
+    print_report(plan, dry_run=report_only, verbose=args.verbose)
 
-    # Apply plan (unless dry run)
-    if not args.dry_run:
+    if not args.apply:
+        print("ℹ️  Report-only mode: no files written. Use --apply for legacy Weekly TODO writes.")
+        return
+
+    print("⚠️  Legacy apply mode: this writes Weekly TODO checkboxes only; canonical tasks are unchanged.")
+
+    # Apply plan only when explicitly requested.
+    if args.apply:
         new_lines = apply_sync_plan(weekly_lines, plan, sync_date)
         new_content = "".join(new_lines)
 
@@ -439,7 +453,7 @@ def main() -> None:
             print("ℹ️  No changes to write.")
         else:
             WEEKLY_TODOS_PATH.write_text(new_content, encoding="utf-8")
-            synced_count = sum(1 for r in plan if r["status"] == "sync")
+            synced_count = sum(1 for r in plan if r["status"] in {"sync", "evidence"})
             print(f"✅ Wrote {WEEKLY_TODOS_PATH.name} ({synced_count} task(s) marked done)")
 
 
