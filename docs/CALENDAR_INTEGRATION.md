@@ -1,6 +1,8 @@
 # Calendar Integration
 
 The daily standup script can optionally fetch today's calendar events via the `gog` CLI.
+Calendar data is display/evidence input only. It must not complete, reschedule,
+or otherwise mutate canonical task state.
 
 ## Configuration
 
@@ -48,10 +50,11 @@ export STANDUP_CALENDARS='{
 - Shows events in chronological order
 - Silently skips calendars that fail to fetch
 - If `STANDUP_CALENDARS` is not set, no calendar integration (script works without it)
+- Does not write task board state; task completion still requires `tasks.py done <task_id>`
 
 ## Example Output
 
-```
+```text
 📋 Daily Standup — Wednesday, January 21
 
 📅 Today's Calendar:

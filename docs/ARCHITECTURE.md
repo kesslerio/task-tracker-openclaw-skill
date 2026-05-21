@@ -32,6 +32,8 @@ graph TD
         TL["task_ledger.py"]
         TR["task_repair.py"]
         TT["task_transitions.py"]
+        REC["task_records.py"]
+        LINES["task_lines.py"]
         SC["standup_common.py"]
     end
 
@@ -54,7 +56,9 @@ graph TD
     TASKS --> TL
     TASKS --> TR
     TASKS --> TT
+    TASKS --> REC
     STANDUP --> UTILS
+    STANDUP --> REC
     STANDUP --> DN
     STANDUP --> SC
     PSTANDUP --> UTILS
@@ -74,6 +78,8 @@ graph TD
     TL -->|append| LEDGER
     TR -->|repair IDs| WT
     TT -->|ID mutations| WT
+    REC -->|shared parsed record| UTILS
+    TT --> LINES
     DN -->|read| DAILY
     WEEKLY -->|write| ARCHIVE
 
@@ -268,7 +274,10 @@ sequenceDiagram
 | | `--due YYYY-MM-DD` | Set due date |
 | | `--owner NAME` | Assign owner |
 | | `--area CATEGORY` | Set area/category |
-| `done "query"` | | Fuzzy-match and complete a task |
+| `done "task_id"` | | Complete exactly one active task by canonical ID |
+| `identity-audit` | | Report missing, duplicate, and malformed task IDs without writing |
+| `identity-repair` | `--apply` | Add safe missing `task_id::` metadata |
+| `ingest-daily-log` | `--file PATH` | Report completion evidence links; no task writes |
 | `blockers` | `--person NAME` | Show blocking tasks |
 | `archive` | | Archive done tasks to quarterly file |
 
@@ -330,6 +339,8 @@ sequenceDiagram
 | `tasks.py list` | Task board | — |
 | `tasks.py add` | Task board | Task board (insert line) |
 | `tasks.py done` | Task board, daily notes | Task board (remove/update line), daily note (append) |
+| `tasks.py identity-audit` | Task board | — |
+| `tasks.py ingest-daily-log` | Task board, done text | — |
 | `tasks.py archive` | Daily notes | Quarterly archive |
 | `standup.py` | Task board, daily notes, calendar | — |
 | `personal_standup.py` | Task board, daily notes, calendar | — |
@@ -342,6 +353,8 @@ sequenceDiagram
 - `log_done.py` is append-only — never overwrites existing data
 - Archive operations are idempotent — skip entries already present
 - Priority escalation is read-only — task files are never mutated for display
+- Fuzzy/title evidence is read-only by default and cannot complete canonical tasks
+- Fallback IDs in JSON are diagnostics only; writes require `task_id::` or readable legacy `id::`
 
 ---
 
@@ -349,7 +362,7 @@ sequenceDiagram
 
 ### Calendar (gog CLI)
 
-`standup_common.py` calls `gog calendar list <calendar_id> --account <account> --today --json` for each configured calendar. Configured via `STANDUP_CALENDARS` env var (JSON object keyed by label). Silently skipped if `gog` is unavailable or config is unset.
+`standup_common.py` calls `gog calendar list <calendar_id> --account <account> --today --json` for each configured calendar. Configured via `STANDUP_CALENDARS` env var (JSON object keyed by label). Silently skipped if `gog` is unavailable or config is unset. Calendar data is evidence/display input only; it does not mutate task truth.
 
 ### Telegram (task-shortcuts.sh)
 

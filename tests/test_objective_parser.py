@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from tasks import _remove_task_line
+from task_lines import remove_task_line
 from utils import detect_format, parse_tasks
 
 
@@ -166,7 +166,7 @@ def test_remove_task_line_removes_parent_and_subtasks():
 - [ ] Sibling objective
 """
 
-    updated = _remove_task_line(content, "- [ ] Parent objective")
+    updated = remove_task_line(content, "- [ ] Parent objective", 2)
 
     assert updated == """## Objectives
 - [ ] Sibling objective
@@ -180,10 +180,22 @@ def test_remove_task_line_preserves_sibling_tasks():
   - [ ] Child B1
 """
 
-    updated = _remove_task_line(content, "- [ ] Parent A")
+    updated = remove_task_line(content, "- [ ] Parent A", 1)
 
     assert updated == """- [ ] Parent B
   - [ ] Child B1
+"""
+
+
+def test_remove_task_line_removes_tab_indented_children():
+    content = """- [x] Parent task
+\t- [ ] Tab child
+- [ ] Sibling task
+"""
+
+    updated = remove_task_line(content, "- [x] Parent task", 1)
+
+    assert updated == """- [ ] Sibling task
 """
 
 
@@ -192,7 +204,7 @@ def test_remove_task_line_handles_flat_task():
 - [ ] Task two
 """
 
-    updated = _remove_task_line(content, "- [ ] Task one")
+    updated = remove_task_line(content, "- [ ] Task one", 1)
 
     assert updated == """- [ ] Task two
 """

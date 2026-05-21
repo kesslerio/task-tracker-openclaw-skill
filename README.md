@@ -39,7 +39,7 @@ python3 scripts/weekly_review.py
 - Weekly review + archive workflows (`weekly_review.py`, `archive.py`)
 - Backlog and delegated-task hygiene
 - Action extraction from notes (`extract_tasks.py`)
-- End-of-day sync helpers retained as legacy workflows
+- End-of-day evidence reporting retained, with legacy Weekly TODO writes behind `--apply`
 - Weekly transclusion refresh for Obsidian (`update_weekly_embeds.py`)
 
 ## Compatibility
@@ -47,6 +47,8 @@ python3 scripts/weekly_review.py
 Active task mutations now require canonical `task_id::` values. Legacy title
 matching remains useful for read-only review and migration diagnostics, but
 write paths block when they cannot resolve exactly one canonical task.
+Fallback IDs may appear in JSON output for diagnostics; they are not valid
+mutation targets.
 
 ## Development
 

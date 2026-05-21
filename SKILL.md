@@ -18,7 +18,7 @@ Use this skill when the user asks to:
 - Add, list, update, or complete tasks
 - Check blockers or due dates
 - Extract actions from meeting notes
-- Sync completed daily items to weekly todos
+- Report completed daily items against weekly todos without changing canonical task state
 
 ## Quick Start
 
@@ -118,6 +118,7 @@ bash scripts/task-shortcuts.sh tasks     # quick priorities view
 ```bash
 python3 scripts/eod_sync.py --dry-run
 python3 scripts/eod_sync.py
+python3 scripts/eod_sync.py --apply   # legacy Weekly TODO checkbox write only
 python3 scripts/update_weekly_embeds.py --dry-run
 python3 scripts/update_weekly_embeds.py
 ```
@@ -144,6 +145,7 @@ Detailed docs moved to `references/`:
 
 ## Compatibility Notes
 
-- Existing scripts/commands are preserved; this is a docs structure refactor.
+- Active task mutations require canonical `task_id::` values; fallback IDs are diagnostics only.
+- `scripts/eod_sync.py` is report-only by default. `--apply` is a legacy Weekly TODO checkbox helper and does not complete canonical tasks.
 - Legacy file fallback (`TASK_TRACKER_LEGACY_FILE`) is still supported.
 - Migration guidance remains available in `references/migration.md`.

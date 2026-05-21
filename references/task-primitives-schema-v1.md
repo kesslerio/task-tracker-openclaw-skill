@@ -67,8 +67,8 @@ Pipeline order is deterministic:
 3. fuzzy match with threshold bands
 
 Threshold decision bands:
-- `score >= auto_threshold` -> `auto-link`
-- `review_threshold <= score < auto_threshold` -> `needs-review`
+- `score >= evidence_link threshold` -> `evidence-link`
+- `review_threshold <= score < evidence_link threshold` -> `needs-review`
 - `score < review_threshold` -> `no-match`
 
 ```json
@@ -80,13 +80,13 @@ Threshold decision bands:
     "path": "/tmp/done-log.md"
   },
   "thresholds": {
-    "auto_link": 0.9,
+    "evidence_link": 0.9,
     "needs_review": 0.7
   },
   "totals": {
     "input_lines": 3,
     "parsed_done_lines": 2,
-    "auto_linked": 1,
+    "evidence_linked": 1,
     "needs_review": 1,
     "no_match": 0
   },
@@ -104,12 +104,15 @@ Threshold decision bands:
         "priority": null,
         "due": null,
         "owner": null,
-        "goal": null
+        "goal": null,
+        "fallback_id": "fallback-abc123",
+        "missing_task_id": false,
+        "fallback_only": false
       },
       "match_metadata": {
         "matched_task_id": "A-1",
         "score": 1.0,
-        "decision": "auto-link",
+        "decision": "evidence-link",
         "match_type": "exact-id-or-link|normalized-title|fuzzy"
       }
     }

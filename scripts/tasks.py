@@ -24,12 +24,17 @@ from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).parent))
 from daily_notes import extract_completed_tasks
-from log_done import log_task_completed
 from standup_common import get_calendar_events, flatten_calendar_events
 import delegation
 from task_identity import audit_payload, print_json as print_identity_json
+from task_lines import remove_task_line
 from task_repair import repair_missing_ids
 from task_transitions import block_unsafe_query, complete_by_id, print_result
+from task_records import (
+    active_records,
+    record_to_task_dict,
+    task_records as build_task_records,
+)
 from utils import (
     detect_format,
     get_tasks_file,
@@ -37,14 +42,13 @@ from utils import (
     parse_tasks,
     load_tasks,
     check_due_date,
-    next_recurrence_date,
     get_current_quarter,
     ARCHIVE_DIR,
     get_objective_progress,
 )
 
 TASK_PRIMITIVES_SCHEMA_VERSION = "v1"
-FUZZY_AUTO_LINK_THRESHOLD = 0.90
+FUZZY_EVIDENCE_LINK_THRESHOLD = 0.90
 FUZZY_REVIEW_THRESHOLD = 0.70
 
 
@@ -192,42 +196,6 @@ def add_task(args):
         print(f"⚠️ Could not find section matching '{priority_pattern}'. Add manually.")
 
 
-def _remove_task_line(content: str, raw_line: str) -> str:
-    """Remove a task line and its child/continuation lines."""
-    lines = content.split('\n')
-    try:
-        target_index = lines.index(raw_line)
-    except ValueError:
-        return content
-
-    target_indent = len(raw_line) - len(raw_line.lstrip(' '))
-    remove_until = target_index + 1
-
-    while remove_until < len(lines):
-        line = lines[remove_until]
-
-        if line.strip() == '':
-            lookahead = remove_until + 1
-            while lookahead < len(lines) and lines[lookahead].strip() == '':
-                lookahead += 1
-
-            if lookahead < len(lines):
-                next_line = lines[lookahead]
-                next_indent = len(next_line) - len(next_line.lstrip(' '))
-                if next_indent > target_indent:
-                    remove_until += 1
-                    continue
-            break
-
-        indent = len(line) - len(line.lstrip(' '))
-        if indent > target_indent:
-            remove_until += 1
-            continue
-        break
-
-    return '\n'.join(lines[:target_index] + lines[remove_until:])
-
-
 def done_task(args):
     """Complete a task by canonical ID only."""
     query = args.query.strip()
@@ -351,10 +319,12 @@ def archive_done(args):
     removed = 0
     if stale_board and tasks_file.exists():
         board_content = tasks_file.read_text()
-        for task in stale_board:
+        for task in sorted(stale_board, key=lambda t: t.get('line_number') or 0, reverse=True):
             raw_line = task.get('raw_line', '')
-            if raw_line and raw_line in board_content:
-                board_content = _remove_task_line(board_content, raw_line)
+            line_number = task.get('line_number')
+            updated = remove_task_line(board_content, raw_line, line_number)
+            if updated is not None:
+                board_content = updated
                 removed += 1
         tasks_file.write_text(board_content)
 
@@ -449,20 +419,6 @@ def cmd_parking_lot(args):
             str(tasks_file.parent / 'Done Archive')
         ))
         print(drop_item(tasks_file, args.id, archive_dir=archive_dir))
-
-
-def _find_open_task(personal: bool, query: str) -> tuple[Path, dict | None, str]:
-    tasks_file, fmt = get_tasks_file(personal)
-    if not tasks_file.exists():
-        return tasks_file, None, f"❌ Tasks file not found: {tasks_file}"
-    content = tasks_file.read_text()
-    tasks_data = parse_tasks(content, personal, fmt)
-    matches = [t for t in tasks_data.get('all', []) if not t.get('done') and query.lower() in t.get('title', '').lower()]
-    if not matches:
-        return tasks_file, None, f"❌ No open task matches: {query}"
-    if len(matches) > 1:
-        return tasks_file, None, f"❌ Multiple matches for '{query}'. Be more specific."
-    return tasks_file, matches[0], ""
 
 
 def cmd_identity_audit(args):
@@ -674,6 +630,20 @@ def _safe_load_tasks(personal: bool = False) -> dict:
         return empty
 
 
+def _safe_load_task_records(personal: bool = False) -> list:
+    tasks_file, fmt = get_tasks_file(personal)
+    if not tasks_file.exists():
+        return []
+    try:
+        content = tasks_file.read_text()
+    except OSError:
+        return []
+    try:
+        return build_task_records(content, personal=personal, fmt=fmt)
+    except Exception:
+        return []
+
+
 def _normalize_title(title: str) -> str:
     lowered = (title or "").strip().casefold()
     lowered = re.sub(r"\[x\]|\[ \]|✅|☑️", " ", lowered)
@@ -681,13 +651,6 @@ def _normalize_title(title: str) -> str:
     lowered = re.sub(r"[^\w\s/-]", " ", lowered)
     lowered = re.sub(r"\s+", " ", lowered)
     return lowered.strip()
-
-
-def _slugify(value: str) -> str:
-    normalized = _normalize_title(value)
-    slug = re.sub(r"[^a-z0-9]+", "-", normalized)
-    slug = re.sub(r"-{2,}", "-", slug).strip("-")
-    return slug or "task"
 
 
 def _extract_inline_identifiers(text: str) -> dict[str, set[str]]:
@@ -717,49 +680,21 @@ def _extract_inline_identifiers(text: str) -> dict[str, set[str]]:
     return {"exact": exact_identifiers, "fallback": fallback_identifiers}
 
 
-def _task_identifier_bundle(task: dict, fallback_id: str) -> dict:
-    raw_line = str(task.get("raw_line") or "")
-    title = str(task.get("title") or "")
-    explicit_id = None
-    parsed_task_id = str(task.get("task_id") or "").strip()
-    parsed_legacy_id = str(task.get("legacy_id") or "").strip()
-    legacy_id_match = re.search(r"\bid::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$|[),.;!?])", raw_line, flags=re.IGNORECASE)
-    task_alias_match = re.search(r"\btask::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$|[),.;!?])", raw_line, flags=re.IGNORECASE)
-    if parsed_task_id:
-        explicit_id = parsed_task_id
-    elif parsed_legacy_id:
-        explicit_id = parsed_legacy_id
-    elif legacy_id_match:
-        explicit_id = legacy_id_match.group(1)
-    elif task_alias_match:
-        explicit_id = task_alias_match.group(1)
-
-    raw_identifiers = _extract_inline_identifiers(raw_line)
-    title_identifiers = _extract_inline_identifiers(title)
+def _record_identifier_bundle(record) -> dict:
+    raw_identifiers = _extract_inline_identifiers(record.raw_line)
+    title_identifiers = _extract_inline_identifiers(record.title)
     exact_identifiers = raw_identifiers["exact"] | title_identifiers["exact"]
     fallback_identifiers = raw_identifiers["fallback"] | title_identifiers["fallback"]
-    if explicit_id:
-        exact_identifiers.add(explicit_id.casefold())
-
+    if record.canonical_id:
+        exact_identifiers.add(record.canonical_id.casefold())
     return {
-        "task_id": explicit_id or fallback_id,
         "exact_identifiers": exact_identifiers,
         "fallback_identifiers": fallback_identifiers,
     }
 
 
-def _canonical_task(task: dict, task_id: str) -> dict:
-    return {
-        "task_id": task_id,
-        "title": task.get("title", ""),
-        "done": bool(task.get("done")),
-        "section": task.get("section"),
-        "area": task.get("area") or task.get("department") or "Uncategorized",
-        "priority": task.get("priority"),
-        "due": task.get("due"),
-        "owner": task.get("owner"),
-        "goal": task.get("goal"),
-    }
+def _canonical_record(record) -> dict:
+    return record_to_task_dict(record)
 
 
 def _group_tasks_by_area(tasks: list[dict]) -> dict[str, list[dict]]:
@@ -859,15 +794,14 @@ def _fuzzy_score(left: str, right: str) -> float:
     return SequenceMatcher(None, left, right).ratio()
 
 
-def _build_task_catalog(tasks_data: dict) -> list[dict]:
+def _build_task_catalog(records: list) -> list[dict]:
     catalog: list[dict] = []
-    for idx, task in enumerate(tasks_data.get("all", []), start=1):
-        fallback_id = f"{_slugify(task.get('title', 'task'))}-{idx:03d}"
-        bundle = _task_identifier_bundle(task, fallback_id=fallback_id)
-        canonical = _canonical_task(task, bundle["task_id"])
+    for record in records:
+        bundle = _record_identifier_bundle(record)
+        canonical = _canonical_record(record)
         catalog.append(
             {
-                "task": task,
+                "record": record,
                 "canonical": canonical,
                 "normalized_title": _normalize_title(canonical["title"]),
                 "exact_identifiers": bundle["exact_identifiers"],
@@ -877,31 +811,23 @@ def _build_task_catalog(tasks_data: dict) -> list[dict]:
     return catalog
 
 
-def _task_id_lookup(tasks_data: dict) -> dict[int, str]:
-    lookup: dict[int, str] = {}
-    for entry in _build_task_catalog(tasks_data):
-        lookup[id(entry["task"])] = entry["canonical"]["task_id"]
-    return lookup
-
-
-def _canonical_task_with_lookup(task: dict, task_ids: dict[int, str]) -> dict:
-    fallback_id = _slugify(task.get("title", ""))
-    return _canonical_task(task, task_ids.get(id(task), fallback_id))
-
-
 def _ingest_match_line(
     line: dict,
     catalog: list[dict],
     auto_threshold: float,
     review_threshold: float,
 ) -> dict:
+    def _sort_key(candidate: dict) -> str:
+        canonical = candidate["canonical"]
+        return canonical.get("task_id") or canonical.get("fallback_id") or canonical.get("title") or ""
+
     exact_matches = [
         candidate
         for candidate in catalog
         if line["exact_identifiers"] and (line["exact_identifiers"] & candidate["exact_identifiers"])
     ]
     if exact_matches:
-        chosen = sorted(exact_matches, key=lambda c: c["canonical"]["task_id"])[0]
+        chosen = sorted(exact_matches, key=_sort_key)[0]
         return {
             "raw_line": line["raw_line"],
             "parsed_title": line["title"],
@@ -910,7 +836,7 @@ def _ingest_match_line(
             "match_metadata": {
                 "matched_task_id": chosen["canonical"]["task_id"],
                 "score": 1.0,
-                "decision": "auto-link",
+                "decision": "evidence-link",
                 "match_type": "exact-id-or-link",
             },
         }
@@ -921,7 +847,7 @@ def _ingest_match_line(
         if line["fallback_identifiers"] and (line["fallback_identifiers"] & candidate["fallback_identifiers"])
     ]
     if fallback_matches:
-        chosen = sorted(fallback_matches, key=lambda c: c["canonical"]["task_id"])[0]
+        chosen = sorted(fallback_matches, key=_sort_key)[0]
         return {
             "raw_line": line["raw_line"],
             "parsed_title": line["title"],
@@ -939,7 +865,7 @@ def _ingest_match_line(
         candidate for candidate in catalog if candidate["normalized_title"] == line["normalized_title"]
     ]
     if exact_title_matches:
-        chosen = sorted(exact_title_matches, key=lambda c: c["canonical"]["task_id"])[0]
+        chosen = sorted(exact_title_matches, key=_sort_key)[0]
         return {
             "raw_line": line["raw_line"],
             "parsed_title": line["title"],
@@ -948,7 +874,7 @@ def _ingest_match_line(
             "match_metadata": {
                 "matched_task_id": chosen["canonical"]["task_id"],
                 "score": 1.0,
-                "decision": "auto-link",
+                "decision": "evidence-link",
                 "match_type": "normalized-title",
             },
         }
@@ -956,13 +882,13 @@ def _ingest_match_line(
     scored = []
     for candidate in catalog:
         score = _fuzzy_score(line["normalized_title"], candidate["normalized_title"])
-        scored.append((score, candidate["canonical"]["task_id"], candidate))
+        scored.append((score, _sort_key(candidate), candidate))
     scored.sort(key=lambda item: (-item[0], item[1]))
     best_score, _, best = scored[0] if scored else (0.0, "", None)
 
     decision = "no-match"
     if best and best_score >= auto_threshold:
-        decision = "auto-link"
+        decision = "evidence-link"
     elif best and best_score >= review_threshold:
         decision = "needs-review"
 
@@ -982,7 +908,7 @@ def _ingest_match_line(
 
 def cmd_standup_summary(args):
     tasks_data = _safe_load_tasks(args.personal)
-    task_ids = _task_id_lookup(tasks_data)
+    records = _safe_load_task_records(args.personal)
     today = datetime.now().date()
 
     notes_dir_raw = os.getenv("TASK_TRACKER_DAILY_NOTES_DIR")
@@ -1009,34 +935,35 @@ def cmd_standup_summary(args):
             for task in tasks_data.get("done", [])
         ]
 
-    dos_raw = [
-        task
-        for task in tasks_data.get("all", [])
-        if not task.get("done") and task.get("section") in {"q1", "q2", "today"}
-    ]
-    dos = [_canonical_task_with_lookup(task, task_ids) for task in dos_raw]
+    active = active_records(records)
+    dos_records = [record for record in active if record.section in {"q1", "q2", "today"}]
+    dos = [_canonical_record(record) for record in dos_records]
 
-    overdue_raw = []
-    for task in tasks_data.get("all", []):
-        if task.get("done") or not task.get("due"):
+    overdue_records = []
+    for record in active:
+        if not record.due:
             continue
         try:
-            due_date = datetime.strptime(task.get("due"), "%Y-%m-%d").date()
+            due_date = datetime.strptime(record.due, "%Y-%m-%d").date()
         except ValueError:
             continue
         if due_date < today:
-            overdue_raw.append(task)
-    overdue = [_canonical_task_with_lookup(task, task_ids) for task in overdue_raw]
+            overdue_records.append(record)
+    overdue = [_canonical_record(record) for record in overdue_records]
 
     carryover_suggestions = []
-    for task in overdue_raw:
+    for record in overdue_records:
         carryover_suggestions.append(
             {
-                "title": task.get("title", ""),
+                "task_id": record.canonical_id,
+                "fallback_id": record.fallback_id,
+                "missing_task_id": record.missing_task_id,
+                "fallback_only": record.fallback_only,
+                "title": record.title,
                 "reason": "overdue",
                 "suggestion": "carry-to-today",
-                "due": task.get("due"),
-                "area": task.get("area") or task.get("department") or "Uncategorized",
+                "due": record.due,
+                "area": record.area or record.department or "Uncategorized",
             }
         )
 
@@ -1068,7 +995,7 @@ def cmd_weekly_review_summary(args):
         sys.exit(2)
 
     tasks_data = _safe_load_tasks(args.personal)
-    task_ids = _task_id_lookup(tasks_data)
+    records = _safe_load_task_records(args.personal)
     notes_dir_raw = os.getenv("TASK_TRACKER_DAILY_NOTES_DIR")
 
     done_items: list[dict] = []
@@ -1099,15 +1026,31 @@ def cmd_weekly_review_summary(args):
             except ValueError:
                 continue
             if start_date <= completed_date <= end_date:
-                row = _canonical_task_with_lookup(task, task_ids)
+                matching = [
+                    record for record in records
+                    if record.line_number == task.get("line_number")
+                    and record.raw_line == task.get("raw_line")
+                ]
+                row = _canonical_record(matching[0]) if matching else {
+                    "task_id": task.get("task_id") or task.get("legacy_id"),
+                    "fallback_id": None,
+                    "missing_task_id": task.get("task_id") is None,
+                    "fallback_only": not (task.get("task_id") or task.get("legacy_id")),
+                    "title": task.get("title", ""),
+                    "done": bool(task.get("done")),
+                    "section": task.get("section"),
+                    "area": task.get("area") or task.get("department") or "Uncategorized",
+                    "priority": task.get("priority"),
+                    "due": task.get("due"),
+                    "owner": task.get("owner"),
+                    "goal": task.get("goal"),
+                }
                 row["completed_date"] = completed
                 done_items.append(row)
 
     do_items = []
-    for task in tasks_data.get("all", []):
-        if task.get("done"):
-            continue
-        due_raw = task.get("due")
+    for record in active_records(records):
+        due_raw = record.due
         if due_raw:
             try:
                 due_date = datetime.strptime(due_raw, "%Y-%m-%d").date()
@@ -1115,7 +1058,36 @@ def cmd_weekly_review_summary(args):
                 continue
             if due_date < start_date or due_date > end_date:
                 continue
-        do_items.append(_canonical_task_with_lookup(task, task_ids))
+        do_items.append(_canonical_record(record))
+
+    if not records:
+        for task in tasks_data.get("all", []):
+            if task.get("done"):
+                continue
+            due_raw = task.get("due")
+            if due_raw:
+                try:
+                    due_date = datetime.strptime(due_raw, "%Y-%m-%d").date()
+                except ValueError:
+                    continue
+                if due_date < start_date or due_date > end_date:
+                    continue
+            do_items.append(
+                {
+                    "task_id": task.get("task_id") or task.get("legacy_id"),
+                    "fallback_id": None,
+                    "missing_task_id": task.get("task_id") is None,
+                    "fallback_only": not (task.get("task_id") or task.get("legacy_id")),
+                    "title": task.get("title", ""),
+                    "done": False,
+                    "section": task.get("section"),
+                    "area": task.get("area") or task.get("department") or "Uncategorized",
+                    "priority": task.get("priority"),
+                    "due": task.get("due"),
+                    "owner": task.get("owner"),
+                    "goal": task.get("goal"),
+                }
+            )
 
     payload = _new_schema("weekly-review-summary")
     payload.update(
@@ -1165,8 +1137,8 @@ def cmd_ingest_daily_log(args):
         source = {"type": "stdin"}
 
     parsed_lines = _extract_done_lines(source_content)
-    tasks_data = _safe_load_tasks(args.personal)
-    catalog = _build_task_catalog(tasks_data)
+    records = _safe_load_task_records(args.personal)
+    catalog = _build_task_catalog(records)
     auto_threshold = float(args.auto_threshold)
     review_threshold = float(args.review_threshold)
     if review_threshold > auto_threshold:
@@ -1178,7 +1150,7 @@ def cmd_ingest_daily_log(args):
         for line in parsed_lines
     ]
 
-    counts = {"auto-link": 0, "needs-review": 0, "no-match": 0}
+    counts = {"evidence-link": 0, "needs-review": 0, "no-match": 0}
     for item in matched:
         counts[item["match_metadata"]["decision"]] += 1
 
@@ -1187,13 +1159,13 @@ def cmd_ingest_daily_log(args):
         {
             "source": source,
             "thresholds": {
-                "auto_link": auto_threshold,
+                "evidence_link": auto_threshold,
                 "needs_review": review_threshold,
             },
             "totals": {
                 "input_lines": len(source_content.splitlines()),
                 "parsed_done_lines": len(parsed_lines),
-                "auto_linked": counts["auto-link"],
+                "evidence_linked": counts["evidence-link"],
                 "needs_review": counts["needs-review"],
                 "no_match": counts["no-match"],
             },
@@ -1215,14 +1187,14 @@ def cmd_calendar_sync_primitive(args):
         warnings.append("calendar-events-unavailable")
 
     try:
-        tasks_data = _safe_load_tasks(args.personal)
-        for task in tasks_data.get("all", []):
-            raw = str(task.get("raw_line") or "")
+        records = _safe_load_task_records(args.personal)
+        for record in records:
+            raw = record.raw_line
             if "meeting::" not in raw:
                 continue
             raw_l = raw.lower()
             status = "scheduled"
-            if task.get("done") or "status::done" in raw_l:
+            if record.done or "status::done" in raw_l:
                 status = "done"
             elif "status::canceled" in raw_l:
                 status = "canceled"
@@ -1231,10 +1203,13 @@ def cmd_calendar_sync_primitive(args):
 
             meetings.append(
                 {
-                    "task_id": _task_identifier_bundle(task, _slugify(task.get("title", "")))["task_id"],
-                    "title": task.get("title", ""),
+                    "task_id": record.canonical_id,
+                    "fallback_id": record.fallback_id,
+                    "missing_task_id": record.missing_task_id,
+                    "fallback_only": record.fallback_only,
+                    "title": record.title,
                     "status": status,
-                    "classification": _calendar_classification(task),
+                    "classification": _calendar_classification(record_to_task_dict(record)),
                 }
             )
     except Exception:
@@ -1393,14 +1368,14 @@ def main():
 
     ingest_daily_log_parser = subparsers.add_parser(
         'ingest-daily-log',
-        help='Ingest done lines and map to canonical tasks',
+        help='Report done-line evidence links for canonical tasks',
     )
     ingest_daily_log_parser.add_argument('--file', help='Input log file; default is stdin')
     ingest_daily_log_parser.add_argument(
         '--auto-threshold',
         type=float,
-        default=FUZZY_AUTO_LINK_THRESHOLD,
-        help='Fuzzy score threshold for auto-linking',
+        default=FUZZY_EVIDENCE_LINK_THRESHOLD,
+        help='Fuzzy score threshold for evidence-link suggestions',
     )
     ingest_daily_log_parser.add_argument(
         '--review-threshold',

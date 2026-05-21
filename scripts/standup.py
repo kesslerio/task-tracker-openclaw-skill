@@ -20,6 +20,7 @@ from standup_common import (
     get_calendar_events,
     resolve_standup_date,
 )
+from task_records import fallback_id_for
 from utils import (
     load_tasks,
     get_missed_tasks_bucketed,
@@ -43,6 +44,23 @@ def group_by_area(tasks):
             areas[area] = []
         areas[area].append(t)
     return areas
+
+
+def _identity_fields(task: dict) -> dict:
+    raw_line = str(task.get("raw_line") or "")
+    line_number = task.get("line_number")
+    try:
+        line_number_int = int(line_number) if line_number else None
+    except (TypeError, ValueError):
+        line_number_int = None
+    task_id = task.get("task_id") or task.get("legacy_id")
+    fallback_id = fallback_id_for(raw_line, line_number_int) if raw_line else None
+    return {
+        "task_id": task_id,
+        "fallback_id": fallback_id,
+        "missing_task_id": task.get("task_id") is None,
+        "fallback_only": task_id is None,
+    }
 
 
 def format_split_standup(output: dict, date_display: str) -> list:
@@ -201,13 +219,23 @@ def build_compact_standup_sections(output: dict) -> dict:
     """Compact standup payload schema v1 for automation clients."""
     done = [t.get('title', '') for t in (output.get('completed') or [])[:12]]
     calendar_dos = [
-        {"quick_id": f"c{idx}", "title": t.get('title', ''), "status": "scheduled"}
+        {
+            "quick_id": f"c{idx}",
+            "title": t.get('title', ''),
+            "status": "scheduled",
+            **_identity_fields(t),
+        }
         for idx, t in enumerate(output.get('due_today') or [], start=1)
     ]
 
     completed = output.get('completed') or []
     calendar_dones = [
-        {"quick_id": f"cd{idx}", "title": t.get('title', ''), "status": "done"}
+        {
+            "quick_id": f"cd{idx}",
+            "title": t.get('title', ''),
+            "status": "done",
+            **_identity_fields(t),
+        }
         for idx, t in enumerate(
             [
                 t for t in completed
@@ -224,7 +252,14 @@ def build_compact_standup_sections(output: dict) -> dict:
         + [("q3", t) for t in (output.get('q3') or [])]
     )
     for idx, (section, t) in enumerate(stack[:20], start=1):
-        dos.append({"quick_id": f"d{idx}", "title": t.get('title', ''), "section": section})
+        dos.append(
+            {
+                "quick_id": f"d{idx}",
+                "title": t.get('title', ''),
+                "section": section,
+                **_identity_fields(t),
+            }
+        )
 
     return {
         "schema_version": "1",

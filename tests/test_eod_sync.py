@@ -1,9 +1,10 @@
-"""Tests for eod_sync.py — EOD completion auto-sync."""
+"""Tests for eod_sync.py — EOD completion evidence reporting."""
 
 from __future__ import annotations
 
 import sys
 import os
+import subprocess
 from pathlib import Path
 from datetime import date
 
@@ -200,9 +201,9 @@ DONE_ITEMS_SAMPLE = [
 
 
 class TestBuildSyncPlan:
-    def test_auto_syncs_high_confidence(self):
+    def test_reports_high_confidence_evidence(self):
         plan = sync.build_sync_plan(DONE_ITEMS_SAMPLE, OPEN_TASKS_SAMPLE, "2026-02-19")
-        synced = [r for r in plan if r["status"] == "sync"]
+        synced = [r for r in plan if r["status"] == "evidence"]
         assert len(synced) == 2
 
     def test_skips_no_match(self):
@@ -218,7 +219,7 @@ class TestBuildSyncPlan:
             "- [x] KPMG audit — prep + send ✅ 2026-02-19",  # very similar
         ]
         plan = sync.build_sync_plan(done_items, OPEN_TASKS_SAMPLE, "2026-02-19")
-        synced = [r for r in plan if r["status"] == "sync"]
+        synced = [r for r in plan if r["status"] == "evidence"]
         # The KPMG task should only match once
         kpmg_matched_indices = {r["match"]["line_idx"] for r in synced if r["match"] is not None}
         assert len(kpmg_matched_indices) <= len(synced), "Duplicate match detected"
@@ -290,3 +291,59 @@ class TestApplySyncPlan:
         original_line = lines[0]
         sync.apply_sync_plan(lines, plan, "2026-02-19")
         assert lines[0] == original_line  # original not mutated
+
+
+def test_cli_default_is_report_only(tmp_path):
+    daily_dir = tmp_path / "daily"
+    daily_dir.mkdir()
+    (daily_dir / "2026-02-19.md").write_text(DAILY_NOTE_PLAIN_DONE)
+    weekly = tmp_path / "Weekly TODOs.md"
+    original = """# Weekly TODOs
+
+- [ ] KPMG audit package — prep + send 📅 2026-02-19 🔺
+"""
+    weekly.write_text(original)
+
+    env = os.environ.copy()
+    env["TASK_TRACKER_DAILY_NOTES_DIR"] = str(daily_dir)
+    env["TASK_TRACKER_WEEKLY_TODOS"] = str(weekly)
+
+    proc = subprocess.run(
+        ["python3", "scripts/eod_sync.py", "--date", "2026-02-19"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 0
+    assert "Report-only mode" in proc.stdout
+    assert weekly.read_text() == original
+
+
+def test_cli_dry_run_wins_over_apply(tmp_path):
+    daily_dir = tmp_path / "daily"
+    daily_dir.mkdir()
+    (daily_dir / "2026-02-19.md").write_text(DAILY_NOTE_PLAIN_DONE)
+    weekly = tmp_path / "Weekly TODOs.md"
+    original = """# Weekly TODOs
+
+- [ ] KPMG audit package — prep + send 📅 2026-02-19 🔺
+"""
+    weekly.write_text(original)
+
+    env = os.environ.copy()
+    env["TASK_TRACKER_DAILY_NOTES_DIR"] = str(daily_dir)
+    env["TASK_TRACKER_WEEKLY_TODOS"] = str(weekly)
+
+    proc = subprocess.run(
+        ["python3", "scripts/eod_sync.py", "--date", "2026-02-19", "--apply", "--dry-run"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 0
+    assert "Dry-run mode" in proc.stdout
+    assert weekly.read_text() == original
