@@ -11,6 +11,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+from candidate_review import candidate_review_summary
 from daily_notes import extract_completed_actions, extract_completed_tasks
 from task_lines import remove_task_line
 from utils import (
@@ -322,6 +323,31 @@ def flatten_missed_buckets(missed_buckets: dict) -> list[dict]:
     return tasks
 
 
+def append_candidate_review_section(lines: list[str], limit: int = 5) -> None:
+    lines.append("")
+    lines.append("🧾 **Completion Candidates**")
+    summary = candidate_review_summary(limit=limit)
+    if not summary.get("available"):
+        error = summary.get("error") or {}
+        lines.append(f"  Review unavailable: {error.get('code', 'unknown-error')}.")
+        for item in (error.get("malformed") or [])[:3]:
+            lines.append(f"  • {item.get('path')}:{item.get('line_number')} {item.get('message')}")
+        return
+
+    if not summary.get("total"):
+        lines.append("  No active completion candidates.")
+        return
+
+    lines.append(f"  {summary.get('total', 0)} candidate(s) need review.")
+    for candidate in summary.get("items", []):
+        task_hint = candidate.get("confirmable_task_id") or candidate.get("suggested_task_id")
+        suffix = f" -> {task_hint}" if task_hint else ""
+        lines.append(f"  • {candidate.get('candidate_id')}: {candidate.get('summary')}{suffix}")
+    if summary.get("overflow"):
+        lines.append(f"  • ... and {summary['overflow']} more")
+    lines.append("  Review required; do not auto-complete from this summary.")
+
+
 def format_overdue(task: dict, reference_date: date) -> str:
     """Return overdue label for a task."""
     due_date = parse_due_date(task.get('due'))
@@ -495,6 +521,8 @@ def generate_weekly_review(week: str | None = None, archive: bool = False) -> st
         tasks_data, week_start, week_end, ARCHIVE_DIR, notes_dir=notes_dir,
     )
     lines.extend(velocity_lines)
+
+    append_candidate_review_section(lines)
 
     # Archive if requested
     if archive and done_tasks:

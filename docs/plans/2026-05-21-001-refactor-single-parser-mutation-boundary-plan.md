@@ -56,7 +56,11 @@ That means 108A made the core safer, but the surrounding workflow code can still
 ### Deferred to Follow-Up Work
 
 - PR #108C: evidence inbox that creates suggestions only and applies confirmed items through ID-only `done`.
-- Later workflow PR: wire Lobster standup, Telegram DONEs, weekly review, and cron flows to canonical IDs.
+- PR #108D: workflow-consumption wiring after the evidence inbox, including
+  shared evidence matching, clearer candidate JSON confirmability, and
+  standup/EOD/Telegram/Lobster surfaces over existing inbox commands.
+- Later ingestion PR: add Gmail, calendar, session-log, and other noisy evidence
+  sources only after 108D proves the review/confirm workflow.
 - Later UX PR: capped daily/EOD decision briefs, stale-task audits, freeze box, and proactive completion prompts.
 - Later product slice: backlog/delegation/frozen states with a real state-transition contract.
 
@@ -411,7 +415,11 @@ The important boundary is that read surfaces may consume fallback diagnostics, b
 - **Agent behavior:** Agents get one canonical ID field to carry through standup, weekly review, and direct DONE commands.
 - **Workflow safety:** EOD and daily-log parsing stop competing with the ID-only kernel.
 - **Compatibility:** Existing read/report commands should keep broadly similar output, but unsafe default write behavior may be blocked or moved behind explicit legacy flags.
-- **Future sequencing:** 108C can build an evidence inbox on top of shared records instead of inheriting current fuzzy write ambiguity.
+- **Future sequencing:** 108C can build an evidence inbox on top of shared
+  records instead of inheriting current fuzzy write ambiguity. Post-108C, 108D
+  should extract the evidence matcher from private `tasks.py` helpers, clarify
+  candidate JSON confirmability, and wire standup/EOD/Telegram/Lobster surfaces
+  over existing inbox commands before adding Gmail/calendar/session ingestion.
 
 ---
 
@@ -438,6 +446,9 @@ The important boundary is that read surfaces may consume fallback diagnostics, b
 6. Make EOD/daily-log fuzzy matching report-only by default.
 7. Update docs/help and run the full local verification suite.
 8. Follow up with 108B hardening before 108C: malformed ledger reporting, completion rollback hardening, and weekly archive cleanup through shared line helpers.
+9. Follow up with 108D workflow consumption before noisy source ingestion:
+   matcher extraction, candidate JSON clarity, standup/EOD candidate visibility,
+   and Telegram/Lobster inbox controls.
 
 ---
 
@@ -466,4 +477,5 @@ The important boundary is that read surfaces may consume fallback diagnostics, b
 - `lobster-workflows:docs/brainstorms/2026-05-20-task-tracker-vnext-requirements.md`
 - `lobster-workflows:docs/debug/2026-05-20-task-tracker-ux-failures.md`
 - `lobster-workflows:docs/ideation/2026-05-20-task-tracker-radical-simplification-ideas.md`
+- `docs/plans/2026-05-21-004-feat-inbox-workflow-consumption-plan.md`
 - Oracle architecture review pasted in the planning conversation on 2026-05-20

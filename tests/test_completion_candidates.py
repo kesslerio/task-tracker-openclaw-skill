@@ -118,6 +118,11 @@ def test_title_candidate_requires_explicit_task_id_before_confirmation(tmp_path)
     env = _env(tmp_path, work)
     scan = _scan_file(tmp_path, env, "- Ship alpha milestone\n")
     candidate_id = _candidate_id(scan)
+    candidate = scan["created"][0]
+
+    assert "confirmable_task_id" not in candidate
+    assert candidate["suggested_match"]["task_id"] == "tsk_ship"
+    assert candidate["review_required"] is True
 
     blocked = _run(["completion-candidates", "confirm", candidate_id], env)
     blocked_payload = _payload(blocked)
@@ -145,6 +150,10 @@ def test_exact_canonical_id_candidate_can_confirm_without_extra_task_id(tmp_path
     work = _write_work_file(tmp_path)
     env = _env(tmp_path, work)
     scan = _scan_file(tmp_path, env, "- Fixed login timeout task_id::tsk_login\n")
+    candidate = scan["created"][0]
+
+    assert candidate["confirmable_task_id"] == "tsk_login"
+    assert candidate["review_required"] is False
 
     proc = _run(["completion-candidates", "confirm", _candidate_id(scan)], env)
     payload = _payload(proc)
@@ -152,6 +161,48 @@ def test_exact_canonical_id_candidate_can_confirm_without_extra_task_id(tmp_path
     assert proc.returncode == 0
     assert payload["ok"] is True
     assert payload["candidate"]["status"] == "confirmed"
+    assert "Fix login timeout" not in work.read_text()
+
+
+def test_legacy_exact_candidate_projects_confirmable_task_id(tmp_path):
+    work = _write_work_file(tmp_path)
+    env = _env(tmp_path, work)
+    candidate_id = "cand_legacy_exact"
+    legacy_event = {
+        "event_id": "evt_legacy",
+        "event_type": "candidate_seen",
+        "timestamp": "2026-05-21T00:00:00+00:00",
+        "actor": "task-tracker",
+        "source": "completion_candidate_scan",
+        "task_id": candidate_id,
+        "previous_state": None,
+        "next_state": None,
+        "reason": None,
+        "evidence": None,
+        "metadata": {
+            "candidate": {
+                "candidate_id": candidate_id,
+                "status": "new",
+                "source": {"type": "file", "path": "/tmp/legacy.md"},
+                "summary": "Fix login timeout task_id::tsk_login",
+                "matched_task_id": "tsk_login",
+                "match_metadata": {
+                    "matched_task_id": "tsk_login",
+                    "match_type": "exact-id-or-link",
+                    "decision": "evidence-link",
+                    "score": 1.0,
+                },
+            }
+        },
+    }
+    (tmp_path / "events.jsonl").write_text(json.dumps(legacy_event) + "\n")
+
+    shown = _payload(_run(["completion-candidates", "show", candidate_id], env))
+    confirmed = _run(["completion-candidates", "confirm", candidate_id], env)
+
+    assert shown["candidate"]["confirmable_task_id"] == "tsk_login"
+    assert shown["candidate"]["review_required"] is False
+    assert confirmed.returncode == 0
     assert "Fix login timeout" not in work.read_text()
 
 
@@ -166,6 +217,10 @@ def test_fallback_only_candidate_cannot_confirm_without_supplied_canonical_id(tm
     )
     env = _env(tmp_path, work)
     scan = _scan_file(tmp_path, env, "- Legacy title only\n")
+    candidate = scan["created"][0]
+
+    assert "confirmable_task_id" not in candidate
+    assert candidate["review_required"] is True
 
     proc = _run(["completion-candidates", "confirm", _candidate_id(scan)], env)
     payload = _payload(proc)
@@ -393,3 +448,87 @@ def test_scan_daily_note_uses_configured_notes_directory(tmp_path):
     assert proc.returncode == 0
     assert payload["totals"]["created"] == 1
     assert payload["created"][0]["source"]["type"] == "daily_note"
+
+
+def test_workflow_control_wrapper_delegates_candidate_decisions(tmp_path):
+    work = _write_work_file(tmp_path)
+    env = _env(tmp_path, work)
+    scan = _scan_file(tmp_path, env, "- Ship alpha milestone\n")
+    candidate_id = _candidate_id(scan)
+
+    listed = subprocess.run(
+        ["python3", "scripts/completion_inbox_control.py", "list"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    blocked = subprocess.run(
+        ["python3", "scripts/completion_inbox_control.py", "confirm", candidate_id],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    confirmed = subprocess.run(
+        [
+            "python3",
+            "scripts/completion_inbox_control.py",
+            "confirm",
+            candidate_id,
+            "--task-id",
+            "tsk_ship",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert listed.returncode == 0
+    assert json.loads(listed.stdout)["total"] == 1
+    assert blocked.returncode == 2
+    assert json.loads(blocked.stdout)["error"]["code"] == "explicit-task-id-required"
+    assert confirmed.returncode == 0
+    assert json.loads(confirmed.stdout)["ok"] is True
+    assert "Ship alpha milestone" not in work.read_text()
+
+
+def test_standalone_workflow_scripts_surface_candidates_without_mutation(tmp_path):
+    work = _write_work_file(tmp_path)
+    env = _env(tmp_path, work)
+    env["EOD_DAILY_DIR"] = str(tmp_path / "daily")
+    env["EOD_OUTPUT_DIR"] = str(tmp_path / "reports")
+    original = work.read_text()
+    scan = _scan_file(tmp_path, env, "- Ship alpha milestone\n")
+    candidate_id = _candidate_id(scan)
+
+    standup = subprocess.run(
+        ["python3", "scripts/standup.py", "--compact-json", "--skip-missed"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    eod = subprocess.run(
+        ["python3", "scripts/eod_review.py", "--json"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    weekly = subprocess.run(
+        ["python3", "scripts/weekly_review.py"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert standup.returncode == 0
+    assert eod.returncode == 0
+    assert weekly.returncode == 0
+    assert json.loads(standup.stdout)["completion_candidates"]["items"][0]["candidate_id"] == candidate_id
+    assert json.loads(eod.stdout)["completion_candidates"]["items"][0]["candidate_id"] == candidate_id
+    assert candidate_id in weekly.stdout
+    assert work.read_text() == original

@@ -24,6 +24,7 @@ def _env(tmp_path, work):
     env = os.environ.copy()
     env["TASK_TRACKER_WORK_FILE"] = str(work)
     env["TASK_TRACKER_DAILY_NOTES_DIR"] = str(tmp_path)
+    env["TASK_TRACKER_LEDGER_FILE"] = str(tmp_path / "events.jsonl")
     env["STANDUP_CALENDARS"] = "{}"
     return env
 
@@ -76,6 +77,7 @@ def test_primitive_schema_shape(tmp_path):
     assert "dos" in standup_payload
     assert "overdue" in standup_payload
     assert "carryover_suggestions" in standup_payload
+    assert "completion_candidates" in standup_payload
 
     week_start = date.today() - timedelta(days=date.today().weekday())
     week_end = week_start + timedelta(days=6)
@@ -102,6 +104,7 @@ def test_primitive_schema_shape(tmp_path):
     assert "DO" in weekly_payload
     assert "by_area" in weekly_payload["DONE"]
     assert "by_category" in weekly_payload["DO"]
+    assert "completion_candidates" in weekly_payload
 
     cal = subprocess.run(
         ["python3", "scripts/tasks.py", "calendar-sync"],
@@ -143,6 +146,45 @@ def test_ingest_daily_log_plain_bullets_and_exact_matching(tmp_path):
     assert payload["items"][0]["match_metadata"]["decision"] == "evidence-link"
     assert payload["items"][0]["match_metadata"]["match_type"] in {"normalized-title", "exact-id-or-link"}
     assert payload["items"][1]["match_metadata"]["match_type"] == "exact-id-or-link"
+
+
+def test_primitive_summaries_include_completion_candidate_review_queue(tmp_path):
+    work = _write_work_file(tmp_path)
+    env = _env(tmp_path, work)
+    scan = subprocess.run(
+        ["python3", "scripts/tasks.py", "completion-candidates", "scan"],
+        input="- Ship alpha milestone\n",
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert scan.returncode == 0
+
+    standup = subprocess.run(
+        ["python3", "scripts/tasks.py", "standup-summary"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    weekly = subprocess.run(
+        ["python3", "scripts/tasks.py", "weekly-review-summary"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert standup.returncode == 0
+    assert weekly.returncode == 0
+    standup_candidates = json.loads(standup.stdout)["completion_candidates"]
+    weekly_candidates = json.loads(weekly.stdout)["completion_candidates"]
+    assert standup_candidates["total"] == 1
+    assert weekly_candidates["total"] == 1
+    assert standup_candidates["items"][0]["candidate_id"].startswith("cand_")
+    assert standup_candidates["items"][0]["suggested_task_id"] == "A-1"
+    assert standup_candidates["items"][0]["review_required"] is True
 
 
 def test_ingest_daily_log_checkbox_and_fuzzy_threshold_bands(tmp_path):

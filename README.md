@@ -56,6 +56,14 @@ Completion evidence candidates are suggestions stored in the ledger. Scanning
 daily-log/EOD-style evidence never changes active tasks. Candidate confirmation
 uses the same canonical-ID completion path as `tasks.py done`.
 
+Candidate JSON distinguishes direct confirmation from suggestions:
+`confirmable_task_id` appears only for exact canonical ID/link evidence.
+Title, fuzzy, fallback, and normalized-title evidence expose `suggested_match`
+and still require an explicit canonical `--task-id`. Standup, EOD, weekly, and
+workflow-control surfaces may show candidate counts and IDs, but they must not
+auto-complete tasks. Gmail, calendar, and session-log evidence ingestion remains
+deferred.
+
 ## Development
 
 ```bash

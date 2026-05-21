@@ -174,6 +174,8 @@ persisted as candidates.
       "summary": "Ship alpha milestone task_id::tsk_ship",
       "normalized_summary": "ship alpha milestone task id tsk_ship",
       "matched_task_id": "tsk_ship",
+      "confirmable_task_id": "tsk_ship",
+      "review_required": false,
       "suggested_match": {
         "task_id": "tsk_ship",
         "title": "Ship alpha milestone",
@@ -204,9 +206,16 @@ Decision commands use the same envelope with command names such as
 Confirmation rules:
 
 - exact `task_id::` or exact link evidence may confirm without `--task-id`
+- `confirmable_task_id` is present only for exact canonical ID/link evidence
 - title, fuzzy, issue-number fallback, and fallback-only matches require
   explicit `--task-id`
+- non-exact evidence may include `suggested_match`, but workflows must treat it
+  as review-required
 - confirmation calls the canonical ID-only completion path and writes a
   `candidate_confirmed` event only after task completion succeeds
 - failed application writes `candidate_apply_failed` and leaves the candidate
   retryable
+
+Workflow wrappers should use `scripts/completion_inbox_control.py` or the
+`completion-candidates` command group. These wrappers review and decide existing
+candidates only; Gmail, calendar, and session-log ingestion remain deferred.

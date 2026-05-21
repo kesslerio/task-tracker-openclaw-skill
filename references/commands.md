@@ -97,6 +97,9 @@ python3 scripts/tasks.py completion-candidates reject cand_example \
   --reason "not actually done"
 python3 scripts/tasks.py completion-candidates duplicate cand_example --of cand_original
 python3 scripts/tasks.py completion-candidates snooze cand_example --until 2026-05-28
+python3 scripts/completion_inbox_control.py list
+python3 scripts/completion_inbox_control.py show cand_example
+python3 scripts/completion_inbox_control.py confirm cand_example --task-id tsk_example
 ```
 
 Scanning creates durable candidate events in the ledger, but never mutates the
@@ -104,6 +107,13 @@ task board or completion log. Confirmation is the only task-changing candidate
 action, and it completes through the same canonical-ID `done` path. Exact
 `task_id::` evidence can confirm directly; title, fuzzy, and fallback-only
 suggestions require `--task-id`.
+
+Candidate JSON uses `confirmable_task_id` only for exact canonical ID/link
+evidence that may be confirmed without an extra task selector. Title, fuzzy,
+fallback, and normalized-title evidence should be treated as `suggested_match`
+only. `completion_inbox_control.py` is the stable workflow-control wrapper for
+Telegram, Lobster, and similar shells; it delegates to the same inbox decision
+paths and does not scan new Gmail, calendar, or session-log evidence.
 
 ## Wrapper shortcuts
 

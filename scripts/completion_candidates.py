@@ -9,6 +9,14 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+from evidence_matching import (
+    FUZZY_EVIDENCE_LINK_THRESHOLD,
+    FUZZY_REVIEW_THRESHOLD,
+    build_task_catalog,
+    extract_done_lines,
+    match_evidence_line,
+    safe_load_task_records,
+)
 from task_ledger import append_event, ledger_path, new_event, read_events
 from task_transitions import complete_by_id
 from utils import get_tasks_file
@@ -56,6 +64,13 @@ def _candidate_from_seen(event: dict[str, Any]) -> dict[str, Any]:
     candidate.setdefault("candidate_id", event.get("task_id"))
     candidate.setdefault("status", "new")
     candidate.setdefault("history", [])
+    match_metadata = candidate.get("match_metadata") or {}
+    matched_task_id = candidate.get("matched_task_id") or match_metadata.get("matched_task_id")
+    if match_metadata.get("match_type") == "exact-id-or-link" and matched_task_id:
+        candidate.setdefault("confirmable_task_id", matched_task_id)
+        candidate.setdefault("review_required", False)
+    else:
+        candidate.setdefault("review_required", True)
     return candidate
 
 
@@ -147,7 +162,9 @@ def _build_candidate_from_match(item: dict[str, Any], source: dict[str, Any]) ->
     candidate_id = candidate_id_for(source_pointer, summary)
     match_metadata = dict(item.get("match_metadata") or {})
     canonical_task = item.get("canonical_task")
-    return {
+    matched_task_id = match_metadata.get("matched_task_id")
+    is_confirmable = match_metadata.get("match_type") == "exact-id-or-link" and bool(matched_task_id)
+    candidate = {
         "candidate_id": candidate_id,
         "status": "new",
         "source": source_pointer,
@@ -156,8 +173,12 @@ def _build_candidate_from_match(item: dict[str, Any], source: dict[str, Any]) ->
         "normalized_summary": item.get("normalized_title") or _normalize_summary(summary),
         "suggested_match": canonical_task,
         "match_metadata": match_metadata,
-        "matched_task_id": match_metadata.get("matched_task_id"),
+        "matched_task_id": matched_task_id,
+        "review_required": not is_confirmable,
     }
+    if is_confirmable:
+        candidate["confirmable_task_id"] = matched_task_id
+    return candidate
 
 
 def _source_from_file(path: Path) -> tuple[str, dict[str, Any]]:
@@ -172,21 +193,12 @@ def _source_from_daily_note(notes_dir: Path, day: date) -> tuple[str, dict[str, 
 
 
 def _match_evidence_lines(content: str, source: dict[str, Any], *, personal: bool = False) -> list[dict[str, Any]]:
-    from tasks import (
-        FUZZY_EVIDENCE_LINK_THRESHOLD,
-        FUZZY_REVIEW_THRESHOLD,
-        _build_task_catalog,
-        _extract_done_lines,
-        _ingest_match_line,
-        _safe_load_task_records,
-    )
-
-    parsed = _extract_done_lines(content)
-    records = _safe_load_task_records(personal)
-    catalog = _build_task_catalog(records)
+    parsed = extract_done_lines(content)
+    records = safe_load_task_records(personal)
+    catalog = build_task_catalog(records)
     matched = []
     for line in parsed:
-        match = _ingest_match_line(
+        match = match_evidence_line(
             line,
             catalog,
             auto_threshold=FUZZY_EVIDENCE_LINK_THRESHOLD,
@@ -332,7 +344,11 @@ def _candidate_task_id(candidate: dict[str, Any], explicit_task_id: str | None) 
             "code": "explicit-task-id-required",
             "message": "Only exact canonical ID/link evidence can be confirmed without --task-id.",
         }
-    task_id = candidate.get("matched_task_id")
+    task_id = candidate.get("confirmable_task_id")
+    if not task_id:
+        # Compatibility with 108C candidate rows projected before
+        # confirmable_task_id existed.
+        task_id = candidate.get("matched_task_id")
     if not task_id:
         return None, {"code": "canonical-task-id-missing"}
     return task_id, None

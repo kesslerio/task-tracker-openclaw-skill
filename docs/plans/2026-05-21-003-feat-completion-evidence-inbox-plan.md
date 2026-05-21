@@ -22,6 +22,13 @@ Build PR #108C as the narrow completion evidence inbox promised by the 108A/108B
 
 The next missing piece is a safe place for "I probably did this" evidence to accumulate without pretending the evidence completed a task. Today `tasks.py ingest-daily-log` can rank matches, but the output is ephemeral. A user or agent has no durable inbox to review, reject, snooze, dedupe, or confirm later. 108C should add that inbox while preserving the source-of-truth boundary: active board markdown is current state; the ledger is audit/candidate history; daily notes are human-facing evidence.
 
+Final Oracle review found no P0 blocker in 108C and judged the foundation good
+enough to build on. The next PR should not add Gmail, calendar, or session-log
+ingestion. It should extract evidence matching out of private `tasks.py` helpers,
+make candidate JSON harder to misuse, and wire standup, EOD, Telegram, and
+Lobster surfaces over the existing inbox. That work is tracked in
+`docs/plans/2026-05-21-004-feat-inbox-workflow-consumption-plan.md`.
+
 ---
 
 ## Requirements
@@ -55,6 +62,9 @@ The next missing piece is a safe place for "I probably did this" evidence to acc
 
 ### Deferred to Follow-Up Work
 
+- PR #108D workflow consumption before noisy source ingestion: shared evidence
+  matching, `confirmable_task_id` versus `suggested_match`, standup/EOD/weekly
+  candidate visibility, and Telegram/Lobster inbox controls.
 - Gmail, calendar, session-log, Telegram DONEs, and Lobster cron ingestion.
 - Morning standup and EOD UX redesign.
 - Bulk confirm or auto-confirm.
@@ -335,6 +345,10 @@ flowchart TD
 
 - Final CLI spelling can be `completion-candidates` or a shorter alias if local command conventions make one clearly better.
 - Exact candidate event names may vary, but they must remain distinct from `state_transition` events.
+- 108C candidate payloads are safe in code, but 108D should make JSON harder for
+  agents to misuse: exact ID/link evidence may expose `confirmable_task_id`,
+  while title/fuzzy/fallback evidence should expose only `suggested_match` and
+  review-required metadata.
 - Candidate expiry policy can be manual or simple time-window based in this slice; do not add scheduler/cron expiry yet.
 - Daily-note scan line-number fidelity may depend on existing extractor detail. If source line numbers are not available, use a stable source pointer based on date/path plus normalized summary and timestamp where available.
 
@@ -347,6 +361,9 @@ flowchart TD
 - Run CLI help checks for `tasks.py done`, `tasks.py ingest-daily-log`, and new completion-candidate commands.
 - Run public hygiene and markdown lint on changed docs.
 - Manually inspect sample JSON for one exact-ID candidate, one fuzzy suggestion, one fallback-only candidate, one rejected candidate, and one apply-failed candidate.
+- After 108C lands, run an Oracle/Codex checkpoint before external ingestion.
+  The final checkpoint recommends 108D as workflow consumption plus matcher
+  extraction, with Gmail/calendar/session ingestion deferred one more PR.
 
 ---
 
@@ -357,3 +374,4 @@ flowchart TD
 - `docs/plans/2026-05-21-002-hardening-108b-before-evidence-inbox-plan.md`
 - `docs/ARCHITECTURE.md`
 - Oracle progress review pasted in the planning conversation on 2026-05-21
+- Post-108C Oracle progress reviews pasted in the planning conversation on 2026-05-21

@@ -60,7 +60,11 @@ The broader product requirements still stand: active-board markdown owns editabl
 
 - PR #108B: consolidate parser and mutation boundaries around one `TaskRecord` contract and remove duplicate task-line mutation helpers.
 - PR #108C: reintroduce completion evidence as an inbox that creates suggestions only and applies confirmed items through ID-only `done`.
-- Later Lobster PR: wire standup, weekly review, Telegram DONEs, calendar, email, and session extraction to the stable task-tracker commands.
+- PR #108D: wire the existing completion inbox into standup, EOD, Telegram, and
+  Lobster workflows after extracting shared evidence matching and clarifying
+  candidate JSON confirmability semantics.
+- Later ingestion PR: add Gmail, calendar, session-log, and other noisy evidence
+  sources only after the workflow-consumption loop is proven.
 - Later product slice: weekly disposition, frozen tasks, delegated/backlog first-class states, and capped daily/EOD UX.
 
 ---
@@ -457,7 +461,13 @@ For #108A, only the solid arrows are in scope. The dashed evidence path is delib
 2. **PR #108B:** Parser and mutation consolidation. Land U6.
 3. **PR #108B hardening:** Close the post-108B Oracle P1s before evidence inbox: ledger malformed-line reporting, complete-by-ID rollback around daily-log/board/ledger writes, and weekly archive cleanup through the shared line helper. See `docs/plans/2026-05-21-002-hardening-108b-before-evidence-inbox-plan.md`.
 4. **PR #108C:** Completion evidence inbox. Land U7.
-5. **Later workflow PR:** Update Lobster/Telegram/standup/weekly/EOD workflows to consume canonical IDs and evidence suggestions.
+5. **PR #108D:** Workflow consumption. Extract shared evidence matching,
+   clarify `confirmable_task_id` versus `suggested_match`, and wire standup,
+   EOD, weekly, Telegram, and Lobster surfaces to consume existing inbox
+   commands without auto-confirming. See
+   `docs/plans/2026-05-21-004-feat-inbox-workflow-consumption-plan.md`.
+6. **Later ingestion PR:** Add Gmail, calendar, session-log, and other noisy
+   evidence sources only after 108D proves the review/confirm workflow.
 
 ---
 
@@ -465,7 +475,8 @@ For #108A, only the solid arrows are in scope. The dashed evidence path is delib
 
 - Update top-level docs in #108A to describe the identity kernel and deferred work accurately.
 - Keep the broad vNext requirements in `lobster-workflows:docs/brainstorms/2026-05-20-task-tracker-vnext-requirements.md` as product direction, but do not let the reduced PR claim full coverage.
-- Add or update follow-up plan/issue text for #108B and #108C once #108A is split.
+- Add or update follow-up plan/issue text for #108B, #108C, #108D, and the
+  later workflow PR as the sequence advances.
 
 ---
 
@@ -475,6 +486,12 @@ For #108A, only the solid arrows are in scope. The dashed evidence path is delib
 - #108B is ready when standup, weekly, EOD, and primitive summaries consume one canonical task record shape and no write path bypasses the kernel.
 - #108B hardening is ready when malformed ledger lines are no longer silent, completion rollback covers daily-log and board write failures, and weekly stale cleanup uses line-number-verified removal.
 - #108C is ready when evidence candidates can be created, deduped, decided, retried, and applied only through ID-only done.
+- #108D is ready when workflow surfaces can list/show/reject/snooze/confirm
+  existing candidates by candidate ID, all confirmation routes through the
+  existing inbox command and ID-only completion kernel, candidate JSON separates
+  `confirmable_task_id` from `suggested_match`, and no workflow path mutates
+  tasks from title, fuzzy, fallback, quick ID, calendar, Gmail, session note, or
+  list position.
 
 ---
 
@@ -485,3 +502,4 @@ For #108A, only the solid arrows are in scope. The dashed evidence path is delib
 - `lobster-workflows:docs/ideation/2026-05-20-task-tracker-radical-simplification-ideas.md`
 - `lobster-workflows:docs/plans/2026-05-20-003-feat-task-tracker-vnext-plan.md`
 - Oracle architecture review pasted in the planning conversation on 2026-05-20
+- Post-108C Oracle progress reviews pasted in the planning conversation on 2026-05-21
