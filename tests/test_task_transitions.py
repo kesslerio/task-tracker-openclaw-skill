@@ -94,6 +94,33 @@ def test_done_restricts_canonical_resolution_to_active_sections(tmp_path):
     assert "Backlog task" in content
 
 
+def test_done_removes_resolved_active_line_when_inactive_raw_line_matches(tmp_path):
+    raw_line = "- [ ] **Same title** task_id::tsk_same"
+    work = tmp_path / "Work Tasks.md"
+    work.write_text(f"""# Work
+
+## 🅿️ Parking Lot
+{raw_line}
+
+## 🔴 Q1
+{raw_line}
+""")
+    env = _env(tmp_path, work)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "done", "tsk_same"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 0
+    content = work.read_text()
+    assert content.count(raw_line) == 1
+    assert content.index(raw_line) < content.index("## 🔴 Q1")
+
+
 def test_done_resolves_plain_task_line_canonical_id(tmp_path):
     work = tmp_path / "Work Tasks.md"
     work.write_text("""# Work
@@ -258,6 +285,32 @@ def test_done_recurring_task_rolls_forward_next_due_date(tmp_path):
     content = work.read_text()
     assert "Send weekly update" in content
     assert "🗓️2026-05-27" in content
+
+
+def test_done_recurring_task_reports_bad_rule_without_writes(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    original = """# Work
+
+## 🔴 Q1
+- [ ] **Send weekly update** task_id::tsk_weekly recur::weekley 🗓️2026-05-20
+"""
+    work.write_text(original)
+    env = _env(tmp_path, work)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "done", "tsk_weekly"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 2
+    payload = json.loads(proc.stdout)
+    assert payload["error"]["code"] == "recurrence-rollover-failed"
+    assert work.read_text() == original
+    assert not (tmp_path / "daily").exists()
+    assert (tmp_path / "events.jsonl").read_text() == ""
 
 
 def test_done_recurring_task_replaces_spaced_due_marker(tmp_path):

@@ -49,6 +49,31 @@ def test_cmd_delegated_take_back_write_failure_keeps_delegated_item(tmp_path, mo
     assert 'Check merch delivery' in delegation_file.read_text()
 
 
+def test_cmd_delegated_take_back_adds_canonical_task_id(tmp_path, monkeypatch):
+    delegation_file = tmp_path / 'Delegated.md'
+    delegation_file.write_text("""# Delegated Tasks
+
+## Active
+- [ ] **Check merch delivery** → Alex [delegated::2026-02-10] [followup::2026-02-17] #Ops
+
+## Awaiting Follow-up
+
+## Completed
+""")
+    tasks_file = tmp_path / 'Work Tasks.md'
+    tasks_file.write_text("""# Weekly Objectives
+
+## Objectives
+""")
+
+    monkeypatch.setenv('TASK_TRACKER_DELEGATION_FILE', str(delegation_file))
+    monkeypatch.setattr(tasks, 'get_tasks_file', lambda personal=False: (tasks_file, 'markdown'))
+
+    tasks.cmd_delegated(SimpleNamespace(del_command='take-back', id=1))
+
+    assert re.search(r'\btask_id::tsk_[a-f0-9]{16}\b', tasks_file.read_text())
+
+
 def test_add_command_emits_canonical_task_id(tmp_path):
     tasks_file = tmp_path / "Work Tasks.md"
     tasks_file.write_text("# Work\n\n## 🟡 Q2\n")

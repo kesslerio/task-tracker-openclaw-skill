@@ -19,12 +19,22 @@ RECURRENCE_RE = re.compile(r"\brecur::\s*(?!(?:\s|[A-Za-z_][A-Za-z0-9_-]*::))([^
 DUE_RE = re.compile(r"(?:🗓️\s*|📅\s*)(\d{4}-\d{2}-\d{2})")
 
 
-def _remove_task_line(content: str, raw_line: str) -> str:
+def _line_index(lines: list[str], raw_line: str, line_number: int | None) -> int | None:
+    if line_number is None:
+        return None
+    index = line_number - 1
+    if index < 0 or index >= len(lines):
+        return None
+    if lines[index] != raw_line:
+        return None
+    return index
+
+
+def _remove_task_line(content: str, raw_line: str, line_number: int | None) -> str | None:
     lines = content.split("\n")
-    try:
-        target_index = lines.index(raw_line)
-    except ValueError:
-        return content
+    target_index = _line_index(lines, raw_line, line_number)
+    if target_index is None:
+        return None
     target_indent = len(raw_line) - len(raw_line.lstrip(" "))
     remove_until = target_index + 1
     while remove_until < len(lines):
@@ -47,8 +57,13 @@ def _remove_task_line(content: str, raw_line: str) -> str:
     return "\n".join(lines[:target_index] + lines[remove_until:])
 
 
-def _replace_task_line(content: str, raw_line: str, replacement: str) -> str:
-    return content.replace(raw_line, replacement, 1)
+def _replace_task_line(content: str, raw_line: str, replacement: str, line_number: int | None) -> str | None:
+    lines = content.split("\n")
+    target_index = _line_index(lines, raw_line, line_number)
+    if target_index is None:
+        return None
+    lines[target_index] = replacement
+    return "\n".join(lines)
 
 
 def _set_due_date(raw_line: str, due_date: str) -> str:
@@ -161,6 +176,39 @@ def complete_by_id(task_id: str, personal: bool = False, source: str = "user_com
 
     due_value = _extract_due_date(record.raw_line)
     recur_value = _extract_recur_value(record.raw_line) or ""
+    if record.line_number is None:
+        return {
+            "ok": False,
+            "error": {
+                "code": "task-line-resolution-failed",
+                "message": "Resolved task has no stable line number; active board was not changed.",
+            },
+        }
+    if recur_value:
+        try:
+            from_date = due_value or datetime.now().date().isoformat()
+            next_due = next_recurrence_date(recur_value, from_date)
+            next_line = _set_due_date(record.raw_line, next_due)
+            new_content = _replace_task_line(content, record.raw_line, next_line, record.line_number)
+        except ValueError as exc:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "recurrence-rollover-failed",
+                    "message": f"Recurring task could not be rolled forward; active board was not changed: {exc}",
+                },
+            }
+    else:
+        new_content = _remove_task_line(content, record.raw_line, record.line_number)
+    if new_content is None:
+        return {
+            "ok": False,
+            "error": {
+                "code": "task-line-resolution-failed",
+                "message": "Resolved task line no longer matches the active board; active board was not changed.",
+            },
+        }
+
     daily_log_file = _daily_log_file()
     snapshots = {tasks_file: (True, content)}
     if daily_log_file is not None:
@@ -188,17 +236,6 @@ def complete_by_id(task_id: str, personal: bool = False, source: str = "user_com
                 "message": "Daily-note completion log failed; active board was not changed.",
             },
         }
-
-    if recur_value:
-        try:
-            from_date = due_value or datetime.now().date().isoformat()
-            next_due = next_recurrence_date(recur_value, from_date)
-            next_line = _set_due_date(record.raw_line, next_due)
-            new_content = _replace_task_line(content, record.raw_line, next_line)
-        except ValueError:
-            new_content = _remove_task_line(content, record.raw_line)
-    else:
-        new_content = _remove_task_line(content, record.raw_line)
 
     tasks_file.write_text(new_content, encoding="utf-8")
     try:

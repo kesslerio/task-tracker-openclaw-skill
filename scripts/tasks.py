@@ -408,7 +408,8 @@ def cmd_delegated(args):
             tasks_file, _ = get_tasks_file(personal=False)
             content = tasks_file.read_text()
             dept_tag = f" #{item.get('department')}" if item.get('department') else ''
-            task_line = f"- [ ] **{item['title']}**{dept_tag}"
+            task_id = f"tsk_{uuid.uuid4().hex[:16]}"
+            task_line = f"- [ ] **{item['title']}** task_id::{task_id}{dept_tag}"
             # Insert at beginning of first section
             lines = content.split('\n')
             insert_at = 0
