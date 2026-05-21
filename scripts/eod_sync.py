@@ -441,6 +441,9 @@ def main() -> None:
     if not args.apply:
         print("ℹ️  Report-only mode: no files written. Use --apply for legacy Weekly TODO writes.")
         return
+    if args.dry_run:
+        print("ℹ️  Dry-run mode: no files written. Remove --dry-run to use legacy --apply writes.")
+        return
 
     print("⚠️  Legacy apply mode: this writes Weekly TODO checkboxes only; canonical tasks are unchanged.")
 

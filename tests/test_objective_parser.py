@@ -187,6 +187,18 @@ def test_remove_task_line_preserves_sibling_tasks():
 """
 
 
+def test_remove_task_line_removes_tab_indented_children():
+    content = """- [x] Parent task
+\t- [ ] Tab child
+- [ ] Sibling task
+"""
+
+    updated = remove_task_line(content, "- [x] Parent task", 1)
+
+    assert updated == """- [ ] Sibling task
+"""
+
+
 def test_remove_task_line_handles_flat_task():
     content = """- [ ] Task one
 - [ ] Task two

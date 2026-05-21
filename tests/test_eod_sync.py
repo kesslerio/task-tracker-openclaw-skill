@@ -319,3 +319,31 @@ def test_cli_default_is_report_only(tmp_path):
     assert proc.returncode == 0
     assert "Report-only mode" in proc.stdout
     assert weekly.read_text() == original
+
+
+def test_cli_dry_run_wins_over_apply(tmp_path):
+    daily_dir = tmp_path / "daily"
+    daily_dir.mkdir()
+    (daily_dir / "2026-02-19.md").write_text(DAILY_NOTE_PLAIN_DONE)
+    weekly = tmp_path / "Weekly TODOs.md"
+    original = """# Weekly TODOs
+
+- [ ] KPMG audit package — prep + send 📅 2026-02-19 🔺
+"""
+    weekly.write_text(original)
+
+    env = os.environ.copy()
+    env["TASK_TRACKER_DAILY_NOTES_DIR"] = str(daily_dir)
+    env["TASK_TRACKER_WEEKLY_TODOS"] = str(weekly)
+
+    proc = subprocess.run(
+        ["python3", "scripts/eod_sync.py", "--date", "2026-02-19", "--apply", "--dry-run"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 0
+    assert "Dry-run mode" in proc.stdout
+    assert weekly.read_text() == original
