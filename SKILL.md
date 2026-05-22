@@ -10,6 +10,11 @@ metadata: {"openclaw":{"emoji":"📋","requires":{"env":["TASK_TRACKER_WORK_FILE
 Personal task management for work + personal workflows, with daily standups and
 weekly reviews.
 
+Source-of-truth model: active task boards are the current task state. Daily and
+weekly notes are logs/evidence, not canonical task state. The JSONL sidecar
+ledger is audit/candidate history for identity repairs, ID-based completions,
+and completion evidence decisions.
+
 ## When to Use
 
 Use this skill when the user asks to:
