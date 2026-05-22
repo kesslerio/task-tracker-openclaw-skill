@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -17,6 +18,17 @@ from utils import get_tasks_file
 
 DEFAULT_STALE_DAYS = 14
 DEFAULT_CANDIDATE_DAYS = 7
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _actionable_records(records: list[TaskRecord]) -> list[TaskRecord]:
+    return [record for record in active_records(records) if not record.is_objective]
 
 
 def _parse_date(value: str | None) -> date | None:
@@ -84,11 +96,14 @@ def _finding(
     return finding
 
 
-def _identity_findings(identity: dict[str, Any]) -> list[dict[str, Any]]:
+def _identity_findings(identity: dict[str, Any], records: list[TaskRecord]) -> list[dict[str, Any]]:
     audit = identity.get("audit") or {}
     findings: list[dict[str, Any]] = []
+    objective_lines = {record.line_number for record in records if record.is_objective}
 
     for item in audit.get("malformed_task_ids", []):
+        if item.get("line_number") in objective_lines:
+            continue
         findings.append(
             _finding(
                 "malformed-task-id",
@@ -113,13 +128,15 @@ def _identity_findings(identity: dict[str, Any]) -> list[dict[str, Any]]:
         )
 
     for item in audit.get("missing_task_ids", []):
+        if item.get("line_number") in objective_lines:
+            continue
         findings.append(
             _finding(
                 "missing-task-id",
                 "medium",
                 "Active task is missing canonical task_id:: metadata.",
                 basis={"source": "identity-audit", "line_number": item.get("line_number")},
-                recommended_action="Run identity-repair --dry-run, then identity-repair --apply if the repair is unambiguous.",
+                recommended_action="Run identity-repair, then identity-repair --apply if the repair is unambiguous.",
                 tasks=[item],
             )
         )
@@ -129,7 +146,7 @@ def _identity_findings(identity: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _duplicate_title_findings(records: list[TaskRecord]) -> list[dict[str, Any]]:
     groups: dict[str, list[TaskRecord]] = {}
-    for record in active_records(records):
+    for record in _actionable_records(records):
         groups.setdefault(_normalized_title(record.title), []).append(record)
 
     findings = []
@@ -157,7 +174,7 @@ def _due_findings(
 ) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     stale_cutoff = today - timedelta(days=stale_days)
-    for record in active_records(records):
+    for record in _actionable_records(records):
         due_date = _parse_date(record.due)
         if not due_date:
             continue
@@ -220,6 +237,16 @@ def _candidate_findings(
                         for item in exc.malformed
                     ]
                 },
+            )
+        ]
+    except OSError as exc:
+        return [
+            _finding(
+                "candidate-ledger-unavailable",
+                "high",
+                "Candidate ledger could not be read for audit projection.",
+                basis={"source": "completion-candidates", "error": str(exc)},
+                recommended_action="Fix the candidate ledger path before trusting candidate audit output.",
             )
         ]
 
@@ -328,7 +355,8 @@ def _backlog_findings(tasks_file: Path, *, backlog_cap: int | None) -> tuple[lis
 
 def _summary(findings: list[dict[str, Any]], *, limit: int) -> dict[str, Any]:
     severity_counts = Counter(finding.get("severity", "unknown") for finding in findings)
-    top = findings[:limit]
+    effective_limit = max(limit, 0)
+    top = findings[:effective_limit]
     return {
         "review_required": bool(findings),
         "total": len(findings),
@@ -368,7 +396,7 @@ def collect_task_audit(
         )
     else:
         _, _, records = load_records(personal)
-        findings.extend(_identity_findings(identity))
+        findings.extend(_identity_findings(identity, records))
         findings.extend(_duplicate_title_findings(records))
         findings.extend(_due_findings(records, today=today, stale_days=stale_days))
 
@@ -390,7 +418,7 @@ def collect_task_audit(
             "backlog_cap": effective_backlog_cap,
         },
         "totals": {
-            "active_tasks": len(active_records(records)),
+            "active_tasks": len(_actionable_records(records)),
             "findings": len(findings),
             "high": sum(1 for finding in findings if finding.get("severity") == "high"),
             "medium": sum(1 for finding in findings if finding.get("severity") == "medium"),
@@ -403,7 +431,12 @@ def collect_task_audit(
 
 def task_audit_summary(*, personal: bool = False, limit: int = 5) -> dict[str, Any]:
     try:
-        payload = collect_task_audit(personal=personal, limit=limit)
+        payload = collect_task_audit(
+            personal=personal,
+            stale_days=_env_int("TASK_AUDIT_STALE_DAYS", DEFAULT_STALE_DAYS),
+            candidate_days=_env_int("TASK_AUDIT_CANDIDATE_DAYS", DEFAULT_CANDIDATE_DAYS),
+            limit=limit,
+        )
     except (OSError, ValueError) as exc:
         return {
             "available": False,

@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import eod_review
 import standup
+import task_audit
 
 
 def _write_work_file(tmp_path: Path, content: str) -> Path:
@@ -237,6 +238,104 @@ def test_task_audit_degrades_on_malformed_ledger_but_keeps_identity_findings(tmp
     assert proc.returncode == 0
     assert "malformed-ledger" in codes
     assert "missing-task-id" in codes
+
+
+def test_task_audit_degrades_on_unreadable_candidate_ledger(tmp_path):
+    work = _write_work_file(
+        tmp_path,
+        """# Weekly TODOs
+
+## 🔴 Q1
+- [ ] **Missing id task** area:: Delivery
+""",
+    )
+    env = _env(tmp_path, work)
+    ledger_dir = tmp_path / "events-as-dir"
+    ledger_dir.mkdir()
+    env["TASK_TRACKER_LEDGER_FILE"] = str(ledger_dir)
+
+    proc = _run(["task-audit"], env)
+    payload = _payload(proc)
+    codes = {finding["code"] for finding in payload["findings"]}
+
+    assert proc.returncode == 0
+    assert "candidate-ledger-unavailable" in codes
+    assert "missing-task-id" in codes
+
+
+def test_task_audit_excludes_objective_headers_from_actionable_identity_findings(tmp_path):
+    work = _write_work_file(
+        tmp_path,
+        """# Weekly TODOs
+
+## Objectives
+- [ ] Launch hiring plan #HR #high
+  - [ ] Post on LinkedIn task_id::tsk_post_linkedin
+- [ ] Close Fizzi deal #Sales #urgent
+  - [ ] Send follow-up proposal
+""",
+    )
+    env = _env(tmp_path, work)
+
+    proc = _run(["task-audit"], env)
+    payload = _payload(proc)
+    missing = [finding for finding in payload["findings"] if finding["code"] == "missing-task-id"]
+    missing_titles = {
+        task["title"]
+        for finding in missing
+        for task in finding.get("tasks", [])
+    }
+
+    assert proc.returncode == 0
+    assert payload["totals"]["active_tasks"] == 2
+    assert "Launch hiring plan" not in missing_titles
+    assert "Close Fizzi deal" not in missing_titles
+    assert "Send follow-up proposal" in missing_titles
+
+
+def test_task_audit_summary_uses_threshold_env_overrides(monkeypatch, tmp_path):
+    old_due = (date.today() - timedelta(days=20)).isoformat()
+    work = _write_work_file(
+        tmp_path,
+        f"""# Weekly TODOs
+
+## 🔴 Q1
+- [ ] **Overdue launch task** task_id::tsk_overdue 🗓️{old_due} area:: Delivery
+""",
+    )
+    monkeypatch.setenv("TASK_TRACKER_WORK_FILE", str(work))
+    monkeypatch.setenv("TASK_TRACKER_DAILY_NOTES_DIR", str(tmp_path / "daily"))
+    monkeypatch.setenv("TASK_TRACKER_DONE_LOG_DIR", str(tmp_path / "daily"))
+    monkeypatch.setenv("TASK_TRACKER_LEDGER_FILE", str(tmp_path / "events.jsonl"))
+    monkeypatch.setenv("TASK_AUDIT_STALE_DAYS", "30")
+    monkeypatch.setenv("TASK_AUDIT_CANDIDATE_DAYS", "11")
+
+    summary = task_audit.task_audit_summary(limit=10)
+    codes = {item["code"] for item in summary["items"]}
+
+    assert summary["available"] is True
+    assert "overdue-task" in codes
+    assert "stale-active-task" not in codes
+
+
+def test_task_audit_negative_summary_limit_does_not_slice_from_tail(tmp_path):
+    work = _write_work_file(
+        tmp_path,
+        """# Weekly TODOs
+
+## 🔴 Q1
+- [ ] **Missing id task** area:: Delivery
+""",
+    )
+    env = _env(tmp_path, work)
+
+    proc = _run(["task-audit", "--limit", "-1"], env)
+    payload = _payload(proc)
+
+    assert proc.returncode == 0
+    assert payload["summary"]["total"] >= 1
+    assert payload["summary"]["items"] == []
+    assert payload["summary"]["overflow"] == payload["summary"]["total"]
 
 
 def test_task_audit_does_not_flag_future_snoozed_candidate_stale(tmp_path):
