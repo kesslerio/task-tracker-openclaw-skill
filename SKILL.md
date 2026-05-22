@@ -88,6 +88,7 @@ python3 scripts/tasks.py blockers
 python3 scripts/tasks.py add "Draft proposal" --priority high --due 2026-01-23
 python3 scripts/tasks.py --personal add "Call mom" --priority high --due 2026-01-22
 python3 scripts/tasks.py identity-audit
+python3 scripts/tasks.py task-audit
 python3 scripts/tasks.py identity-repair --apply
 python3 scripts/tasks.py done "tsk_example"
 python3 scripts/tasks.py --personal done "tsk_personal"
@@ -103,6 +104,10 @@ tasks; confirmation must resolve to a canonical `task_id::`. Workflow wrappers
 such as Telegram/Lobster should call `completion_inbox_control.py` or the
 `completion-candidates` command group by candidate ID. They must not call
 `done` by title, fuzzy match, fallback ID, quick ID, or list position.
+
+Task audits are read-only health checks. They can flag duplicate titles, stale
+active tasks, unresolved candidates, missing IDs, and backlog pressure, but they
+must not be treated as authority to freeze, delete, merge, or complete tasks.
 
 ### Backlog ops
 

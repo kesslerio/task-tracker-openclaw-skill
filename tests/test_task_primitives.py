@@ -78,6 +78,7 @@ def test_primitive_schema_shape(tmp_path):
     assert "overdue" in standup_payload
     assert "carryover_suggestions" in standup_payload
     assert "completion_candidates" in standup_payload
+    assert "task_audit" in standup_payload
 
     week_start = date.today() - timedelta(days=date.today().weekday())
     week_end = week_start + timedelta(days=6)
@@ -105,6 +106,21 @@ def test_primitive_schema_shape(tmp_path):
     assert "by_area" in weekly_payload["DONE"]
     assert "by_category" in weekly_payload["DO"]
     assert "completion_candidates" in weekly_payload
+    assert "task_audit" in weekly_payload
+
+    audit = subprocess.run(
+        ["python3", "scripts/tasks.py", "task-audit"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert audit.returncode == 0
+    audit_payload = json.loads(audit.stdout)
+    assert audit_payload["schema_version"] == "v1"
+    assert audit_payload["command"] == "task-audit"
+    assert "findings" in audit_payload
+    assert "summary" in audit_payload
 
     cal = subprocess.run(
         ["python3", "scripts/tasks.py", "calendar-sync"],

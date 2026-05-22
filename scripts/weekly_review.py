@@ -12,6 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from candidate_review import candidate_review_summary
+from task_audit import task_audit_summary
 from daily_notes import extract_completed_actions, extract_completed_tasks
 from task_lines import remove_task_line
 from utils import (
@@ -348,6 +349,27 @@ def append_candidate_review_section(lines: list[str], limit: int = 5) -> None:
     lines.append("  Review required; do not auto-complete from this summary.")
 
 
+def append_task_audit_section(lines: list[str], limit: int = 5) -> None:
+    lines.append("")
+    lines.append("🧹 **Task Audit**")
+    summary = task_audit_summary(limit=limit)
+    if not summary.get("available"):
+        error = summary.get("error") or {}
+        lines.append(f"  Audit unavailable: {error.get('code', 'unknown-error')}.")
+        return
+
+    if not summary.get("total"):
+        lines.append("  No task-health findings.")
+        return
+
+    lines.append(f"  {summary.get('total', 0)} finding(s) need review.")
+    for finding in summary.get("items", []):
+        lines.append(f"  • {finding.get('severity')}: {finding.get('code')} — {finding.get('reason')}")
+    if summary.get("overflow"):
+        lines.append(f"  • ... and {summary['overflow']} more")
+    lines.append("  Run `tasks.py task-audit`; do not mutate from audit text.")
+
+
 def format_overdue(task: dict, reference_date: date) -> str:
     """Return overdue label for a task."""
     due_date = parse_due_date(task.get('due'))
@@ -523,6 +545,7 @@ def generate_weekly_review(week: str | None = None, archive: bool = False) -> st
     lines.extend(velocity_lines)
 
     append_candidate_review_section(lines)
+    append_task_audit_section(lines)
 
     # Archive if requested
     if archive and done_tasks:

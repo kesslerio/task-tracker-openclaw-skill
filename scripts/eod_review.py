@@ -22,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 
 from candidate_review import candidate_review_summary
+from task_audit import task_audit_summary
 from utils import load_tasks
 
 OBSIDIAN_VAULT = Path(os.getenv('OBSIDIAN_VAULT', Path.home() / "Obsidian"))
@@ -181,6 +182,7 @@ def generate_eod(target_date: datetime = None) -> dict:
         'not_done': not_done,
         'tomorrows_top3': tomorrows_top3,
         'completion_candidates': candidate_review_summary(),
+        'task_audit': task_audit_summary(limit=3),
         'source': source,
     }
 
@@ -230,6 +232,19 @@ def format_markdown(data: dict) -> str:
     else:
         lines.append('_No active completion candidates_')
 
+    audit = data.get('task_audit') or {}
+    lines.extend(['', '## Task Audit'])
+    if audit.get('review_required'):
+        lines.append(f"{audit.get('total', 0)} task-health finding(s) need review.")
+        for finding in audit.get('items', [])[:3]:
+            lines.append(f"- {finding.get('severity')}: {finding.get('code')} — {finding.get('reason')}")
+        if audit.get('overflow'):
+            lines.append(f"- ... and {audit['overflow']} more")
+        lines.append("")
+        lines.append("Run `tasks.py task-audit`; do not mutate from audit text.")
+    else:
+        lines.append('_No task-health findings_')
+
     lines.extend([
         '',
         f"_Generated {datetime.now().isoformat()} via eod_review.py_",
@@ -269,6 +284,15 @@ def format_telegram(data: dict) -> str:
         lines.append(f"- {candidates.get('total', 0)} need review")
         for candidate in candidates.get('items', [])[:3]:
             lines.append(f"- {candidate.get('candidate_id')}: {candidate.get('summary')}")
+    else:
+        lines.append('- None')
+
+    audit = data.get('task_audit') or {}
+    lines.extend(['', 'Task audit:'])
+    if audit.get('review_required'):
+        lines.append(f"- {audit.get('total', 0)} need review")
+        for finding in audit.get('items', [])[:3]:
+            lines.append(f"- {finding.get('severity')}: {finding.get('code')}")
     else:
         lines.append('- None')
 

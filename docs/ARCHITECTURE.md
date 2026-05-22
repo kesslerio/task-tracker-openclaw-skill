@@ -278,6 +278,7 @@ sequenceDiagram
 | `done "task_id"` | | Complete exactly one active task by canonical ID |
 | `identity-audit` | | Report missing, duplicate, and malformed task IDs without writing |
 | `identity-repair` | `--apply` | Add safe missing `task_id::` metadata |
+| `task-audit` | `--stale-days`, `--candidate-days`, `--backlog-cap` | Report task-health findings without writing |
 | `ingest-daily-log` | `--file PATH` | Report completion evidence links; no task writes |
 | `completion-candidates scan` | `--file PATH`, `--date YYYY-MM-DD` | Persist completion evidence candidates; no task writes |
 | `completion-candidates list/show` | `--all`, `--mark-shown` | Review candidate inbox and event history |
@@ -346,6 +347,7 @@ sequenceDiagram
 | `tasks.py add` | Task board | Task board (insert line) |
 | `tasks.py done` | Task board, daily notes | Task board (remove/update line), daily note (append) |
 | `tasks.py identity-audit` | Task board | — |
+| `tasks.py task-audit` | Task board, ledger, parking lot | — |
 | `tasks.py ingest-daily-log` | Task board, done text | — |
 | `tasks.py completion-candidates scan` | Task board, done text, ledger | Ledger candidate events |
 | `tasks.py completion-candidates list/show` | Ledger | Ledger only with `--mark-shown` |

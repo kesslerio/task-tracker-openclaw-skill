@@ -219,6 +219,51 @@ def list_stale(tasks_file: Path) -> str:
     return json.dumps(stale, indent=2)
 
 
+def audit_items(tasks_file: Path, *, cap: int | None = None) -> dict:
+    """Return read-only Parking Lot audit data."""
+    content = tasks_file.read_text()
+    lines = content.split('\n')
+    start, end = _find_parking_lot_bounds(lines)
+    effective_cap = cap if cap is not None else _parking_lot_cap()
+    if start == -1:
+        return {
+            'available': False,
+            'cap': effective_cap,
+            'total': 0,
+            'stale_count': 0,
+            'items': [],
+            'stale': [],
+        }
+
+    items = _parse_items(lines, start, end)
+    stale = []
+    exported = []
+    for it in items:
+        age_days = _days_since(it.get('created'))
+        row = {
+            'id': it['id'],
+            'title': it['title'],
+            'department': it.get('department'),
+            'priority': it.get('priority'),
+            'created': it.get('created'),
+            'age_days': age_days,
+            'line_number': (it.get('line_num') or 0) + 1,
+            'raw_line': it.get('raw_line'),
+        }
+        exported.append(row)
+        if _is_stale(it):
+            stale.append(row)
+
+    return {
+        'available': True,
+        'cap': effective_cap,
+        'total': len(items),
+        'stale_count': len(stale),
+        'items': exported,
+        'stale': stale,
+    }
+
+
 def add_item(tasks_file: Path, title: str, dept: str | None = None,
              priority: str = 'low', task_id: str | None = None) -> str:
     """Add an item to the parking lot. Returns status message."""

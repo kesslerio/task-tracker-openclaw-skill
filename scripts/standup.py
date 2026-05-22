@@ -13,6 +13,7 @@ from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).parent))
 from candidate_review import candidate_review_summary
+from task_audit import task_audit_summary
 from daily_notes import extract_completed_actions, extract_completed_tasks
 from standup_common import (
     flatten_calendar_events,
@@ -363,6 +364,7 @@ def generate_standup(
 
     output['objective_progress'] = summarize_objective_progress(tasks_data)
     output['completion_candidates'] = candidate_review_summary()
+    output['task_audit'] = task_audit_summary(limit=3)
     
     if json_output:
         return output
@@ -474,6 +476,16 @@ def generate_standup(
         if candidates.get('overflow'):
             lines.append(f"  • ... and {candidates['overflow']} more")
         lines.append("  Review required; do not auto-complete from this summary.")
+
+    audit = output.get('task_audit') or {}
+    if audit.get('review_required'):
+        lines.append("")
+        lines.append(f"🧹 **Task Audit:** {audit.get('total', 0)} finding(s) need review")
+        for finding in audit.get('items', [])[:3]:
+            lines.append(f"  • {finding.get('severity')}: {finding.get('code')} — {finding.get('reason')}")
+        if audit.get('overflow'):
+            lines.append(f"  • ... and {audit['overflow']} more")
+        lines.append("  Run `tasks.py task-audit`; do not mutate from audit text.")
 
     objective_progress = output.get('objective_progress') or {}
     if objective_progress.get('total_objectives', 0) > 0:

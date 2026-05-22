@@ -144,6 +144,76 @@ Optional helper command. It must not hard-fail if calendar/task sources are unav
 }
 ```
 
+## `task-audit`
+
+Read-only task-health primitive for periodic standup, EOD, weekly, and workflow
+surfaces. It reports findings and recommended safe actions, but does not write
+the board, daily notes, completion log, or ledger.
+
+```json
+{
+  "schema_version": "v1",
+  "command": "task-audit",
+  "ok": false,
+  "personal": false,
+  "generated_at": "2026-05-22T10:00:00",
+  "thresholds": {
+    "stale_days": 14,
+    "candidate_days": 7,
+    "backlog_cap": 25
+  },
+  "totals": {
+    "active_tasks": 10,
+    "findings": 2,
+    "high": 1,
+    "medium": 1,
+    "low": 0
+  },
+  "findings": [
+    {
+      "code": "duplicate-title",
+      "severity": "medium",
+      "reason": "Multiple active tasks have the same title.",
+      "basis": {
+        "source": "task-records",
+        "match": "normalized-title"
+      },
+      "recommended_action": "Review canonical task IDs; do not complete by title.",
+      "tasks": [
+        {
+          "task_id": "tsk_one",
+          "fallback_id": "fallback_example",
+          "fallback_only": false,
+          "title": "Draft proposal",
+          "section": "q1",
+          "area": "Sales",
+          "line_number": 4
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "review_required": true,
+    "total": 2,
+    "by_severity": {
+      "high": 1,
+      "medium": 1
+    },
+    "items": [],
+    "overflow": 0,
+    "instructions": "Review findings; mutate only through task_id:: commands."
+  }
+}
+```
+
+Finding codes may include `missing-task-id`, `malformed-task-id`,
+`duplicate-task-id`, `duplicate-title`, `overdue-task`, `stale-active-task`,
+`stale-completion-candidate`, `candidate-snooze-expired`,
+`candidate-apply-failed`, `stale-backlog-item`, and `backlog-cap-reached`.
+Findings are advisory and must not be applied from title, fuzzy match, fallback
+ID, quick ID, local numeric ID, calendar event, Gmail message, session note, or
+list position.
+
 ## `completion-candidates`
 
 The completion evidence inbox stores candidate lifecycle events in the JSONL
