@@ -36,6 +36,8 @@ python3 scripts/weekly_review.py
 - Canonical task identity audit/repair with inline `task_id::` metadata
 - Append-only JSONL event ledger for repairs and ID-based completions
 - Durable completion evidence inbox for review/confirm/reject/snooze decisions
+- Read-only task health audits for duplicate titles, stale tasks, identity
+  issues, candidates, and backlog pressure
 - Daily standup summaries (`standup.py`, `personal_standup.py`)
 - Weekly review + archive workflows (`weekly_review.py`, `archive.py`)
 - Backlog and delegated-task hygiene
@@ -63,6 +65,10 @@ and still require an explicit canonical `--task-id`. Standup, EOD, weekly, and
 workflow-control surfaces may show candidate counts and IDs, but they must not
 auto-complete tasks. Gmail, calendar, and session-log evidence ingestion remains
 deferred.
+
+Periodic task audits are also read-only. They surface task-health findings and
+safe next actions, but they do not freeze, delete, merge, complete, or otherwise
+mutate tasks.
 
 ## Development
 

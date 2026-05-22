@@ -32,6 +32,7 @@ python3 scripts/tasks.py blockers --person sarah
 python3 scripts/tasks.py add "Draft project proposal" --priority high --due 2026-01-23
 python3 scripts/tasks.py --personal add "Call mom" --priority high --due 2026-01-22
 python3 scripts/tasks.py identity-audit
+python3 scripts/tasks.py task-audit
 python3 scripts/tasks.py identity-repair
 python3 scripts/tasks.py identity-repair --apply
 python3 scripts/tasks.py done "tsk_example"
@@ -68,6 +69,7 @@ python3 scripts/tasks.py calendar resolve --window today --json
 python3 scripts/tasks.py standup-summary
 python3 scripts/tasks.py weekly-review-summary --week 2026-W08
 python3 scripts/tasks.py weekly-review-summary --start 2026-02-16 --end 2026-02-22
+python3 scripts/tasks.py task-audit --stale-days 14 --candidate-days 7
 python3 scripts/tasks.py ingest-daily-log --file /tmp/done-log.md
 cat /tmp/done-log.md | python3 scripts/tasks.py ingest-daily-log
 python3 scripts/tasks.py calendar-sync
@@ -83,6 +85,11 @@ All primitives return JSON with a stable envelope:
 ```
 
 Detailed shape: `references/task-primitives-schema-v1.md`.
+
+`task-audit` is read-only. It reports duplicate titles, identity issues,
+overdue/stale active tasks, stale candidates, and backlog pressure. Follow-up
+actions must use explicit repair, candidate, backlog, or canonical task-ID
+commands.
 
 ### Completion evidence inbox
 

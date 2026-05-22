@@ -103,6 +103,10 @@ post-108C follow-up notes in
 
 ### Deferred to Follow-Up Work
 
+- Periodic task audits for duplicate titles, stale active tasks, unresolved
+  candidates, identity issues, and backlog pressure. This became the next
+  automation layer before source ingestion; see
+  `docs/plans/2026-05-22-001-feat-periodic-task-audits-plan.md`.
 - Gmail evidence ingestion.
 - Calendar evidence ingestion.
 - Session-log evidence ingestion.

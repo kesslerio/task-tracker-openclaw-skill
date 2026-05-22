@@ -36,6 +36,7 @@ from evidence_matching import (
 from standup_common import get_calendar_events, flatten_calendar_events
 import delegation
 from task_identity import audit_payload, print_json as print_identity_json
+from task_audit import collect_task_audit, task_audit_summary
 from task_lines import remove_task_line
 from task_repair import repair_missing_ids
 from task_transitions import block_unsafe_query, complete_by_id, print_result
@@ -56,6 +57,13 @@ from utils import (
 )
 
 TASK_PRIMITIVES_SCHEMA_VERSION = "v1"
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
 
 
 def list_tasks(args):
@@ -484,6 +492,20 @@ def cmd_identity_audit(args):
     print_identity_json(audit_payload(personal=args.personal))
 
 
+def cmd_task_audit(args):
+    payload = _new_schema("task-audit")
+    payload.update(
+        collect_task_audit(
+            personal=args.personal,
+            stale_days=args.stale_days if args.stale_days is not None else _env_int("TASK_AUDIT_STALE_DAYS", 14),
+            candidate_days=args.candidate_days if args.candidate_days is not None else _env_int("TASK_AUDIT_CANDIDATE_DAYS", 7),
+            backlog_cap=args.backlog_cap,
+            limit=args.limit,
+        )
+    )
+    print(json.dumps(payload, indent=2))
+
+
 def cmd_identity_repair(args):
     payload = repair_missing_ids(personal=args.personal, apply=args.apply)
     print(json.dumps(payload, indent=2, sort_keys=True))
@@ -812,6 +834,7 @@ def cmd_standup_summary(args):
             "overdue": overdue,
             "carryover_suggestions": carryover_suggestions,
             "completion_candidates": candidate_review_summary(personal=args.personal),
+            "task_audit": task_audit_summary(personal=args.personal),
             "groups": {
                 "dones_by_area": _group_tasks_by_area(dones),
                 "dos_by_area": _group_tasks_by_area(dos),
@@ -945,6 +968,7 @@ def cmd_weekly_review_summary(args):
                 "by_category": _group_tasks_by_category(do_items),
             },
             "completion_candidates": candidate_review_summary(personal=args.personal),
+            "task_audit": task_audit_summary(personal=args.personal),
         }
     )
     print(json.dumps(payload, indent=2))
@@ -1357,6 +1381,32 @@ def main():
 
     identity_audit_parser = subparsers.add_parser('identity-audit', help='Read-only canonical identity audit')
     identity_audit_parser.set_defaults(func=cmd_identity_audit)
+
+    task_audit_parser = subparsers.add_parser('task-audit', help='Read-only task health audit')
+    task_audit_parser.add_argument(
+        '--stale-days',
+        type=int,
+        default=None,
+        help='Days overdue before active tasks are flagged stale',
+    )
+    task_audit_parser.add_argument(
+        '--candidate-days',
+        type=int,
+        default=None,
+        help='Days before unresolved completion candidates are flagged stale',
+    )
+    task_audit_parser.add_argument(
+        '--backlog-cap',
+        type=int,
+        help='Parking Lot cap for backlog pressure checks',
+    )
+    task_audit_parser.add_argument(
+        '--limit',
+        type=int,
+        default=5,
+        help='Maximum findings included in the summary block',
+    )
+    task_audit_parser.set_defaults(func=cmd_task_audit)
 
     identity_repair_parser = subparsers.add_parser('identity-repair', help='Repair missing task_id metadata')
     identity_repair_parser.add_argument('--apply', action='store_true', help='Write safe task_id repairs')
