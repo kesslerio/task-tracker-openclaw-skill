@@ -59,6 +59,13 @@ from utils import (
 TASK_PRIMITIVES_SCHEMA_VERSION = "v1"
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
 def list_tasks(args):
     """List tasks with optional filters."""
     _, tasks_data = load_tasks(args.personal)
@@ -490,8 +497,8 @@ def cmd_task_audit(args):
     payload.update(
         collect_task_audit(
             personal=args.personal,
-            stale_days=args.stale_days,
-            candidate_days=args.candidate_days,
+            stale_days=args.stale_days if args.stale_days is not None else _env_int("TASK_AUDIT_STALE_DAYS", 14),
+            candidate_days=args.candidate_days if args.candidate_days is not None else _env_int("TASK_AUDIT_CANDIDATE_DAYS", 7),
             backlog_cap=args.backlog_cap,
             limit=args.limit,
         )
@@ -1379,13 +1386,13 @@ def main():
     task_audit_parser.add_argument(
         '--stale-days',
         type=int,
-        default=int(os.getenv('TASK_AUDIT_STALE_DAYS', '14')),
+        default=None,
         help='Days overdue before active tasks are flagged stale',
     )
     task_audit_parser.add_argument(
         '--candidate-days',
         type=int,
-        default=int(os.getenv('TASK_AUDIT_CANDIDATE_DAYS', '7')),
+        default=None,
         help='Days before unresolved completion candidates are flagged stale',
     )
     task_audit_parser.add_argument(

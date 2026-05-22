@@ -279,21 +279,24 @@ def _candidate_findings(
     return findings
 
 
-def _backlog_findings(tasks_file: Path, *, backlog_cap: int | None) -> list[dict[str, Any]]:
+def _backlog_findings(tasks_file: Path, *, backlog_cap: int | None) -> tuple[list[dict[str, Any]], int | None]:
     try:
         audit = audit_items(tasks_file, cap=backlog_cap)
-    except OSError as exc:
-        return [
-            _finding(
-                "backlog-unavailable",
-                "low",
-                "Parking Lot could not be read for backlog audit.",
-                basis={"source": "parking-lot", "error": str(exc)},
-                recommended_action="Inspect the task board path and rerun task-audit.",
-            )
-        ]
+    except (OSError, ValueError) as exc:
+        return (
+            [
+                _finding(
+                    "backlog-unavailable",
+                    "low",
+                    "Parking Lot could not be read for backlog audit.",
+                    basis={"source": "parking-lot", "error": str(exc)},
+                    recommended_action="Inspect task board and parking-lot env configuration, then rerun task-audit.",
+                )
+            ],
+            backlog_cap,
+        )
     if not audit.get("available"):
-        return []
+        return [], audit.get("cap")
 
     findings: list[dict[str, Any]] = []
     cap = audit.get("cap") or 0
@@ -320,7 +323,7 @@ def _backlog_findings(tasks_file: Path, *, backlog_cap: int | None) -> list[dict
                 details=item,
             )
         )
-    return findings
+    return findings, audit.get("cap")
 
 
 def _summary(findings: list[dict[str, Any]], *, limit: int) -> dict[str, Any]:
@@ -370,7 +373,8 @@ def collect_task_audit(
         findings.extend(_due_findings(records, today=today, stale_days=stale_days))
 
     findings.extend(_candidate_findings(personal=personal, today=today, candidate_days=candidate_days))
-    findings.extend(_backlog_findings(tasks_file, backlog_cap=backlog_cap))
+    backlog_findings, effective_backlog_cap = _backlog_findings(tasks_file, backlog_cap=backlog_cap)
+    findings.extend(backlog_findings)
 
     severity_order = {"high": 0, "medium": 1, "low": 2}
     findings = sorted(findings, key=lambda item: (severity_order.get(item.get("severity"), 9), item.get("code", "")))
@@ -383,7 +387,7 @@ def collect_task_audit(
         "thresholds": {
             "stale_days": stale_days,
             "candidate_days": candidate_days,
-            "backlog_cap": backlog_cap,
+            "backlog_cap": effective_backlog_cap,
         },
         "totals": {
             "active_tasks": len(active_records(records)),
@@ -400,7 +404,7 @@ def collect_task_audit(
 def task_audit_summary(*, personal: bool = False, limit: int = 5) -> dict[str, Any]:
     try:
         payload = collect_task_audit(personal=personal, limit=limit)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         return {
             "available": False,
             "review_required": True,

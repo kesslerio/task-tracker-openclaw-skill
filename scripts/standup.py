@@ -478,7 +478,11 @@ def generate_standup(
         lines.append("  Review required; do not auto-complete from this summary.")
 
     audit = output.get('task_audit') or {}
-    if audit.get('review_required'):
+    if audit.get('review_required') and not audit.get('available', True):
+        error = audit.get('error') or {}
+        lines.append("")
+        lines.append(f"🧹 **Task Audit:** unavailable ({error.get('code', 'unknown-error')})")
+    elif audit.get('review_required'):
         lines.append("")
         lines.append(f"🧹 **Task Audit:** {audit.get('total', 0)} finding(s) need review")
         for finding in audit.get('items', [])[:3]:

@@ -234,7 +234,10 @@ def format_markdown(data: dict) -> str:
 
     audit = data.get('task_audit') or {}
     lines.extend(['', '## Task Audit'])
-    if audit.get('review_required'):
+    if audit.get('review_required') and not audit.get('available', True):
+        error = audit.get('error') or {}
+        lines.append(f"Audit unavailable: {error.get('code', 'unknown-error')}.")
+    elif audit.get('review_required'):
         lines.append(f"{audit.get('total', 0)} task-health finding(s) need review.")
         for finding in audit.get('items', [])[:3]:
             lines.append(f"- {finding.get('severity')}: {finding.get('code')} — {finding.get('reason')}")
@@ -289,7 +292,10 @@ def format_telegram(data: dict) -> str:
 
     audit = data.get('task_audit') or {}
     lines.extend(['', 'Task audit:'])
-    if audit.get('review_required'):
+    if audit.get('review_required') and not audit.get('available', True):
+        error = audit.get('error') or {}
+        lines.append(f"- Unavailable: {error.get('code', 'unknown-error')}")
+    elif audit.get('review_required'):
         lines.append(f"- {audit.get('total', 0)} need review")
         for finding in audit.get('items', [])[:3]:
             lines.append(f"- {finding.get('severity')}: {finding.get('code')}")

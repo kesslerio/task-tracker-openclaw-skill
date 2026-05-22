@@ -1,8 +1,14 @@
 import json
 import os
 import subprocess
+import sys
 from datetime import date, timedelta
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
+import eod_review
+import standup
 
 
 def _write_work_file(tmp_path: Path, content: str) -> Path:
@@ -70,6 +76,117 @@ def test_task_audit_reports_duplicate_missing_overdue_and_backlog_without_mutati
     assert "stale-active-task" in codes
     assert "stale-backlog-item" in codes
     assert work.read_text() == original
+
+
+def test_invalid_task_audit_env_defaults_do_not_break_other_commands(tmp_path):
+    work = _write_work_file(
+        tmp_path,
+        """# Weekly TODOs
+
+## 🔴 Q1
+- [ ] **Ship alpha milestone** task_id::tsk_ship area:: Delivery
+""",
+    )
+    env = _env(tmp_path, work)
+    env["TASK_AUDIT_STALE_DAYS"] = "not-a-number"
+    env["TASK_AUDIT_CANDIDATE_DAYS"] = "also-bad"
+
+    listed = _run(["list"], env)
+    audit = _run(["task-audit"], env)
+    payload = _payload(audit)
+
+    assert listed.returncode == 0
+    assert audit.returncode == 0
+    assert payload["thresholds"]["stale_days"] == 14
+    assert payload["thresholds"]["candidate_days"] == 7
+
+
+def test_task_audit_reports_effective_default_backlog_cap(tmp_path):
+    work = _write_work_file(
+        tmp_path,
+        """# Weekly TODOs
+
+## 🔴 Q1
+- [ ] **Ship alpha milestone** task_id::tsk_ship area:: Delivery
+
+## 🅿️ Parking Lot
+- [ ] **Idea one** task_id::tsk_idea created::2026-01-01 #Dev #low
+""",
+    )
+    env = _env(tmp_path, work)
+    env["PARKING_LOT_CAP"] = "1"
+
+    proc = _run(["task-audit"], env)
+    payload = _payload(proc)
+
+    assert proc.returncode == 0
+    assert payload["thresholds"]["backlog_cap"] == 1
+    assert "backlog-cap-reached" in {finding["code"] for finding in payload["findings"]}
+
+
+def test_task_audit_degrades_on_invalid_parking_lot_env(tmp_path):
+    work = _write_work_file(
+        tmp_path,
+        """# Weekly TODOs
+
+## 🔴 Q1
+- [ ] **Ship alpha milestone** task_id::tsk_ship area:: Delivery
+
+## 🅿️ Parking Lot
+- [ ] **Idea one** task_id::tsk_idea created::2026-01-01 #Dev #low
+""",
+    )
+    env = _env(tmp_path, work)
+    env["PARKING_LOT_CAP"] = "bad-cap"
+
+    proc = _run(["task-audit"], env)
+    payload = _payload(proc)
+
+    assert proc.returncode == 0
+    assert "backlog-unavailable" in {finding["code"] for finding in payload["findings"]}
+
+
+def test_standup_and_eod_render_unavailable_audit_as_error(monkeypatch):
+    unavailable = {
+        "available": False,
+        "review_required": True,
+        "error": {"code": "io-error", "message": "cannot read board"},
+    }
+
+    monkeypatch.setattr(standup, "task_audit_summary", lambda limit=3: unavailable)
+    monkeypatch.setattr(standup, "candidate_review_summary", lambda: {})
+    monkeypatch.setattr(standup, "get_calendar_events", lambda: {})
+    standup_text = standup.generate_standup(
+        date_str="2026-05-22",
+        tasks_data={"q1": [], "q2": [], "q3": [], "team": [], "done": [], "due_today": [], "all": []},
+    )
+    eod_text = eod_review.format_markdown(
+        {
+            "weekday": "Friday",
+            "date": "2026-05-22",
+            "source": "test",
+            "done": [],
+            "not_done": [],
+            "tomorrows_top3": [],
+            "completion_candidates": {},
+            "task_audit": unavailable,
+        }
+    )
+    eod_telegram = eod_review.format_telegram(
+        {
+            "weekday": "Friday",
+            "date": "2026-05-22",
+            "done": [],
+            "not_done": [],
+            "tomorrows_top3": [],
+            "completion_candidates": {},
+            "task_audit": unavailable,
+        }
+    )
+
+    assert "unavailable (io-error)" in standup_text
+    assert "Audit unavailable: io-error." in eod_text
+    assert "Unavailable: io-error" in eod_telegram
 
 
 def test_task_audit_reports_stale_candidates_and_does_not_write_ledger(tmp_path):
