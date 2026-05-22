@@ -9,7 +9,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import eod_review
 import standup
-import task_audit
 
 
 def _write_work_file(tmp_path: Path, content: str) -> Path:
@@ -293,7 +292,7 @@ def test_task_audit_excludes_objective_headers_from_actionable_identity_findings
     assert "Send follow-up proposal" in missing_titles
 
 
-def test_task_audit_summary_uses_threshold_env_overrides(monkeypatch, tmp_path):
+def test_task_audit_summary_uses_threshold_env_overrides(tmp_path):
     old_due = (date.today() - timedelta(days=20)).isoformat()
     work = _write_work_file(
         tmp_path,
@@ -303,16 +302,30 @@ def test_task_audit_summary_uses_threshold_env_overrides(monkeypatch, tmp_path):
 - [ ] **Overdue launch task** task_id::tsk_overdue 🗓️{old_due} area:: Delivery
 """,
     )
-    monkeypatch.setenv("TASK_TRACKER_WORK_FILE", str(work))
-    monkeypatch.setenv("TASK_TRACKER_DAILY_NOTES_DIR", str(tmp_path / "daily"))
-    monkeypatch.setenv("TASK_TRACKER_DONE_LOG_DIR", str(tmp_path / "daily"))
-    monkeypatch.setenv("TASK_TRACKER_LEDGER_FILE", str(tmp_path / "events.jsonl"))
-    monkeypatch.setenv("TASK_AUDIT_STALE_DAYS", "30")
-    monkeypatch.setenv("TASK_AUDIT_CANDIDATE_DAYS", "11")
+    env = _env(tmp_path, work)
+    env["TASK_AUDIT_STALE_DAYS"] = "30"
+    env["TASK_AUDIT_CANDIDATE_DAYS"] = "11"
 
-    summary = task_audit.task_audit_summary(limit=10)
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, sys; "
+                "sys.path.insert(0, 'scripts'); "
+                "import task_audit; "
+                "print(json.dumps(task_audit.task_audit_summary(limit=10)))"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    summary = json.loads(proc.stdout)
     codes = {item["code"] for item in summary["items"]}
 
+    assert proc.returncode == 0
     assert summary["available"] is True
     assert "overdue-task" in codes
     assert "stale-active-task" not in codes
