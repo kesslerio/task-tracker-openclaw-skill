@@ -128,12 +128,25 @@ def open_loop(
     ``delivery_target`` is the PROOF record: an entry is only created with a
     proven target (the caller proves it first). It is stored so a re-fire can be
     checked against the live env (target_mismatch guard).
+
+    An existing entry is archived into ``archived_nag_loops`` only if it was a real
+    prior nag loop -- one that FIRED (``nag_count > 0``) or reached a terminal ack.
+    A body-double-only stub (``nag_count == 0``, never acked) is promoted in place
+    rather than archived as a phantom loop. Either way, any ACTIVE (non-ended)
+    body-double sessions on the existing entry are carried forward so opening a
+    fresh loop never drops a live session.
     """
     existing = state.get(task_id)
     entry = default_nag_entry(new_nag_loop_id(), delivery_target=delivery_target)
     if isinstance(existing, dict):
         entry["archived_nag_loops"] = list(existing.get("archived_nag_loops") or [])
-        entry["archived_nag_loops"].append(_archive_view(existing))
+        was_real_loop = int(existing.get("nag_count") or 0) > 0 or bool(existing.get("ack"))
+        if was_real_loop:
+            entry["archived_nag_loops"].append(_archive_view(existing))
+        entry["body_double_sessions"] = [
+            s for s in (existing.get("body_double_sessions") or [])
+            if isinstance(s, dict) and not s.get("ended_at")
+        ]
     entry["task_title"] = task_title
     entry["threshold_crossed"] = threshold_crossed
     entry["threshold_type"] = threshold_type

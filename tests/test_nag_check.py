@@ -405,6 +405,52 @@ def test_dry_run_writes_no_state_and_sends_nothing(harness):
     assert not (state / "nag-state.json").exists()  # no state written
 
 
+def test_dry_run_does_not_resolve_a_preexisting_open_loop(harness):
+    """--dry-run must not terminally ack/clear a real open loop or write the ledger
+    in the resolve pass (pass 1), even against live state with loops present."""
+    import task_ledger
+    board, state = harness
+    _run(harness)  # open a real loop for tsk_abc123
+    # Task leaves the board -> a real run would close it (verified_done).
+    board.write_text("# Work\n\n## 🟡 Q2\n", encoding="utf-8")
+    state_before = (state / "nag-state.json").read_text()
+    events_before = len(task_ledger.read_events(state / "events.jsonl"))
+
+    counts = nag_check.run_nag_check(dry_run=True, send=lambda t, x: None)
+    assert counts["closed"] == 1  # previewed, but...
+    assert (state / "nag-state.json").read_text() == state_before  # ...state unchanged
+    assert len(task_ledger.read_events(state / "events.jsonl")) == events_before
+    assert _state(state)["tsk_abc123"]["ack"] is False  # loop NOT resolved
+
+
+def test_body_double_stub_promoted_to_genuine_nag_opens_loop(tmp_path, monkeypatch):
+    """A body-double stub (nag_count==0, delivery_target=None) that later crosses
+    threshold must be promoted via open_loop -- emitting nag_opened and backfilling
+    delivery_target -- not silently fired as a loop with delivery_target:null."""
+    board = tmp_path / "Work Tasks.md"
+    board.write_text(
+        "# Work\n\n## 🟡 Q2\n- [ ] **AC** task_id::tsk_abc123 🗓️2026-06-15 area:: M\n",
+        encoding="utf-8")
+    state = tmp_path / "state"
+    _set_env(monkeypatch, board, state)
+    monkeypatch.setattr(nag_check, "_today", lambda: REF)  # already 4 days overdue
+    # Attach a body-double-only stub BEFORE any nag fires.
+    session = {"session_id": "bd_1", "cron_ids": ["c"], "started_at": "x", "ended_at": None}
+    nag_state.transition(lambda s: nag_state.add_body_double_session(s, "tsk_abc123", session))
+    assert _state(state)["tsk_abc123"]["nag_count"] == 0  # a stub
+
+    sent = []
+    nag_check.run_nag_check(send=lambda t, x: sent.append((t, x)))
+    assert len(sent) == 1
+    nag = _state(state)["tsk_abc123"]
+    assert nag["nag_count"] == 1
+    assert nag["delivery_target"] is not None  # backfilled, not null
+    # The active body-double session survives the promotion.
+    assert nag_state.active_body_double_session(nag) is not None
+    opened = [e for e in _events(state) if e["event_type"] == "nag_opened"]
+    assert opened  # nag_opened emitted for the promoted loop
+
+
 def test_dry_run_does_not_append_to_autonomy_audit_log(harness):
     """A --dry-run must NOT gate() (which appends an executed act) -- it only proves
     the target. Otherwise it manufactures a phantom undoable nag never sent."""

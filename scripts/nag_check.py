@@ -201,15 +201,19 @@ def run_nag_check(*, dry_run: bool = False,
     #      if its due date later lapses past threshold again, an acked entry is
     #      skipped forever. Clearing lets that future lapse open a fresh loop -- the
     #      same recycle the reactive /reschedule + recurring-/done paths use.
+    #    A dry-run PREVIEWS the resolve (counts it) but writes nothing -- it must
+    #    not terminally ack / clear a real loop or append a ledger event.
     for task_id, entry in list(nag_state.read_state().items()):
         if not (nag_state.is_open(entry) and nag_state.is_genuine_nag(entry)):
             continue
         record = active.get(task_id)
         if record is None:
-            _close(task_id, nag_state.CLOSED_VERIFIED_DONE, entry)
+            if not dry_run:
+                _close(task_id, nag_state.CLOSED_VERIFIED_DONE, entry)
             counts["closed"] += 1
         elif _crossed(record, ref=ref) is None:
-            _recycle(task_id, entry)
+            if not dry_run:
+                _recycle(task_id, entry)
             counts["closed"] += 1
 
     # 2. Open / re-fire loops for tasks that crossed their threshold.
@@ -267,7 +271,12 @@ def _fire_locked(live, task_id, record, section, overdue, *, ref, send):
     if not outcome["sent"]:
         return {"status": "blocked", "reason": outcome["reason"]}
 
-    opened = not nag_state.is_open(current)
+    # Open a fresh loop unless there is ALREADY a genuine open nag loop (one that
+    # has fired). An absent entry, an acked one, or a body-double-only STUB
+    # (nag_count==0) is not a genuine loop, so we open_loop -- which backfills the
+    # threshold/delivery_target metadata and emits nag_opened -- rather than
+    # silently promoting a stub to a firing loop with delivery_target:null.
+    opened = not (nag_state.is_open(current) and nag_state.is_genuine_nag(current))
     if opened:
         nag_state.open_loop(
             live, task_id, task_title=record.title,

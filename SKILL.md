@@ -230,8 +230,9 @@ bash scripts/telegram-commands.sh cancel-session <task_id>   # end a body-double
   `TELEGRAM_CHAT_ID_PRODUCTIVITY` / `OPENCLAW_TOPIC_PRODUCTIVITY_STANDUP` ⇒
   `nag_delivery_blocked:env_missing` and the loop STAYS OPEN.
 - Delivery: each proven+gated+asserted nag text is emitted on `nag_check.py`'s
-  stdout, which the cron job's explicit `delivery.to: -1003878985658:topic:2`
-  announces to topic 2. A nag is counted as sent only once its text is collected
+  stdout, which the cron job's explicit `delivery.to`
+  (`${TELEGRAM_CHAT_ID_PRODUCTIVITY}:topic:${OPENCLAW_TOPIC_PRODUCTIVITY_STANDUP}`,
+  topic 2) announces. A nag is counted as sent only once its text is collected
   for that announce — the script never logs `nag_sent` while delivering nothing.
 - `nag_check.py` is READ-ONLY on the board; all board mutations happen through the
   reactive command path (`/done`, `/reschedule`).
