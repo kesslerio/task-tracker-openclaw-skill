@@ -278,22 +278,30 @@ def run_debrief_capture(reference: str, notes: str, *,
         proactive_state.save_proactive_state(state)
         return {"captured": False, "task_ids": []}
 
+    # A retry after a partial failure re-submits the SAME notes, so skip any
+    # commitment whose title was already created on a prior attempt (recorded on the
+    # entry) -- this is the dedup that stops a retry from duplicating board tasks
+    # while still letting the previously-failed ones through.
+    already = set(entry.get("created_commitment_titles") or [])
     task_ids: list[str] = []
     failed: list[str] = []
     for spec in parse_commitments(notes):
+        if spec["title"] in already:
+            continue  # already created on a prior attempt -- do not duplicate
         task_id = _create_commitment_task(spec, runner=runner)
         if task_id is None:
             failed.append(spec["title"])
             continue
         task_ids.append(task_id)
+        already.add(spec["title"])
         _log("commitment_task_created", task_id=task_id, title=spec["title"], due=spec.get("due"))
 
     # NEVER lose a commitment: if ANY commitment failed to create, the loop stays
     # OPEN so the user can retry, rather than silently dropping it behind a closed
-    # loop. The successfully-created tasks are kept (a partial success is recorded),
-    # and the failures are surfaced for the next re-prompt / retry.
+    # loop. The created task ids + titles are recorded so a retry dedups; the
+    # failures are surfaced for the next re-prompt.
     if failed:
-        proactive_state.record_partial_debrief(state, event_id, task_ids)
+        proactive_state.record_partial_debrief(state, event_id, task_ids, sorted(already))
         proactive_state.save_proactive_state(state)
         _log("debrief_captured", event_key=event_id, commitments_task_ids=task_ids,
              failed_commitments=failed, partial=True)
@@ -515,29 +523,44 @@ def _block_already_placed(cal_state: dict[str, Any], task_id: str) -> bool:
     return focus_calendar.block_for_task(cal_state, task_id) is not None
 
 
+def _local_day_start(ref: datetime, *, day_start_hour: int, tz_offset_hours: int) -> datetime:
+    """The day-start anchor as a tz-aware timestamp in the user's LOCAL clock.
+
+    ``ref`` may be UTC (the cron is UTC-scheduled); this converts it to
+    ``UTC+tz_offset_hours``, pins it to ``day_start_hour:00`` LOCAL, and returns the
+    tz-aware result. So a 09:00 local anchor lands at the user's morning regardless
+    of the cron's clock -- the UTC-anchor bug. A fixed offset (no tz database) is
+    good enough for a focus-block start hint.
+    """
+    local_tz = timezone(timedelta(hours=tz_offset_hours))
+    local_ref = ref.astimezone(local_tz)
+    return local_ref.replace(hour=day_start_hour, minute=0, second=0, microsecond=0)
+
+
 def run_create_blocks(*, now: datetime | None = None, dry_run: bool = False,
                       send: Send | None = None,
                       runner: calendar_blocks.Runner | None = None,
-                      day_start_hour: int = 9) -> dict[str, int]:
+                      day_start_hour: int | None = None,
+                      tz_offset_hours: int | None = None) -> dict[str, int]:
     """Create freebusy-gated focus blocks for today's Defended Three.
 
     Reads the day's priorities from U3's ``focus-state.json`` (READ-ONLY -- U6
     never writes it), sizes each block from ``estimate_minutes``, and places them
-    back-to-back starting at ``day_start_hour`` -- each via the freebusy-gated
+    back-to-back starting at the user's LOCAL morning -- each via the freebusy-gated
     ``create_focus_block`` (NEVER-OVERBOOK-EXTERNAL: an overlap/unknown freebusy
     refuses that block; the others still place). Created blocks are recorded in
     ``focus-calendar.json`` and a confirmation notice is pushed through the proven
     delivery seam. Idempotent: a priority that already has an active block is
     skipped. Degrades silently when no focus calendar is configured.
 
-    ``day_start_hour`` is anchored in ``now``'s OWN timezone, so the morning anchor
-    is the user's local morning ONLY when the caller passes a local-time ``now``
-    (the cron runs in PT per the spec schedule). The default ``now`` is UTC, which
-    is correct for a UTC-scheduled caller; a PT cron must pass its local now. The
-    block start/end are emitted as the resulting tz-aware ISO timestamps, so the
-    freebusy check and the stored block are unambiguous either way.
+    The morning anchor is the user's LOCAL clock: ``day_start_hour`` (default from
+    ``FOCUS_BLOCK_DAY_START_HOUR``) interpreted in ``UTC + tz_offset_hours`` (default
+    from ``FOCUS_TZ_OFFSET_HOURS``), so a UTC-scheduled cron still lands blocks in
+    the morning rather than at UTC midnight.
     """
     ref = now or _now()
+    start_hour = day_start_hour if day_start_hour is not None else cos_config.focus_block_day_start_hour()
+    offset = tz_offset_hours if tz_offset_hours is not None else cos_config.focus_tz_offset_hours()
     counts = {"created": 0, "refused": 0, "skipped": 0}
     cal_state = focus_calendar.load_focus_calendar()
     calendar_id = cal_state.get("agent_calendar_id")
@@ -545,7 +568,7 @@ def run_create_blocks(*, now: datetime | None = None, dry_run: bool = False,
         return counts  # no focus calendar configured -- degrade silently
     priorities = (focus_state.load_focus_state() or {}).get("daily_priorities") or []
     fb_ids = calendar_blocks.external_calendar_ids()
-    cursor = ref.replace(hour=day_start_hour, minute=0, second=0, microsecond=0)
+    cursor = _local_day_start(ref, day_start_hour=start_hour, tz_offset_hours=offset)
     created_titles: list[str] = []
 
     for row in priorities:

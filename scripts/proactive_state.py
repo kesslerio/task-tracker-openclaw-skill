@@ -258,22 +258,32 @@ def mark_debrief_reprompted(entry: dict[str, Any], *, now: datetime) -> None:
 
 
 def capture_debrief(state: dict[str, Any], event_id: str, commitment_task_ids: list[str]) -> dict[str, Any] | None:
-    """Close a debrief loop by capturing commitments (sets ``debrief_captured_at``)."""
+    """Close a debrief loop by capturing commitments (sets ``debrief_captured_at``).
+
+    The created ids are MERGED with any recorded on a prior partial attempt (de-duped,
+    order preserved) so a successful retry preserves the commitments captured before
+    the failure rather than overwriting them.
+    """
     entry = find_pre_brief(state, event_id)
     if entry is None:
         return None
     entry["debrief_captured_at"] = _now_iso()
-    entry["commitments_task_ids"] = list(commitment_task_ids)
+    existing = entry.get("commitments_task_ids") or []
+    seen = set(existing)
+    entry["commitments_task_ids"] = existing + [t for t in commitment_task_ids if not (t in seen or seen.add(t))]
     return entry
 
 
-def record_partial_debrief(state: dict[str, Any], event_id: str, commitment_task_ids: list[str]) -> dict[str, Any] | None:
-    """Record successfully-created commitment ids WITHOUT closing the loop.
+def record_partial_debrief(state: dict[str, Any], event_id: str,
+                           commitment_task_ids: list[str],
+                           created_titles: list[str]) -> dict[str, Any] | None:
+    """Record successfully-created commitment ids + titles WITHOUT closing the loop.
 
     Used when some commitments failed to create: the loop stays OPEN (no
     ``debrief_captured_at``) so the user can retry rather than the agent silently
     dropping a commitment behind a closed loop. The created ids are merged (de-duped,
-    order preserved) onto the entry so a successful task is recorded once.
+    order preserved); ``created_titles`` records which commitment titles already have
+    a task, so a retry of the same notes dedups against them instead of duplicating.
     """
     entry = find_pre_brief(state, event_id)
     if entry is None:
@@ -281,6 +291,7 @@ def record_partial_debrief(state: dict[str, Any], event_id: str, commitment_task
     existing = entry.get("commitments_task_ids") or []
     seen = set(existing)
     entry["commitments_task_ids"] = existing + [t for t in commitment_task_ids if not (t in seen or seen.add(t))]
+    entry["created_commitment_titles"] = list(created_titles)
     return entry
 
 

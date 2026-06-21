@@ -306,6 +306,46 @@ def test_debrief_capture_resolves_by_summary(harness):
     assert proactive_state.is_debrief_open(reloaded["pre_briefs"][0]) is False  # closed
 
 
+def test_debrief_retry_after_partial_failure_does_not_duplicate(harness):
+    """autoreview: a retry after a partial failure re-submits the SAME notes but must
+    NOT re-create the commitment that already succeeded -- it only retries the failed
+    one. The first commitment succeeds, the second fails; on retry (second now
+    succeeds) only ONE new task is created."""
+    board, state = harness
+    st = proactive_state.load_proactive_state()
+    proactive_state.mark_pre_brief_sent(st, "evt_q3", "Q3 Review", "2026-06-20T09:00:00+00:00")
+    proactive_state.open_debrief(st, "evt_q3")
+    proactive_state.save_proactive_state(st)
+
+    notes = "I will ship the deck by 2026-06-30. Martin will review by 2026-07-02"
+    created: list = []
+
+    def first_runner(cmd):
+        # the FIRST commitment (ship the deck) succeeds; the SECOND (Martin review) fails
+        created.append(cmd[3])
+        if "ship the deck" in cmd[3]:
+            return types.SimpleNamespace(stdout=f"✅ Added work task: {cmd[3]} (tsk_ship)", stderr="", returncode=0)
+        return types.SimpleNamespace(stdout="", stderr="cap", returncode=2)
+
+    first = proactive_brief.run_debrief_capture("evt_q3", notes, runner=first_runner)
+    assert first["captured"] is False  # partial -> loop stays open
+    assert first["task_ids"] == ["tsk_ship"]
+
+    created.clear()
+
+    def retry_runner(cmd):
+        created.append(cmd[3])
+        return types.SimpleNamespace(stdout=f"✅ Added work task: {cmd[3]} (tsk_review)", stderr="", returncode=0)
+
+    second = proactive_brief.run_debrief_capture("evt_q3", notes, runner=retry_runner)
+    # only the previously-FAILED commitment is retried -- the succeeded one is NOT re-added
+    assert created == ["Martin will review"]
+    assert second["captured"] is True
+    reloaded = proactive_state.load_proactive_state()
+    # both commitment ids are recorded, no duplicate of the first
+    assert reloaded["pre_briefs"][0]["commitments_task_ids"] == ["tsk_ship", "tsk_review"]
+
+
 def test_debrief_capture_unknown_reference_refuses(harness):
     """A /debrief for an event with no OPEN loop refuses -- it never creates tasks."""
     board, state = harness

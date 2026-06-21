@@ -103,7 +103,7 @@ def test_create_blocks_places_freebusy_clear_priority(harness):
     _seed_priorities([{"task_id": "tsk_rel", "title": "Finalize release notes", "estimate_minutes": 120}])
     runner = _create_runner(_ext_free([]))
     sent: list = []
-    counts = proactive_brief.run_create_blocks(now=NOW, send=lambda t, x: sent.append(x), runner=runner)
+    counts = proactive_brief.run_create_blocks(now=NOW, tz_offset_hours=0, day_start_hour=9, send=lambda t, x: sent.append(x), runner=runner)
     assert counts["created"] == 1
     assert any(c[1:3] == ["calendar", "create"] for c in runner.calls)
     reloaded = focus_calendar.load_focus_calendar()
@@ -118,7 +118,7 @@ def test_create_blocks_refuses_on_external_overlap(harness):
     _seed_priorities([{"task_id": "tsk_rel", "title": "Finalize release notes", "estimate_minutes": 120}])
     # The 09:00-11:00 window overlaps an external meeting -> refuse.
     runner = _create_runner(_ext_free([{"start": "2026-06-20T09:30:00+00:00", "end": "2026-06-20T10:00:00+00:00"}]))
-    counts = proactive_brief.run_create_blocks(now=NOW, send=lambda t, x: None, runner=runner)
+    counts = proactive_brief.run_create_blocks(now=NOW, tz_offset_hours=0, day_start_hour=9, send=lambda t, x: None, runner=runner)
     assert counts["created"] == 0
     assert counts["refused"] == 1
     assert not any(c[1:3] == ["calendar", "create"] for c in runner.calls)
@@ -130,10 +130,10 @@ def test_create_blocks_idempotent_per_task(harness):
     _seed_focus_calendar()
     _seed_priorities([{"task_id": "tsk_rel", "title": "Finalize release notes", "estimate_minutes": 120}])
     runner = _create_runner(_ext_free([]))
-    proactive_brief.run_create_blocks(now=NOW, send=lambda t, x: None, runner=runner)
+    proactive_brief.run_create_blocks(now=NOW, tz_offset_hours=0, day_start_hour=9, send=lambda t, x: None, runner=runner)
     # second run: the block already exists -> skipped, no second create
     runner2 = _create_runner(_ext_free([]))
-    counts = proactive_brief.run_create_blocks(now=NOW, send=lambda t, x: None, runner=runner2)
+    counts = proactive_brief.run_create_blocks(now=NOW, tz_offset_hours=0, day_start_hour=9, send=lambda t, x: None, runner=runner2)
     assert counts["created"] == 0
     assert counts["skipped"] == 1
     assert not any(c[1:3] == ["calendar", "create"] for c in runner2.calls)
@@ -144,7 +144,7 @@ def test_create_blocks_no_focus_calendar_degrades(harness):
     # no focus calendar seeded
     _seed_priorities([{"task_id": "tsk_rel", "title": "x", "estimate_minutes": 60}])
     runner = _create_runner(_ext_free([]))
-    counts = proactive_brief.run_create_blocks(now=NOW, send=lambda t, x: None, runner=runner)
+    counts = proactive_brief.run_create_blocks(now=NOW, tz_offset_hours=0, day_start_hour=9, send=lambda t, x: None, runner=runner)
     assert counts == {"created": 0, "refused": 0, "skipped": 0}
     assert runner.calls == []
 
@@ -156,8 +156,23 @@ def test_create_blocks_never_writes_focus_state(harness):
     _seed_priorities([{"task_id": "tsk_rel", "title": "x", "estimate_minutes": 60}])
     before = focus_state.focus_state_path().read_text()
     runner = _create_runner(_ext_free([]))
-    proactive_brief.run_create_blocks(now=NOW, send=lambda t, x: None, runner=runner)
+    proactive_brief.run_create_blocks(now=NOW, tz_offset_hours=0, day_start_hour=9, send=lambda t, x: None, runner=runner)
     assert focus_state.focus_state_path().read_text() == before
+
+
+def test_create_blocks_anchors_to_local_morning_not_utc(harness):
+    """autoreview: a UTC `now` must place blocks at the user's LOCAL morning, not
+    UTC 09:00. With offset -7 (PT), a 09:00-local block starts at 16:00 UTC."""
+    board, state = harness
+    _seed_focus_calendar()
+    _seed_priorities([{"task_id": "tsk_rel", "title": "Finalize", "estimate_minutes": 60}])
+    runner = _create_runner(_ext_free([]))
+    # UTC now; offset -7 -> 09:00 PT == 16:00 UTC
+    proactive_brief.run_create_blocks(now=NOW, tz_offset_hours=-7, day_start_hour=9,
+                                      send=lambda t, x: None, runner=runner)
+    create_cmd = next(c for c in runner.calls if c[1:3] == ["calendar", "create"])
+    from_idx = create_cmd.index("--from") + 1
+    assert "T09:00:00-07:00" in create_cmd[from_idx]  # 09:00 LOCAL (PT), not UTC
 
 
 def test_create_block_is_gated_in_autonomy_log(harness):
@@ -169,7 +184,7 @@ def test_create_block_is_gated_in_autonomy_log(harness):
     _seed_focus_calendar()
     _seed_priorities([{"task_id": "tsk_rel", "title": "Finalize", "estimate_minutes": 120}])
     runner = _create_runner(_ext_free([]))
-    proactive_brief.run_create_blocks(now=NOW, send=lambda t, x: None, runner=runner)
+    proactive_brief.run_create_blocks(now=NOW, tz_offset_hours=0, day_start_hour=9, send=lambda t, x: None, runner=runner)
     acts = [a for a in autonomy_gate.read_autonomy_log() if a.get("act_type") == "calendar_block_created"]
     assert len(acts) == 1
     assert acts[0]["status"] == "executed"
