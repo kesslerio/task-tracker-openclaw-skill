@@ -108,7 +108,12 @@ def save_proactive_state(state: dict[str, Any]) -> dict[str, Any]:
     return state
 
 
-def _find_pre_brief(state: dict[str, Any], event_id: str) -> dict[str, Any] | None:
+def find_pre_brief(state: dict[str, Any], event_id: str) -> dict[str, Any] | None:
+    """Return the pre-brief entry for ``event_id``, or None.
+
+    Public so a caller can inspect a loop's open/closed state (e.g. the reactive
+    debrief-capture idempotency guard) without re-implementing the lookup.
+    """
     for entry in state.get("pre_briefs", []):
         if entry.get("event_id") == event_id:
             return entry
@@ -141,13 +146,13 @@ def pre_brief_due(state: dict[str, Any], event_id: str) -> bool:
     The mandatory ``*/5`` idempotency check (spec §4.6): a fire reads this before
     sending so a second fire within the lead window does not double-brief.
     """
-    entry = _find_pre_brief(state, event_id)
+    entry = find_pre_brief(state, event_id)
     return not (entry and entry.get("brief_sent"))
 
 
 def mark_pre_brief_sent(state: dict[str, Any], event_id: str, event_summary: str, event_start: str) -> dict[str, Any]:
     """Record that a pre-brief was sent for ``event_id``; returns the entry."""
-    entry = _find_pre_brief(state, event_id)
+    entry = find_pre_brief(state, event_id)
     if entry is None:
         entry = {
             "event_id": event_id,
@@ -175,7 +180,7 @@ def open_debrief(state: dict[str, Any], event_id: str) -> dict[str, Any] | None:
     caller may still re-send the gentle follow-up: a debrief loop closes ONLY on
     capture or skip, never by time (spec §5.5).
     """
-    entry = _find_pre_brief(state, event_id)
+    entry = find_pre_brief(state, event_id)
     if entry is None:
         return None
     if not entry.get("debrief_requested"):
@@ -223,7 +228,7 @@ def mark_debrief_reprompted(entry: dict[str, Any], *, now: datetime) -> None:
 
 def capture_debrief(state: dict[str, Any], event_id: str, commitment_task_ids: list[str]) -> dict[str, Any] | None:
     """Close a debrief loop by capturing commitments (sets ``debrief_captured_at``)."""
-    entry = _find_pre_brief(state, event_id)
+    entry = find_pre_brief(state, event_id)
     if entry is None:
         return None
     entry["debrief_captured_at"] = _now_iso()
@@ -233,7 +238,7 @@ def capture_debrief(state: dict[str, Any], event_id: str, commitment_task_ids: l
 
 def skip_debrief(state: dict[str, Any], event_id: str) -> dict[str, Any] | None:
     """Close a debrief loop by user skip (sets ``debrief_skipped_at``)."""
-    entry = _find_pre_brief(state, event_id)
+    entry = find_pre_brief(state, event_id)
     if entry is None:
         return None
     entry["debrief_skipped_at"] = _now_iso()

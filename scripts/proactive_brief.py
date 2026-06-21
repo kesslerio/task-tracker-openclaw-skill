@@ -232,8 +232,18 @@ def run_debrief_capture(event_key: str, notes: str, *,
     (which sets ``debrief_captured_at`` -> the loop is CLOSED), and emit
     ``commitment_task_created`` + ``debrief_captured`` ledger events. A "skip" (no
     commitments) closes the loop via skip instead. Returns ``{captured, task_ids}``.
+
+    Idempotent: a re-invocation for a loop that is ALREADY closed (captured or
+    skipped) is a no-op -- it never re-parses the notes or re-adds the commitment
+    tasks, so a retry / double-submit cannot duplicate tasks (mirrors the
+    ``pre_brief_due`` guard the cron flows use). Returns
+    ``{captured: False, reason: "already_closed"}`` in that case.
     """
     state = proactive_state.load_proactive_state()
+    entry = proactive_state.find_pre_brief(state, event_key)
+    if entry is not None and not proactive_state.is_debrief_open(entry):
+        return {"captured": False, "task_ids": [], "reason": "already_closed"}
+
     if notes.strip().lower() == "skip":
         proactive_state.skip_debrief(state, event_key)
         proactive_state.save_proactive_state(state)

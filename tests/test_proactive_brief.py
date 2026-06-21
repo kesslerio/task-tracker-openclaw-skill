@@ -253,6 +253,35 @@ def test_debrief_capture_creates_tasks_and_closes_loop(harness):
     assert reloaded["pre_briefs"][0]["commitments_task_ids"] == ["tsk_commit1", "tsk_commit2"]
 
 
+def test_debrief_capture_idempotent_on_closed_loop(harness):
+    """autoreview: a second /debrief for an already-closed loop is a NO-OP -- it
+    never re-parses the notes or duplicates commitment tasks."""
+    board, state = harness
+    st = proactive_state.load_proactive_state()
+    proactive_state.mark_pre_brief_sent(st, "evt_q3", "Q3 Review", "2026-06-20T09:00:00+00:00")
+    proactive_state.open_debrief(st, "evt_q3")
+    proactive_state.save_proactive_state(st)
+
+    calls: list = []
+
+    def fake_runner(cmd):
+        calls.append(cmd)
+        return types.SimpleNamespace(
+            stdout=f"✅ Added work task: {cmd[3]} (tsk_commit{len(calls)})", stderr="", returncode=0)
+
+    notes = "I will ship by 2026-06-30"
+    first = proactive_brief.run_debrief_capture("evt_q3", notes, runner=fake_runner)
+    assert first["captured"] is True and first["task_ids"] == ["tsk_commit1"]
+    # second invocation for the now-CLOSED loop adds NOTHING
+    second = proactive_brief.run_debrief_capture("evt_q3", notes, runner=fake_runner)
+    assert second["captured"] is False
+    assert second["reason"] == "already_closed"
+    assert len(calls) == 1  # the task was added exactly once
+    # the first batch's ids are preserved, not overwritten
+    reloaded = proactive_state.load_proactive_state()
+    assert reloaded["pre_briefs"][0]["commitments_task_ids"] == ["tsk_commit1"]
+
+
 def test_debrief_skip_closes_loop_no_tasks(harness):
     board, state = harness
     st = proactive_state.load_proactive_state()
