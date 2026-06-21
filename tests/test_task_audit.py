@@ -155,7 +155,7 @@ def test_standup_and_eod_render_unavailable_audit_as_error(monkeypatch):
 
     monkeypatch.setattr(standup, "task_audit_summary", lambda limit=3: unavailable)
     monkeypatch.setattr(standup, "candidate_review_summary", lambda: {})
-    monkeypatch.setattr(standup, "get_calendar_events", lambda: {})
+    monkeypatch.setattr(standup, "get_calendar_events", lambda trigger="calendar_fetch": {})
     standup_text = standup.generate_standup(
         date_str="2026-05-22",
         tasks_data={"q1": [], "q2": [], "q3": [], "team": [], "done": [], "due_today": [], "all": []},

@@ -21,6 +21,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import error_envelope
 from candidate_review import candidate_review_summary
 from task_audit import task_audit_summary
 from utils import load_tasks
@@ -347,4 +349,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(error_envelope.run_main("eod_review", main))

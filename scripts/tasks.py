@@ -22,6 +22,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).parent))
+import error_envelope
 from daily_notes import extract_completed_tasks
 from candidate_review import candidate_review_summary
 from evidence_matching import (
@@ -1644,4 +1645,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(error_envelope.run_main("tasks", main))
