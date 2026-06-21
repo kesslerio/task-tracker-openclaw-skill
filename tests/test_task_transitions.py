@@ -236,17 +236,21 @@ def test_done_restores_completion_log_when_board_write_fails(tmp_path, monkeypat
     monkeypatch.setenv("TASK_TRACKER_LEDGER_FILE", env["TASK_TRACKER_LEDGER_FILE"])
     monkeypatch.setattr(task_records, "get_tasks_file", lambda personal=False: (work, "obsidian"))
 
-    original_write_text = Path.write_text
-    failed = False
+    # The board write now goes through utils._atomic_write (temp file + os.replace),
+    # and the rollback restore goes through it too (atomic restore). Fail ONLY the
+    # forward board write; let the atomic restore proceed so the invariant still
+    # holds: a failed board write restores snapshots and reports
+    # task-state-write-failed.
+    real_atomic_write = task_transitions._atomic_write
+    state = {"forward_failed": False}
 
-    def fail_first_board_write(path_obj, content, *args, **kwargs):
-        nonlocal failed
-        if path_obj == work and not failed:
-            failed = True
+    def fail_board_write(path_obj, content):
+        if Path(path_obj) == work and not state["forward_failed"]:
+            state["forward_failed"] = True
             raise OSError("simulated board write failure")
-        return original_write_text(path_obj, content, *args, **kwargs)
+        return real_atomic_write(path_obj, content)
 
-    monkeypatch.setattr(Path, "write_text", fail_first_board_write)
+    monkeypatch.setattr(task_transitions, "_atomic_write", fail_board_write)
 
     result = task_transitions.complete_by_id("tsk_ship")
 
@@ -476,3 +480,51 @@ def test_done_removes_indented_block_across_blank_line(tmp_path):
     assert "first note" not in content
     assert "second note" not in content
     assert "Other task" in content
+
+
+def test_restore_snapshots_is_atomic(tmp_path, monkeypatch):
+    """Finding #6: rollback must be at least as crash-safe as the forward path.
+
+    Assert _restore_snapshots routes existing-file restores through the atomic
+    writer (temp+replace) rather than a non-atomic write_text, and that a crash
+    mid-restore leaves the destination untouched (no truncation)."""
+    import utils
+
+    target = tmp_path / "board.md"
+    target.write_text("CURRENT (post-failed-write) CONTENT\n")
+    snapshot_content = "ORIGINAL SNAPSHOT CONTENT\n" * 20
+
+    # Capture the writer used for the restore.
+    calls = []
+    real_atomic_write = utils._atomic_write
+
+    def tracking_atomic_write(path_obj, content):
+        calls.append(Path(path_obj))
+        return real_atomic_write(path_obj, content)
+
+    monkeypatch.setattr(task_transitions, "_atomic_write", tracking_atomic_write)
+    task_transitions._restore_snapshots({target: (True, snapshot_content)})
+
+    assert calls == [target], "restore must go through the atomic writer"
+    assert target.read_text() == snapshot_content
+
+
+def test_restore_snapshots_crash_mid_restore_leaves_target_intact(tmp_path, monkeypatch):
+    """If os.replace fails during the atomic restore, the destination is not
+    truncated -- the same crash-safety the forward path has."""
+    import utils
+
+    target = tmp_path / "board.md"
+    current = "CURRENT CONTENT THAT MUST SURVIVE A FAILED RESTORE\n" * 10
+    target.write_text(current)
+
+    def boom(src, dst):
+        raise OSError("simulated crash during restore replace")
+
+    monkeypatch.setattr(utils.os, "replace", boom)
+
+    # _restore_after_failure swallows the OSError and reports it; the destination
+    # must be byte-for-byte the pre-restore content (never half-written).
+    err = task_transitions._restore_after_failure({target: (True, "SNAPSHOT\n")})
+    assert err is not None
+    assert target.read_text() == current
