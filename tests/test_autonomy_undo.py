@@ -108,16 +108,16 @@ def test_work_group_target_is_blocked_at_gate():
     assert result["record"]["delivery_target"] is None
 
 
-def test_rung3_push_act_is_disabled_in_v0_1():
-    """Board-only: a rung-3 act naming a PROVEN target is still blocked (no push)."""
-    assert autonomy_gate.RUNG3_PUSH_ENABLED is False
+def test_rung3_push_act_is_enabled_in_v0_2():
+    """v0.2 (U4) ships the delivery seam: a rung-3 act naming a PROVEN target
+    executes + binds, and a send to that SAME target is then authorised. The proof
+    is unchanged -- an unproven target is still blocked (see the work-group test)."""
+    assert autonomy_gate.RUNG3_PUSH_ENABLED is True
     result = autonomy_gate.gate("nag_sent", delivery_target=TOPIC_2, unit="U4")
-    assert result["ok"] is False
-    assert result["reason"] == "push-disabled"
-    # It was logged as a blocked push, and a send for it is refused.
-    check = autonomy_gate.assert_send_target(result["act_id"], TOPIC_2)
-    assert check["ok"] is False
-    assert check["reason"] == "act-not-authorised"
+    assert result["ok"] is True
+    assert result["delivery_target"] == TOPIC_2
+    # The send to the gated target is authorised; any other target is not.
+    assert autonomy_gate.assert_send_target(result["act_id"], TOPIC_2)["ok"] is True
 
 
 def test_rung3_board_only_act_without_target_still_executes():
@@ -136,9 +136,9 @@ def test_rung3_board_only_act_without_target_still_executes():
 def _gate_nag_executed(task_id):
     """Gate a nag act to 'executed' for undo tests.
 
-    v0.1 blocks rung-3 PUSH acts, so to exercise the nag undo path we register
-    nag_sent as a board-only rung-2 act (no delivery_target) -- the undo logic is
-    keyed on act_type prefix + snapshot shape, not the rung.
+    The undo path is keyed on act_type prefix + snapshot shape, not the rung, so
+    we register nag_sent as a board-only rung-2 act (no delivery_target) and gate
+    it with a snapshot. This isolates the undo logic from the push/delivery seam.
     """
     _override_rung("nag_sent", autonomy_gate.RUNG_APPROVE)
     snap = {"file": "/tmp/nope.md", "raw_line": "", "line_number": 0}  # nag has no board line

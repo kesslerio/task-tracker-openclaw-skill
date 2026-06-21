@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Telegram slash command wrapper for task-tracker skill
-# Usage: telegram-commands.sh {daily|weekly|done24h|done7d|audit|undo}
+# Usage: telegram-commands.sh {daily|weekly|done24h|done7d|audit|undo|
+#                              done|reschedule|snooze|body-double|cancel-session|nag-check}
 #
 # U1 NO-RAW-ERROR-LEAK boundary: every python3 invocation goes through
 # run_with_envelope, which captures stdout AND stderr. On a non-zero exit the
@@ -109,8 +110,22 @@ case "$1" in
     shift
     run_with_envelope "undo" python3 "$SCRIPT_DIR/autonomy_cli.py" undo "$@"
     ;;
+  done|reschedule|snooze|body-double|cancel-session)
+    # U4 reactive nag commands. Each mutates the board (where applicable) and then
+    # closes/pauses the nag loop SYNCHRONOUSLY in the same turn (origin-proven, no
+    # proactive push). The subcommand name is $1; the rest are its args.
+    sub="$1"; shift
+    run_with_envelope "$sub" python3 "$SCRIPT_DIR/nag_commands.py" "$sub" "$@"
+    ;;
+  nag-check)
+    # U4 nag engine (cron). Proactive push: every nag goes through
+    # prove_delivery_target + the gated act_id + assert_send_target. An unset env
+    # blocks the push and leaves the loop open (never silently clears).
+    shift
+    run_with_envelope "nag_check" python3 "$SCRIPT_DIR/nag_check.py" "$@"
+    ;;
   *)
-    echo "Usage: $0 {daily|weekly|done24h|done7d|audit|undo}"
+    echo "Usage: $0 {daily|weekly|done24h|done7d|audit|undo|done|reschedule|snooze|body-double|cancel-session|nag-check}"
     exit 1
     ;;
 esac
