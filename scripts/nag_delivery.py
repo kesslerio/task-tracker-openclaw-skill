@@ -20,6 +20,17 @@ session reply -- this module proves the target and authorises it; the caller doe
 the I/O only after ``ok`` is True.  ``send`` is injectable so tests can assert
 "sent vs blocked" without a live gateway.
 
+Transport-binding boundary (by design): the production ``send`` collects the
+proven nag text for the cron to announce; the bytes themselves leave via the
+gateway cron descriptor's ``delivery.to``, which is templated from the SAME env
+vars this module proves against (``TELEGRAM_CHAT_ID_PRODUCTIVITY`` +
+``OPENCLAW_TOPIC_PRODUCTIVITY_STANDUP``). The proof therefore gates WHETHER text is
+emitted (an unset / work-group env blocks emission, so nothing is announced) and
+binds the in-process seam; it cannot reach into the out-of-process gateway
+descriptor to re-assert its ``delivery.to`` at fire time. Keeping both surfaces
+sourced from one env pair is the binding -- the cron descriptor's ``delivery.to``
+MUST stay env-templated, never a literal, so the two never diverge.
+
 When the proof or seam fails, the caller MUST treat it as ``nag_delivery_blocked``
 and leave the nag OPEN -- the env var being unset never clears a loop.
 """

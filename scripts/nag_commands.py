@@ -314,23 +314,14 @@ def handle_body_double(
             "code": "invalid-duration",
             "message": f"Body-double duration must be like 90m/1h; got {duration!r}.",
         }}
-
-    record = _active_record(task_id, personal=personal)
-    if record is None:
+    if _active_record(task_id, personal=personal) is None:
         return {"ok": False, "error": {
             "code": "task-not-active",
             "message": "I can't body-double a task that isn't on your active board.",
         }}
-
-    existing = nag_state.read_state().get(task_id)
-    active_session = nag_state.active_body_double_session(existing)
+    active_session = nag_state.active_body_double_session(nag_state.read_state().get(task_id))
     if active_session is not None:
-        return {"ok": False, "error": {
-            "code": "session-already-active",
-            "message": (f"There's already an active body-double session for this task "
-                        f"(started at {active_session.get('started_at')}). "
-                        f"Reply /cancel-session {task_id} to end it first."),
-        }}
+        return _session_active_error(task_id, active_session.get("started_at"))
 
     proof = nag_delivery.resolve_target()
     if not proof["ok"]:
@@ -339,11 +330,54 @@ def handle_body_double(
             "message": "Cannot prove a check-in delivery target; body-double not started.",
             "reason": proof["reason"],
         }}
-    delivery_target = proof["delivery_target"]
 
     session_id = f"bd_{uuid.uuid4().hex[:12]}"
     started_at = _now()
-    create = create_cron or cron_backend.create_cron
+    created = _create_checkin_crons(session_id, task_id, minutes, started_at,
+                                    proof["delivery_target"],
+                                    create=create_cron or cron_backend.create_cron)
+    if not created["ok"]:
+        return created["error"]
+
+    session = {"session_id": session_id, "cron_ids": created["cron_ids"],
+               "started_at": started_at.isoformat(), "duration_min": minutes,
+               "delivery_target": proof["delivery_target"], "ended_at": None, "outcome": None}
+    # The append re-validates the one-session-per-task invariant UNDER the lock; if
+    # a concurrent /body-double won the race it returns None and we roll back the
+    # crons we just created (the early pre-check above is only fast feedback).
+    if nag_state.transition(lambda s: nag_state.add_body_double_session(s, task_id, session)) is None:
+        for cron_id in created["cron_ids"]:
+            _safe_delete(cron_id)
+        return _session_active_error(task_id)
+
+    _log("body_double_started", task_id=task_id, session_id=session_id,
+         duration_min=minutes, cron_ids=created["cron_ids"])
+    return {"ok": True, "task_id": task_id, "session_id": session_id,
+            "cron_ids": created["cron_ids"], "duration_min": minutes,
+            "ack": "Session started. I'll check in at the halfway and end points. "
+                   "What are you aiming to finish?"}
+
+
+def _session_active_error(task_id: str, started_at: str | None = None) -> dict[str, Any]:
+    """The 'a session is already active' refusal (early pre-check + under-lock race)."""
+    when = f" (started at {started_at})" if started_at else ""
+    return {"ok": False, "error": {
+        "code": "session-already-active",
+        "message": (f"There's already an active body-double session for this task{when}. "
+                    f"Reply /cancel-session {task_id} to end it first."),
+    }}
+
+
+def _create_checkin_crons(session_id, task_id, minutes, started_at, delivery_target,
+                          *, create: Callable[[dict[str, Any]], str]) -> dict[str, Any]:
+    """Create the check-in cron pair; roll back partial creation on failure.
+
+    Returns ``{"ok": True, "cron_ids": [...]}`` on success, or ``{"ok": False,
+    "error": <handler-result>}`` where ``error`` is the full structured result the
+    caller returns. A backend failure deletes any cron already created so no
+    half-started session is left behind (the caller must not record a session or
+    report "started").
+    """
     cron_ids: list[str] = []
     try:
         for fraction in _CHECKIN_FRACTIONS:
@@ -354,45 +388,14 @@ def handle_body_double(
             )
             cron_ids.append(create(descriptor))
     except cron_backend.CronBackendError as exc:
-        # A check-in cron could not be scheduled. Do NOT record a half-started
-        # session or report "started" -- the session would have no working
-        # check-ins. Best-effort delete any crons created before the failure.
         for cron_id in cron_ids:
             _safe_delete(cron_id)
-        return {"ok": False, "error": {
+        return {"ok": False, "error": {"ok": False, "error": {
             "code": "checkin-cron-failed",
             "message": "Could not schedule the body-double check-ins; session not started.",
             "reason": str(exc),
-        }}
-
-    session = {
-        "session_id": session_id,
-        "cron_ids": cron_ids,
-        "started_at": started_at.isoformat(),
-        "duration_min": minutes,
-        "delivery_target": delivery_target,
-        "ended_at": None,
-        "outcome": None,
-    }
-    # The append re-validates the one-session-per-task invariant UNDER the lock; if
-    # a concurrent /body-double won the race, it returns None and we roll back the
-    # crons we just created (the early pre-check above is only fast feedback).
-    added = nag_state.transition(
-        lambda state: nag_state.add_body_double_session(state, task_id, session))
-    if added is None:
-        for cron_id in cron_ids:
-            _safe_delete(cron_id)
-        return {"ok": False, "error": {
-            "code": "session-already-active",
-            "message": (f"There's already an active body-double session for this task. "
-                        f"Reply /cancel-session {task_id} to end it first."),
-        }}
-    _log("body_double_started", task_id=task_id, session_id=session_id,
-         duration_min=minutes, cron_ids=cron_ids)
-    return {"ok": True, "task_id": task_id, "session_id": session_id,
-            "cron_ids": cron_ids, "duration_min": minutes,
-            "ack": "Session started. I'll check in at the halfway and end points. "
-                   "What are you aiming to finish?"}
+        }}}
+    return {"ok": True, "cron_ids": cron_ids}
 
 
 def handle_cancel_session(
