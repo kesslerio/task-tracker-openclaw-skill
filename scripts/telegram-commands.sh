@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Telegram slash command wrapper for task-tracker skill
-# Usage: telegram-commands.sh {daily|weekly|done|ledger|approve|audit|undo}
+# Usage: telegram-commands.sh {daily|weekly|done|reschedule|snooze|body-double|cancel-session|
+#                              done24h|done7d|ledger|approve|nag-check|audit|undo}
 #
 # U1 NO-RAW-ERROR-LEAK boundary: every python3 invocation goes through
 # run_with_envelope, which captures stdout AND stderr. On a non-zero exit the
@@ -69,14 +70,14 @@ case "$1" in
     # Show Q1 and Q2 tasks
     run_with_envelope "weekly_review" python3 "$SCRIPT_DIR/weekly_review.py"
     ;;
-  done)
+  done24h)
     # U5: replaces the broken done24h. Harvests the last 24h of shipped work
     # (merged PRs + sent mail), matches it against the active board, and prints a
     # brag-doc draft. Reactive: the agent relays the draft to the originating
     # topic, and an explicit /approve marks a matched task done.
     run_with_envelope "ledger_harvest" python3 "$SCRIPT_DIR/harvest_ledger.py" harvest --window 24h
     ;;
-  ledger)
+  done7d|ledger)
     # U5: replaces the broken done7d. Harvests the current ISO week and proves
     # the Done-topic delivery target before the draft is pushed.
     run_with_envelope "ledger_harvest" python3 "$SCRIPT_DIR/harvest_ledger.py" harvest --window week
@@ -101,8 +102,22 @@ case "$1" in
     shift
     run_with_envelope "undo" python3 "$SCRIPT_DIR/autonomy_cli.py" undo "$@"
     ;;
+  done|reschedule|snooze|body-double|cancel-session)
+    # U4 reactive nag commands. Each mutates the board (where applicable) and then
+    # closes/pauses the nag loop SYNCHRONOUSLY in the same turn (origin-proven, no
+    # proactive push). The subcommand name is $1; the rest are its args.
+    sub="$1"; shift
+    run_with_envelope "$sub" python3 "$SCRIPT_DIR/nag_commands.py" "$sub" "$@"
+    ;;
+  nag-check)
+    # U4 nag engine (cron). Proactive push: every nag goes through
+    # prove_delivery_target + the gated act_id + assert_send_target. An unset env
+    # blocks the push and leaves the loop open (never silently clears).
+    shift
+    run_with_envelope "nag_check" python3 "$SCRIPT_DIR/nag_check.py" "$@"
+    ;;
   *)
-    echo "Usage: $0 {daily|weekly|done|ledger|approve|audit|undo}"
+    echo "Usage: $0 {daily|weekly|done|reschedule|snooze|body-double|cancel-session|done24h|done7d|ledger|approve|nag-check|audit|undo}"
     exit 1
     ;;
 esac

@@ -54,14 +54,31 @@ DEFAULT_RUNG_FOR_UNKNOWN = RUNG_DRAFT
 RUNG_MIN = RUNG_READ
 RUNG_MAX = RUNG_NEVER_AUTO
 
-# v0.1 ships board-only (Decision: U2 owns "rung-3 push acts DISABLED"). A
-# rung-3 monitored-auto act is reversible enough to auto-execute, but in v0.1 the
-# proactive-push delivery seam (U4/U5/U6) has NOT shipped, so a rung-3 act that
-# names a delivery_target is a Telegram PUSH and must be blocked here -- not just
-# left unsent downstream. Flipping this to True is the explicit v0.2 gate, paired
-# with the U4/U5/U6 delivery wiring. A rung-3 act with NO delivery_target (a pure
-# board mutation) is unaffected; only the push variant is disabled.
-RUNG3_PUSH_ENABLED = False
+# v0.2 ships the proactive-push delivery seam (U4 nag engine). A rung-3
+# monitored-auto act that names a PROVEN delivery_target is now permitted to
+# execute and bind its target -- the gate<->message seam (assert_send_target)
+# still enforces that the SAME proven target is the sole permitted destination,
+# so flipping this on does NOT relax the delivery-target proof: an unproven /
+# work-group / env-missing target is still blocked upstream at
+# ``blocked:unproven-target`` (the in-gate prove), and a send to any other target
+# is still blocked at ``target-mismatch``. This was the explicit v0.2 gate paired
+# with U4's delivery wiring; v0.1 shipped it False (board-only). A rung-3 act with
+# NO delivery_target (a pure board mutation) was always unaffected.
+RUNG3_PUSH_ENABLED = True
+
+# Acts that are a proactive PUSH and make NO board write, anchored IN CODE. These
+# are the ONLY acts exempt from the pre-action board snapshot requirement: their
+# reversal is the ack (e.g. /undo acks the nag loop), not a board-line restore, so
+# there is nothing on the board to snapshot. The exemption is keyed on this
+# explicit allowlist -- NOT inferred from (rung, has-target) -- so a FUTURE rung-3
+# act that names a delivery_target AND rewrites a board line is NOT silently
+# exempted and keeps its mandatory undo snapshot. To add a new push act here, it
+# must genuinely make no board mutation.
+PUSH_NO_BOARD_WRITE_ACTS: frozenset[str] = frozenset({
+    "nag_sent",            # U4 nag re-fire -- reversal is the ack, not a board edit
+    "body_double_checkin",  # U4 body-double check-in -- pure push
+    "brief_sent",          # U6 daily brief / pre-brief / slip notice / Friday proposal -- pure push
+})
 
 # Irreversible-act rungs anchored IN CODE (Finding #3b). These are the acts that
 # must never auto-execute regardless of what a JSON override claims; a corrupt or
@@ -80,6 +97,17 @@ DEFAULT_ACT_TYPE_RUNGS: dict[str, int] = {
     # frozen in v0.1. Board mutations are execute-with-approval -> rung 2.
     "nag_sent": RUNG_MONITORED_AUTO,
     "nag_acked": RUNG_MONITORED_AUTO,
+    "body_double_checkin": RUNG_MONITORED_AUTO,  # U4 push, no board write
+    # U6 proactive layer. A brief/pre-brief/slip-notice/Friday-proposal push is
+    # reversible (it is just a message; its "undo" is reading the channel) and
+    # makes no board write -> rung 3 (monitored-auto), exempt from the snapshot
+    # requirement via PUSH_NO_BOARD_WRITE_ACTS. A focus-block create/move IS a
+    # calendar write but it is agent-owned and reversible by construction (the
+    # event id is stored; move/delete undoes it) -> rung 3. A focus-block DELETE
+    # is irreversible -> already anchored at rung 4 above.
+    "brief_sent": RUNG_MONITORED_AUTO,
+    "calendar_block_created": RUNG_MONITORED_AUTO,
+    "calendar_block_moved": RUNG_MONITORED_AUTO,
     "wip_cap_enforced": RUNG_APPROVE,
     "task_marked_done": RUNG_APPROVE,
     "focus_set": RUNG_APPROVE,
@@ -416,11 +444,22 @@ def gate(
                           delivery_target=proven_target, **common)
         return {"ok": False, "reason": "push-disabled", "act_id": act_id, "record": record}
 
-    # TOCTOU: snapshot taken now, right before authorising the write. A snapshot is
-    # mandatory at rung >= APPROVE irrespective of reversible -- reversible=False is
-    # NOT an escape hatch for skipping the pre-action snapshot.
+    # TOCTOU: snapshot taken now, right before authorising the write. A pre-action
+    # snapshot is the undo substrate for a BOARD MUTATION (an act that rewrites a
+    # markdown line); it is mandatory at rung >= APPROVE irrespective of reversible
+    # -- reversible=False is NOT an escape hatch for skipping it.
+    #
+    # A proactive PUSH that makes NO board write (the explicit
+    # PUSH_NO_BOARD_WRITE_ACTS allowlist -- e.g. U4 nag_sent / body_double_checkin)
+    # has nothing on the board to snapshot; its reversal is the ack (`/undo` acks
+    # the nag loop, not a line restore). So those acts are exempt from the snapshot
+    # requirement -- the delivery-target proof + the gate<->message seam are THEIR
+    # safety substrate. The exemption is keyed on the explicit allowlist, NOT
+    # inferred from (rung, has-target): a rung-2 board mutation still needs its
+    # snapshot, and a future rung-3 act that DOES write the board is not exempted.
     snapshot = snapshot_provider() if snapshot_provider is not None else None
-    if rung >= RUNG_APPROVE and snapshot is None:
+    is_push = act_type in PUSH_NO_BOARD_WRITE_ACTS and proven_target is not None
+    if rung >= RUNG_APPROVE and snapshot is None and not is_push:
         record = _log_act(act_id, act_type, rung, "blocked:missing-snapshot",
                           delivery_target=proven_target, **common)
         return {"ok": False, "reason": "missing-snapshot", "act_id": act_id, "record": record}

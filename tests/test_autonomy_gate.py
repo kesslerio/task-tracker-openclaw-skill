@@ -85,13 +85,30 @@ def test_send_to_non_gated_target_blocked():
     assert check["gated_target"] == TOPIC_2
 
 
-def test_nag_sent_push_is_frozen_in_v0_1():
-    """nag_sent is a real rung-3 push; v0.1 ships board-only, so it is blocked."""
-    assert autonomy_gate.rung_for_act_type("nag_sent") == autonomy_gate.RUNG_MONITORED_AUTO
-    assert autonomy_gate.RUNG3_PUSH_ENABLED is False
-    result = autonomy_gate.gate("nag_sent", delivery_target=TOPIC_2, unit="U4")
+def test_snapshot_exemption_is_keyed_on_explicit_push_allowlist():
+    """The snapshot exemption is the explicit PUSH_NO_BOARD_WRITE_ACTS allowlist,
+    NOT inferred from (rung, has-target): a rung-3 act that names a target but is
+    NOT a registered no-board-write push still requires its snapshot."""
+    _write_config_with_override("rung3_board_push", autonomy_gate.RUNG_MONITORED_AUTO)
+    assert "rung3_board_push" not in autonomy_gate.PUSH_NO_BOARD_WRITE_ACTS
+    result = autonomy_gate.gate("rung3_board_push", delivery_target=TOPIC_2, unit="U6")
     assert result["ok"] is False
-    assert result["reason"] == "push-disabled"
+    assert result["reason"] == "missing-snapshot"
+    # An allowlisted push act with the same rung+target is exempt and executes.
+    assert "nag_sent" in autonomy_gate.PUSH_NO_BOARD_WRITE_ACTS
+    ok = autonomy_gate.gate("nag_sent", delivery_target=TOPIC_2, unit="U4")
+    assert ok["ok"] is True
+
+
+def test_nag_sent_push_enabled_in_v0_2():
+    """nag_sent is a real rung-3 push; v0.2 (U4) ships the delivery seam, so a
+    PROVEN target now executes + binds. The proof is NOT relaxed -- an unproven
+    target is still blocked at the in-gate prove (see test_gate_blocks_* above)."""
+    assert autonomy_gate.rung_for_act_type("nag_sent") == autonomy_gate.RUNG_MONITORED_AUTO
+    assert autonomy_gate.RUNG3_PUSH_ENABLED is True
+    result = autonomy_gate.gate("nag_sent", delivery_target=TOPIC_2, unit="U4")
+    assert result["ok"] is True
+    assert result["delivery_target"] == TOPIC_2
 
 
 def test_send_for_unknown_act_blocked():

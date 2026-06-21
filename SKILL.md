@@ -27,6 +27,31 @@ Use this skill when the user asks to:
 - Report completed daily items against weekly todos without changing canonical
   task state
 - Review completion evidence candidates before confirming task completion
+- Schedule freebusy-gated focus blocks for the day's priorities on an agent-owned
+  "Task Focus" calendar, send a morning brief / pre-brief / debrief, and propose
+  next week's priorities on Friday (U6 proactive layer; opt-in — degrades silently
+  when the focus calendar / `STANDUP_CALENDARS` are absent and never overbooks)
+
+## Proactive layer (U6)
+
+`scripts/proactive_brief.py --mode {brief,prebrief,slip,friday,create}` is the cron
+entry point for the proactive layer, plus `--mode debrief-capture --event-key <id>
+--notes "<notes>"` for the reactive `/debrief` path. Every push proves its delivery
+target FIRST (`prove_delivery_target` -> gated `act_id` -> `assert_send_target`) and
+lands only on the proven Productivity topic; an unset/wrong target blocks the push
+and sends nothing.
+
+- `create` places freebusy-gated focus blocks for the day's Defended Three (read
+  from U3's `focus-state.json`, never written by U6); `slip` slides a slipped block
+  to the next free window and notifies the user.
+- Calendar writes go through `scripts/calendar_blocks.py`, which freebusy-gates
+  every create/move against EXTERNAL calendars (an overlap OR an unknown freebusy
+  refuses the write — NEVER-OVERBOOK-EXTERNAL), slides a slipped block via
+  `gog calendar update` (never delete+create), and refuses to delete/move any
+  non-`agent_created` event (`ExternalEventError`).
+- State lives in `focus-calendar.json` and `proactive-state.json` (atomic,
+  torn-read safe — no duplicate briefs on a `*/5` scan; reactive `/debrief` capture
+  is idempotent on a closed loop).
 
 ## Quick Start
 
@@ -198,9 +223,46 @@ bash scripts/telegram-commands.sh undo act_<id>    # reverse a reversible act
 - `/audit` — list recent autonomous acts (act_id, type, task, target, status),
   newest first; an already-undone act is flagged.
 
-v0.1 ships **board-only**: rung-3 proactive Telegram pushes are disabled at the
-gate (`autonomy_gate.RUNG3_PUSH_ENABLED=False`) until U4/U5/U6 land the delivery
-wiring. Boot preflight (U1) must keep `autonomy-log.jsonl` writable for these.
+As of v0.2 (U4), rung-3 proactive Telegram pushes are ENABLED at the gate
+(`autonomy_gate.RUNG3_PUSH_ENABLED=True`): a nag push executes only with a PROVEN,
+gated, asserted delivery target. The proof is unchanged — an unset env / wrong
+group / mismatched send is still blocked. Boot preflight (U1) must keep
+`autonomy-log.jsonl` writable for these.
+
+### Accountability / nag engine (U4 — Productivity Group topic 2)
+
+The nag engine chases overdue tasks until they are acknowledged. A nag is an open
+loop persisted in `nag-state.json`; it closes ONLY on an explicit ack
+(`/done`/`/reschedule`), a verified disappearance from the board, or a reschedule
+out of the overdue window — never silently, never on a crash, and a `/snooze`
+pauses but does NOT close it.
+
+```bash
+bash scripts/telegram-commands.sh nag-check            # cron pass (every ~3h, work hrs)
+bash scripts/telegram-commands.sh nag-check --dry-run  # preview, no state write / push
+bash scripts/telegram-commands.sh done <task_id>             # complete + close loop (same turn)
+bash scripts/telegram-commands.sh reschedule <task_id> <date># move due:: + close loop
+bash scripts/telegram-commands.sh snooze <task_id> <dur>     # pause loop (cap: 3 snoozes)
+bash scripts/telegram-commands.sh body-double <task_id> <dur># focus session + check-ins
+bash scripts/telegram-commands.sh cancel-session <task_id>   # end a body-double session
+```
+
+- Q1-aware: thresholds are `NAG_Q1_THRESHOLD_DAYS=1`, `NAG_Q2_THRESHOLD_DAYS=3`,
+  `NAG_Q3_THRESHOLD_DAYS=7`, read off the scalar `overdue_days` because
+  `effective_priority()` short-circuits non-q2/q3 tasks to `escalated=False`.
+- Every nag push goes through `prove_delivery_target()` →
+  `autonomy_gate.gate()` (act_id) → `assert_send_target()`. An unset
+  `TELEGRAM_CHAT_ID_PRODUCTIVITY` / `OPENCLAW_TOPIC_PRODUCTIVITY_STANDUP` ⇒
+  `nag_delivery_blocked:env_missing` and the loop STAYS OPEN.
+- Delivery: each proven+gated+asserted nag text is emitted on `nag_check.py`'s
+  stdout, which the cron job's explicit `delivery.to`
+  (`${TELEGRAM_CHAT_ID_PRODUCTIVITY}:topic:${OPENCLAW_TOPIC_PRODUCTIVITY_STANDUP}`,
+  topic 2) announces. A nag is counted as sent only once its text is collected
+  for that announce — the script never logs `nag_sent` while delivering nothing.
+- `nag_check.py` is READ-ONLY on the board; all board mutations happen through the
+  reactive command path (`/done`, `/reschedule`).
+- Body-double check-ins are ephemeral one-shot crons with `deleteAfterRun:true`
+  and an explicit proven `delivery.to` + `agentId` set at session-start time.
 
 ## Agent Invocation Guidance
 
