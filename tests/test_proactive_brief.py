@@ -399,6 +399,36 @@ def test_debrief_partial_failure_keeps_loop_open(harness):
     assert proactive_state.is_debrief_open(reloaded["pre_briefs"][0]) is True
 
 
+def test_commitment_ledger_failure_still_captures(harness, monkeypatch):
+    """autoreview P3: a ledger I/O error after the task is created must NOT abort the
+    capture -- the loop still closes and the dedup record is persisted so a retry
+    does not re-create the task."""
+    board, state = harness
+    st = proactive_state.load_proactive_state()
+    proactive_state.mark_pre_brief_sent(st, "evt_q3", "Q3 Review", "2026-06-20T09:00:00+00:00")
+    proactive_state.open_debrief(st, "evt_q3")
+    proactive_state.save_proactive_state(st)
+
+    def ok_runner(cmd):
+        return types.SimpleNamespace(
+            stdout=f"✅ Added work task: {cmd[3]} (tsk_c1)", stderr="", returncode=0)
+
+    # the commitment_task_created ledger append raises OSError
+    real_log = proactive_brief._log
+
+    def flaky_log(event_type, **kw):
+        if event_type == "commitment_task_created":
+            raise OSError("ledger unwritable")
+        return real_log(event_type, **kw)
+
+    monkeypatch.setattr(proactive_brief, "_log", flaky_log)
+    result = proactive_brief.run_debrief_capture("evt_q3", "I will ship by 2026-06-30",
+                                                 runner=ok_runner)
+    assert result["captured"] is True  # the capture survived the ledger error
+    reloaded = proactive_state.load_proactive_state()
+    assert proactive_state.is_debrief_open(reloaded["pre_briefs"][0]) is False  # loop closed
+
+
 def test_commitment_add_does_not_force_parking(harness):
     """autoreview P1: the commitment add must NOT pass --force-parking (a parking-lot
     add prints an unparseable line that would be misread as a failure)."""

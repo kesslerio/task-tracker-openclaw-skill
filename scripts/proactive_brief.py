@@ -317,7 +317,14 @@ def _capture_under_lock(state: dict[str, Any], reference: str, notes: str,
             continue
         task_ids.append(task_id)
         already.add(spec["title"])
-        _log("commitment_task_created", task_id=task_id, title=spec["title"], due=spec.get("due"))
+        # The TASK is already created; record the audit breadcrumb best-effort so a
+        # transient ledger I/O error cannot abort the capture and lose the dedup
+        # record (created_commitment_titles), which would let a retry re-create the
+        # task. The state write below is the source of truth, not this breadcrumb.
+        try:
+            _log("commitment_task_created", task_id=task_id, title=spec["title"], due=spec.get("due"))
+        except OSError:
+            pass
 
     # NEVER lose a commitment: if ANY commitment failed to create, the loop stays
     # OPEN so the user can retry. Created ids + titles are recorded so a retry dedups.
