@@ -239,6 +239,80 @@ def complete_by_id(
     }
 
 
+def reschedule_by_id(
+    task_id: str,
+    new_due: str,
+    personal: bool = False,
+    source: str = "user_command",
+) -> dict:
+    """Move a task's ``due::`` to ``new_due`` (YYYY-MM-DD), atomically + reversibly.
+
+    Shares the resolve / ledger-preflight / snapshot-restore scaffold with
+    ``complete_by_id``: the board is snapshotted before the write, the write is
+    atomic, and a failure restores the snapshot.  Used by the reactive
+    ``/reschedule`` handler -- moving the due date out (to a future date) takes the
+    task off the overdue set so the next nag-check closes the loop (Path C), and
+    the handler also closes the nag-state loop SYNCHRONOUSLY in the same turn.
+    """
+    try:
+        datetime.strptime(new_due, "%Y-%m-%d")
+    except ValueError:
+        return {"ok": False, "error": {
+            "code": "invalid-due-date",
+            "message": f"Due date must be YYYY-MM-DD; got {new_due!r}.",
+        }}
+
+    tasks_file, content, record, error = _resolve_by_id(task_id, personal)
+    if error:
+        return error
+    ledger_error = _preflight_ledger(tasks_file)
+    if ledger_error:
+        return ledger_error
+    if record.line_number is None:
+        return {"ok": False, "error": {
+            "code": "task-line-resolution-failed",
+            "message": "Resolved task has no stable line number; active board was not changed.",
+        }}
+
+    new_line = _set_due_date(record.raw_line, new_due)
+    new_content = replace_task_line(content, record.raw_line, new_line, record.line_number)
+    if new_content is None:
+        return {"ok": False, "error": {
+            "code": "task-line-resolution-failed",
+            "message": "Resolved task line no longer matches the active board; active board was not changed.",
+        }}
+
+    old_due = _extract_due_date(record.raw_line)
+    event = new_event(
+        "state_transition",
+        task_id=task_id,
+        source=source,
+        previous_state="active",
+        next_state="active",
+        reason="rescheduled-by-canonical-id",
+        metadata={"title": record.title, "line_number": record.line_number,
+                  "previous_due": old_due, "new_due": new_due},
+    )
+    snapshots = {tasks_file: (True, content)}
+    ledger_file = ledger_path(tasks_file)
+    ledger_snapshot = _snapshot_regular(ledger_file)
+    if ledger_snapshot is not None:
+        snapshots[ledger_file] = ledger_snapshot
+
+    try:
+        _atomic_write(tasks_file, new_content)
+        append_event(event, path=ledger_file)
+    except OSError as exc:
+        restore_error = _restore_after_failure(snapshots)
+        error = {"code": "task-state-write-failed",
+                 "message": f"Reschedule write failed; snapshots were restored: {exc}"}
+        if restore_error:
+            error["restore_error"] = restore_error
+        return {"ok": False, "error": error}
+    return {"ok": True, "task_id": task_id, "title": record.title,
+            "previous_due": old_due, "new_due": new_due, "event": event}
+
+
 def block_unsafe_query(query: str) -> dict:
     return {
         "ok": False,

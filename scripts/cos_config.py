@@ -49,6 +49,33 @@ def active_task_hard_cap() -> int:
     return _int_env("ACTIVE_TASK_HARD_CAP", 20)
 
 
+# --- Nag engine knobs (U4, spec §6.5) -------------------------------------
+
+def nag_q1_threshold_days() -> int:
+    """Days overdue before a Q1 (urgent) task triggers a nag (default 1).
+
+    Q1 is the section ``effective_priority()`` short-circuits to ``escalated=False``,
+    so the nag engine reads the scalar ``overdue_days`` and applies this threshold
+    itself rather than relying on the display escalation.
+    """
+    return _int_env("NAG_Q1_THRESHOLD_DAYS", 1)
+
+
+def nag_q2_threshold_days() -> int:
+    """Days overdue before a Q2 task triggers a nag (default 3, matches escalation)."""
+    return _int_env("NAG_Q2_THRESHOLD_DAYS", 3)
+
+
+def nag_q3_threshold_days() -> int:
+    """Days overdue before a Q3 task triggers a nag (default 7)."""
+    return _int_env("NAG_Q3_THRESHOLD_DAYS", 7)
+
+
+def nag_snooze_max() -> int:
+    """Akrasia cap: how many times a single nag loop may be snoozed (default 3)."""
+    return _int_env("NAG_SNOOZE_MAX", 3)
+
+
 # --- Undo windows (Decision #8) -------------------------------------------
 
 def undo_window_nag_hours() -> int:

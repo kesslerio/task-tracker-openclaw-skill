@@ -54,14 +54,17 @@ DEFAULT_RUNG_FOR_UNKNOWN = RUNG_DRAFT
 RUNG_MIN = RUNG_READ
 RUNG_MAX = RUNG_NEVER_AUTO
 
-# v0.1 ships board-only (Decision: U2 owns "rung-3 push acts DISABLED"). A
-# rung-3 monitored-auto act is reversible enough to auto-execute, but in v0.1 the
-# proactive-push delivery seam (U4/U5/U6) has NOT shipped, so a rung-3 act that
-# names a delivery_target is a Telegram PUSH and must be blocked here -- not just
-# left unsent downstream. Flipping this to True is the explicit v0.2 gate, paired
-# with the U4/U5/U6 delivery wiring. A rung-3 act with NO delivery_target (a pure
-# board mutation) is unaffected; only the push variant is disabled.
-RUNG3_PUSH_ENABLED = False
+# v0.2 ships the proactive-push delivery seam (U4 nag engine). A rung-3
+# monitored-auto act that names a PROVEN delivery_target is now permitted to
+# execute and bind its target -- the gate<->message seam (assert_send_target)
+# still enforces that the SAME proven target is the sole permitted destination,
+# so flipping this on does NOT relax the delivery-target proof: an unproven /
+# work-group / env-missing target is still blocked upstream at
+# ``blocked:unproven-target`` (the in-gate prove), and a send to any other target
+# is still blocked at ``target-mismatch``. This was the explicit v0.2 gate paired
+# with U4's delivery wiring; v0.1 shipped it False (board-only). A rung-3 act with
+# NO delivery_target (a pure board mutation) was always unaffected.
+RUNG3_PUSH_ENABLED = True
 
 # Irreversible-act rungs anchored IN CODE (Finding #3b). These are the acts that
 # must never auto-execute regardless of what a JSON override claims; a corrupt or
@@ -416,11 +419,22 @@ def gate(
                           delivery_target=proven_target, **common)
         return {"ok": False, "reason": "push-disabled", "act_id": act_id, "record": record}
 
-    # TOCTOU: snapshot taken now, right before authorising the write. A snapshot is
-    # mandatory at rung >= APPROVE irrespective of reversible -- reversible=False is
-    # NOT an escape hatch for skipping the pre-action snapshot.
+    # TOCTOU: snapshot taken now, right before authorising the write. A pre-action
+    # snapshot is the undo substrate for a BOARD MUTATION (an act that rewrites a
+    # markdown line); it is mandatory at rung >= APPROVE irrespective of reversible
+    # -- reversible=False is NOT an escape hatch for skipping it.
+    #
+    # A proactive PUSH (a rung-3 monitored-auto act that names a proven
+    # delivery_target and makes NO board write -- e.g. a U4 nag_sent /
+    # body_double_checkin) has nothing on the board to snapshot; its reversal is
+    # the ack (`/undo` acks the nag loop, not a line restore). So a rung-3 push act
+    # is exempt from the snapshot requirement -- the delivery-target proof + the
+    # gate<->message seam are ITS safety substrate. The exemption is scoped to
+    # rung 3 + a proven target: a rung-2 (execute-with-approval) BOARD mutation
+    # still needs its snapshot even if a target is attached.
     snapshot = snapshot_provider() if snapshot_provider is not None else None
-    if rung >= RUNG_APPROVE and snapshot is None:
+    is_push = rung >= RUNG_MONITORED_AUTO and proven_target is not None
+    if rung >= RUNG_APPROVE and snapshot is None and not is_push:
         record = _log_act(act_id, act_type, rung, "blocked:missing-snapshot",
                           delivery_target=proven_target, **common)
         return {"ok": False, "reason": "missing-snapshot", "act_id": act_id, "record": record}

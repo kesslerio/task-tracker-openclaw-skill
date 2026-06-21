@@ -85,13 +85,15 @@ def test_send_to_non_gated_target_blocked():
     assert check["gated_target"] == TOPIC_2
 
 
-def test_nag_sent_push_is_frozen_in_v0_1():
-    """nag_sent is a real rung-3 push; v0.1 ships board-only, so it is blocked."""
+def test_nag_sent_push_enabled_in_v0_2():
+    """nag_sent is a real rung-3 push; v0.2 (U4) ships the delivery seam, so a
+    PROVEN target now executes + binds. The proof is NOT relaxed -- an unproven
+    target is still blocked at the in-gate prove (see test_gate_blocks_* above)."""
     assert autonomy_gate.rung_for_act_type("nag_sent") == autonomy_gate.RUNG_MONITORED_AUTO
-    assert autonomy_gate.RUNG3_PUSH_ENABLED is False
+    assert autonomy_gate.RUNG3_PUSH_ENABLED is True
     result = autonomy_gate.gate("nag_sent", delivery_target=TOPIC_2, unit="U4")
-    assert result["ok"] is False
-    assert result["reason"] == "push-disabled"
+    assert result["ok"] is True
+    assert result["delivery_target"] == TOPIC_2
 
 
 def test_send_for_unknown_act_blocked():
