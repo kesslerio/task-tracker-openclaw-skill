@@ -356,11 +356,18 @@ def main(argv: list[str] | None = None) -> int:
         counts = run_nag_check(dry_run=args.dry_run,
                                send=None if args.dry_run else
                                (lambda _target, text: payloads.append(text)))
+        # STDOUT carries ONLY the deliverable nag text -- it is what the cron
+        # announces to topic 2, so an idle cycle (no overdue task) announces
+        # NOTHING. The operational status footer goes to STDERR (captured by the
+        # run_with_envelope boundary, never delivered) so the ADHD-focused surface
+        # is not spammed with a "0 open loops" line every cycle (spec §2.1
+        # habituation). A dry-run prints to stdout for the operator preview.
         for text in payloads:
             print(text)
             print()  # blank line between nags in the announced output
-        print(f"NAG_CHECK_DONE: {counts['open']} open loops, {counts['sent']} sent, "
-              f"{counts['closed']} closed, {counts['blocked']} blocked")
+        footer = (f"NAG_CHECK_DONE: {counts['open']} open loops, {counts['sent']} sent, "
+                  f"{counts['closed']} closed, {counts['blocked']} blocked")
+        print(footer, file=sys.stdout if args.dry_run else sys.stderr)
         return 0
     except Exception as exc:  # noqa: BLE001 -- top-level NO-RAW-ERROR-LEAK boundary
         error_envelope.log_error(

@@ -124,16 +124,34 @@ def test_t2_nag_refires_without_ack(harness):
 
 # --- Production transport: main() emits the nag text for the cron announce ----
 
-def test_main_emits_nag_text_for_delivery(harness, capsys):
-    """The production CLI path (main) must actually emit the proven nag text -- not
-    gate+log nag_sent while delivering nothing. The cron announces this stdout."""
+def test_main_emits_nag_text_to_stdout_footer_to_stderr(harness, capsys):
+    """The production CLI path (main) emits the proven nag text on STDOUT (what the
+    cron announces) and the operational footer on STDERR (not delivered), so an
+    idle cycle announces nothing and the surface is not spammed with a status line."""
     board, state = harness
     rc = nag_check.main([])
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
     assert rc == 0
-    assert "tsk_abc123" in out  # the nag payload is in the deliverable output
-    assert "Overdue task still open" in out
-    assert "NAG_CHECK_DONE: 1 open loops, 1 sent" in out
+    assert "tsk_abc123" in captured.out  # nag payload is in the announced stdout
+    assert "Overdue task still open" in captured.out
+    assert "NAG_CHECK_DONE" not in captured.out  # footer NOT in the announced output
+    assert "NAG_CHECK_DONE: 1 open loops, 1 sent" in captured.err  # footer on stderr
+
+
+def test_main_idle_cycle_announces_nothing(tmp_path, monkeypatch, capsys):
+    """No overdue task -> stdout is empty (the cron announces nothing this cycle)."""
+    board = tmp_path / "Work Tasks.md"
+    board.write_text(
+        "# Work\n\n## 🟡 Q2\n- [ ] **Soon** task_id::tsk_future 🗓️2026-07-15 area:: Ops\n",
+        encoding="utf-8")
+    state = tmp_path / "state"
+    _set_env(monkeypatch, board, state)
+    monkeypatch.setattr(nag_check, "_today", lambda: REF)
+    rc = nag_check.main([])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert captured.out.strip() == ""  # nothing announced on an idle cycle
+    assert "NAG_CHECK_DONE: 0 open loops" in captured.err
 
 
 def test_run_nag_check_requires_transport_for_real_run(harness):
