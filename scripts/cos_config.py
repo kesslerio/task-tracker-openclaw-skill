@@ -76,6 +76,19 @@ def nag_snooze_max() -> int:
     return _int_env("NAG_SNOOZE_MAX", 3)
 
 
+# --- Proactive layer knobs (U6) -------------------------------------------
+
+def debrief_reprompt_interval_minutes() -> int:
+    """Minimum minutes between debrief follow-up re-prompts for one open loop.
+
+    The ``*/5`` pre-brief scan would otherwise re-prompt an ignored debrief every
+    five minutes (dozens of messages a day). This paces it: an open loop is nudged
+    at most once per interval, matching the U4 nag engine's habituation-aware
+    pacing rather than spamming the ADHD-focused surface (default 120 min).
+    """
+    return _int_env("DEBRIEF_REPROMPT_INTERVAL_MINUTES", 120)
+
+
 # --- Undo windows (Decision #8) -------------------------------------------
 
 def undo_window_nag_hours() -> int:

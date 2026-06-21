@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import calendar_blocks
+import cos_config
 import error_envelope
 import focus_calendar
 import proactive_delivery
@@ -334,16 +335,23 @@ def run_pre_brief_scan(*, now: datetime | None = None, dry_run: bool = False,
         elif not dry_run:
             counts["blocked"] += 1
 
-    # Re-prompt every OPEN debrief loop whose event has ended (NAG-CLOSES-ONLY-ON-ACK).
+    # Re-prompt every OPEN debrief loop whose event has ended (NAG-CLOSES-ONLY-ON-ACK),
+    # PACED so an ignored loop is nudged at most once per interval rather than every
+    # `*/5` scan (autoreview P3: no dozens-of-messages-a-day spam).
+    interval = cos_config.debrief_reprompt_interval_minutes()
     for entry in state.get("pre_briefs", []):
         if not proactive_state.is_debrief_open(entry):
             continue
         start = _parse_event_start(entry.get("event_start"))
         if start is not None and start > ref:
             continue  # event has not happened yet -- nothing to debrief
+        if not proactive_state.debrief_reprompt_due(entry, now=ref, interval_minutes=interval):
+            continue  # nudged recently -- respect the pacing interval
         result = _push("brief_sent", debrief_followup_text(entry), surface="standup",
                        send=send, dry_run=dry_run)
         if result["sent"]:
+            proactive_state.mark_debrief_reprompted(entry, now=ref)
+            proactive_state.save_proactive_state(state)
             counts["debrief_reprompts"] += 1
         elif not dry_run:
             counts["blocked"] += 1
@@ -431,7 +439,11 @@ def run_slip_recovery(*, now: datetime | None = None, dry_run: bool = False,
     if not calendar_id:
         return counts  # no focus calendar configured -- degrade silently
     active_ids = {r.canonical_id for r in _load_active() if r.canonical_id}
-    fb_ids = calendar_blocks.focus_calendar_ids()
+    # Freebusy-check the slid window against EXTERNAL (human) calendars only -- the
+    # block being moved still occupies its old slot on the focus calendar, which
+    # FreeBusy cannot exclude per-event, so including the focus calendar would
+    # always self-overlap and refuse the move.
+    fb_ids = calendar_blocks.external_calendar_ids()
 
     for block in list(cal_state.get("active_blocks", [])):
         if not _block_has_slipped(block, ref=ref, active_ids=active_ids):

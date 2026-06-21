@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -191,6 +191,34 @@ def is_debrief_open(entry: dict[str, Any]) -> bool:
         and not entry.get("debrief_captured_at")
         and not entry.get("debrief_skipped_at")
     )
+
+
+def debrief_reprompt_due(entry: dict[str, Any], *, now: datetime, interval_minutes: int) -> bool:
+    """True if this open debrief loop is due for a follow-up re-prompt.
+
+    The first re-prompt (no ``debrief_last_reprompt_at`` yet) is always due; after
+    that, a re-prompt fires only once ``interval_minutes`` have elapsed since the
+    last one -- so the ``*/5`` scan paces nudges rather than spamming every cycle.
+    A garbage timestamp degrades to "due" (better to nudge than to go silent).
+    """
+    last = entry.get("debrief_last_reprompt_at")
+    if not last:
+        return True
+    try:
+        last_dt = datetime.fromisoformat(str(last))
+    except ValueError:
+        return True
+    return (now - last_dt) >= timedelta(minutes=interval_minutes)
+
+
+def mark_debrief_reprompted(entry: dict[str, Any], *, now: datetime) -> None:
+    """Stamp the re-prompt time so the next scan respects the pacing interval.
+
+    Uses the flow's ``now`` (the cron's notion of the current time) -- not
+    wall-clock -- so the pacing is computed against the same clock
+    ``debrief_reprompt_due`` reads, keeping the interval check consistent.
+    """
+    entry["debrief_last_reprompt_at"] = now.isoformat()
 
 
 def capture_debrief(state: dict[str, Any], event_id: str, commitment_task_ids: list[str]) -> dict[str, Any] | None:

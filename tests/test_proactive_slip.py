@@ -45,7 +45,9 @@ def _set_env(monkeypatch, board, state_dir):
     monkeypatch.setenv("TELEGRAM_CHAT_ID_WORK", WORK_GROUP)
     monkeypatch.setenv("OPENCLAW_TOPIC_PRODUCTIVITY_STANDUP", "2")
     monkeypatch.setenv("TASK_TRACKER_FOCUS_CALENDAR_ID", "focus-cal")
-    monkeypatch.delenv("STANDUP_CALENDARS", raising=False)
+    # An EXTERNAL human calendar is configured: the freebusy gate checks it (and
+    # NOT the agent's own focus calendar, so a move never self-overlaps).
+    monkeypatch.setenv("STANDUP_CALENDARS", '{"work": {"calendar_id": "primary", "account": "me"}}')
     monkeypatch.setattr(utils, "OBSIDIAN_WORK", Path(board))
 
 
@@ -76,6 +78,12 @@ def _types(state):
     return [e["event_type"] for e in task_ledger.read_events(state / "events.jsonl")]
 
 
+def _external_freebusy(busy):
+    """Freebusy JSON for the EXTERNAL ``primary`` calendar (the one the gate checks)."""
+    import json
+    return json.dumps({"calendars": {"primary": {"busy": busy}}})
+
+
 def _agent_event_runner(freebusy_stdout):
     """A gog runner: event -> agent-created, freebusy -> the given stdout, update -> ok."""
     import json
@@ -100,7 +108,7 @@ def _agent_event_runner(freebusy_stdout):
 def test_t5_slip_recovery_moves_via_update(harness):
     board, state = harness
     _seed_block()
-    runner = _agent_event_runner('{"calendars": {"focus-cal": {"busy": []}}}')  # new window free
+    runner = _agent_event_runner(_external_freebusy([]))  # external calendar free
     counts = proactive_brief.run_slip_recovery(now=NOW, send=None, runner=runner)
     assert counts["moved"] == 1
     assert counts["refused"] == 0
@@ -114,13 +122,34 @@ def test_t5_slip_recovery_moves_via_update(harness):
     assert "calendar_block_moved" in _types(state)
 
 
+def test_slip_succeeds_despite_block_own_slot_busy_on_focus_calendar(harness):
+    """Regression (autoreview P2): the block being moved still occupies its OLD slot
+    on the focus calendar, but the freebusy gate checks only EXTERNAL calendars, so
+    the move is NOT refused by the block's own busy interval. A 2h 09:00 block slid
+    at noon proposes 13:00-15:00; even if the focus calendar reports the block busy,
+    the external calendar is free -> the move succeeds."""
+    board, state = harness
+    _seed_block(start="2026-06-20T09:00:00+00:00", end="2026-06-20T11:00:00+00:00")
+    # The freebusy stub answers for the EXTERNAL calendar (primary) only; it is free.
+    # The focus calendar is never queried, so the block's own slot cannot self-overlap.
+    runner = _agent_event_runner(_external_freebusy([]))
+    counts = proactive_brief.run_slip_recovery(now=NOW, send=None, runner=runner)
+    assert counts["moved"] == 1
+    assert counts["refused"] == 0
+    # the freebusy command was issued for `primary`, NOT the focus calendar
+    fb_cmd = next(c for c in runner.calls if c[1:3] == ["calendar", "freebusy"])
+    assert "primary" in fb_cmd
+    assert "focus-cal" not in fb_cmd
+
+
 # --- NEVER-OVERBOOK-EXTERNAL: busy new window refuses the move --------------
 
 def test_slip_into_busy_window_refused_and_block_stays(harness):
     board, state = harness
     _seed_block()
-    runner = _agent_event_runner(
-        '{"calendars": {"focus-cal": {"busy": [{"start": "2026-06-20T13:00:00+00:00", "end": "2026-06-20T14:00:00+00:00"}]}}}')
+    # An EXTERNAL human meeting overlaps the proposed 13:00-15:00 window -> refuse.
+    runner = _agent_event_runner(_external_freebusy(
+        [{"start": "2026-06-20T13:00:00+00:00", "end": "2026-06-20T14:00:00+00:00"}]))
     counts = proactive_brief.run_slip_recovery(now=NOW, send=None, runner=runner)
     assert counts["moved"] == 0
     assert counts["refused"] == 1
@@ -155,7 +184,7 @@ def test_future_block_not_slipped(harness):
     """A block whose start is still in the future is NOT a slip."""
     board, state = harness
     _seed_block(start="2026-06-20T15:00:00+00:00", end="2026-06-20T17:00:00+00:00")
-    runner = _agent_event_runner('{"calendars": {"focus-cal": {"busy": []}}}')
+    runner = _agent_event_runner(_external_freebusy([]))
     counts = proactive_brief.run_slip_recovery(now=NOW, send=None, runner=runner)
     assert counts == {"moved": 0, "refused": 0}
     assert runner.calls == []
@@ -178,3 +207,29 @@ def test_debrief_followup_reprompts_open_loop(harness, monkeypatch):
     # the loop is STILL open -- a re-prompt never closes it
     reloaded = proactive_state.load_proactive_state()
     assert proactive_state.is_debrief_open(reloaded["pre_briefs"][0]) is True
+
+
+def test_debrief_reprompt_is_paced_no_spam(harness, monkeypatch):
+    """autoreview P3: a second `*/5` scan within the pacing interval does NOT
+    re-prompt -- an ignored debrief loop is nudged at most once per interval."""
+    from datetime import timedelta
+
+    board, state = harness
+    st = proactive_state.load_proactive_state()
+    proactive_state.mark_pre_brief_sent(st, "evt_q3", "Q3 Review", "2026-06-20T09:00:00+00:00")
+    proactive_state.open_debrief(st, "evt_q3")
+    proactive_state.save_proactive_state(st)
+    monkeypatch.setattr(proactive_brief, "get_calendar_events", lambda **_k: {"work": []})
+
+    sent: list = []
+    send = lambda t, x: sent.append((t, x))
+    # First scan -> one re-prompt.
+    c1 = proactive_brief.run_pre_brief_scan(now=NOW, send=send)
+    assert c1["debrief_reprompts"] == 1
+    # A scan 5 minutes later (well within the 120-min interval) -> NO re-prompt.
+    c2 = proactive_brief.run_pre_brief_scan(now=NOW + timedelta(minutes=5), send=send)
+    assert c2["debrief_reprompts"] == 0
+    assert len(sent) == 1  # only the first nudge was delivered
+    # A scan past the interval -> re-prompt again (the loop is still open).
+    c3 = proactive_brief.run_pre_brief_scan(now=NOW + timedelta(minutes=121), send=send)
+    assert c3["debrief_reprompts"] == 1

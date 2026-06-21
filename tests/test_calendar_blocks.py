@@ -216,17 +216,19 @@ def test_slip_into_busy_window_refused():
     assert not runner.made("calendar.update")
 
 
-# --- focus_calendar_ids env assembly ---------------------------------------
+# --- external_calendar_ids env assembly (focus calendar is EXCLUDED) --------
 
-def test_focus_calendar_ids_dedupes_env(monkeypatch):
+def test_external_calendar_ids_excludes_focus_calendar(monkeypatch):
+    """The agent's own focus calendar is excluded from the freebusy gate so a MOVE
+    does not self-overlap; only external (human) calendars are checked."""
     monkeypatch.setenv("TASK_TRACKER_FOCUS_CALENDAR_ID", "focus-cal")
     monkeypatch.setenv("STANDUP_CALENDARS",
                        '{"a": {"calendar_id": "primary"}, "b": {"calendar_id": "focus-cal"}}')
-    ids = calendar_blocks.focus_calendar_ids()
-    assert ids == ["focus-cal", "primary"]  # de-duped, order preserved
+    ids = calendar_blocks.external_calendar_ids()
+    assert ids == ["primary"]  # focus-cal dropped even though listed in STANDUP_CALENDARS
 
 
-def test_focus_calendar_ids_empty_when_unset(monkeypatch):
+def test_external_calendar_ids_empty_when_unset(monkeypatch):
     monkeypatch.delenv("TASK_TRACKER_FOCUS_CALENDAR_ID", raising=False)
     monkeypatch.delenv("STANDUP_CALENDARS", raising=False)
-    assert calendar_blocks.focus_calendar_ids() == []
+    assert calendar_blocks.external_calendar_ids() == []

@@ -226,9 +226,11 @@ def create_focus_block(
     property so it is recognisable (and the only thing this unit may later
     move/delete). Returns ``{"event_id", "start", "end", "request"}``.
     """
-    # ``None`` means "not supplied" -> default to the focus calendar; an explicit
+    # ``None`` means "not supplied" -> default to the EXTERNAL (human) calendars,
+    # never the agent's own focus calendar (NEVER-OVERBOOK-EXTERNAL is about human
+    # meetings; including the focus calendar would self-overlap a move). An explicit
     # ``[]`` is honoured as "no calendars to check" -> unknown -> refuse.
-    fb_calendars = [calendar_id] if freebusy_calendar_ids is None else freebusy_calendar_ids
+    fb_calendars = external_calendar_ids() if freebusy_calendar_ids is None else freebusy_calendar_ids
     _assert_free_or_refuse(fb_calendars, start, end, task_id, "place", runner=runner, trigger=trigger)
     cmd = [
         "gog", "calendar", "create", calendar_id,
@@ -286,7 +288,7 @@ def move_focus_block(
             f"(no {AGENT_CREATED_PROP}={AGENT_CREATED_VALUE}). Refusing.",
             event_id=event_id,
         )
-    fb_calendars = [calendar_id] if freebusy_calendar_ids is None else freebusy_calendar_ids
+    fb_calendars = external_calendar_ids() if freebusy_calendar_ids is None else freebusy_calendar_ids
     _assert_free_or_refuse(fb_calendars, new_start, new_end, task_id, "move", runner=runner, trigger=trigger)
     cmd = [
         "gog", "calendar", "update", calendar_id, event_id,
@@ -348,20 +350,23 @@ def delete_focus_block(
     return {"ok": True, "event_id": event_id}
 
 
-def focus_calendar_ids() -> list[str]:
-    """The calendar ids to freebusy-check before a write, env-sourced.
+def external_calendar_ids() -> list[str]:
+    """The HUMAN/external calendar ids to freebusy-check before a write, env-sourced.
 
-    The agent-owned focus calendar (``TASK_TRACKER_FOCUS_CALENDAR_ID``) plus every
-    external calendar configured in ``STANDUP_CALENDARS`` -- so a block never
-    overlaps a human meeting on ANY watched calendar. Both are absent in the
-    container today (Decision #4/#5); an empty list makes ``get_freebusy`` return
-    "unknown" -> treated as busy -> the agent simply does not place a block
-    (degrade silently, never overbook).
+    NEVER-OVERBOOK-EXTERNAL is about never overlapping a *human* meeting, so the
+    freebusy gate checks the EXTERNAL calendars (those configured in
+    ``STANDUP_CALENDARS``) and NOT the agent-owned focus calendar
+    (``TASK_TRACKER_FOCUS_CALENDAR_ID``). Including the focus calendar would make a
+    MOVE self-overlap: the block being slid still occupies its old slot on the
+    focus calendar, which FreeBusy cannot exclude per-event, so the move would
+    always be refused. The agent owns and serialises its own focus-block writes, so
+    the focus calendar does not need a freebusy guard against itself.
+
+    All external calendars are absent in the container today (Decision #4/#5); an
+    empty list makes ``get_freebusy`` return "unknown" -> treated as busy -> the
+    agent simply does not place/move a block (degrade silently, never overbook).
     """
     ids: list[str] = []
-    focus_id = os.getenv("TASK_TRACKER_FOCUS_CALENDAR_ID")
-    if focus_id and focus_id.strip():
-        ids.append(focus_id.strip())
     raw = os.getenv("STANDUP_CALENDARS")
     if raw and raw.strip():
         try:
@@ -371,7 +376,8 @@ def focus_calendar_ids() -> list[str]:
                     ids.append(str(cal_id))
         except (json.JSONDecodeError, AttributeError):
             pass
-    # De-dup while preserving order so a calendar listed in both env vars is
-    # checked once.
+    # The agent's own focus calendar is explicitly EXCLUDED (see docstring); de-dup
+    # while preserving order in case a calendar appears twice in STANDUP_CALENDARS.
+    focus_id = (os.getenv("TASK_TRACKER_FOCUS_CALENDAR_ID") or "").strip()
     seen: set[str] = set()
-    return [cid for cid in ids if not (cid in seen or seen.add(cid))]
+    return [cid for cid in ids if cid != focus_id and not (cid in seen or seen.add(cid))]
