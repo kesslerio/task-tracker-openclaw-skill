@@ -161,8 +161,17 @@ def get_freebusy(
     # true "every calendar is free", so it is treated as busy (refuse), never free.
     if data is None or "calendars" not in data:
         return {"ok": False, "reason": "unknown"}
+    calendars = data.get("calendars", {})
     busy: list[dict[str, str]] = []
-    for cal in data.get("calendars", {}).values():
+    for cal_id in calendar_ids:
+        cal = calendars.get(cal_id)
+        # A requested calendar that is ABSENT from the response, or whose entry
+        # carries an ``errors`` field (inaccessible / not found / rate-limited), has
+        # an UNKNOWN free/busy state -- never assume it is free, or the agent could
+        # overbook a calendar it cannot read. Treat the whole check as unknown ->
+        # busy -> refuse (NEVER-OVERBOOK-EXTERNAL).
+        if cal is None or cal.get("errors"):
+            return {"ok": False, "reason": "unknown"}
         for slot in cal.get("busy", []):
             start, end = slot.get("start"), slot.get("end")
             if start and end:

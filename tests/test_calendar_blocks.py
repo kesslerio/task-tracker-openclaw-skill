@@ -55,8 +55,11 @@ class RecordingRunner:
 
 
 def _freebusy_json(busy):
+    """A realistic gog freebusy response: an entry for EVERY calendar these tests
+    request (gog returns one per requested calendar). The busy slots are on the
+    external calendar; the agent's own focus calendar is free."""
     import json
-    return json.dumps({"calendars": {EXTERNAL_CAL: {"busy": busy}}})
+    return json.dumps({"calendars": {EXTERNAL_CAL: {"busy": busy}, FOCUS_CAL: {"busy": []}}})
 
 
 def _agent_event_json():
@@ -215,7 +218,7 @@ def test_t5_slip_recovery_uses_update_not_delete_create():
 
 
 def test_slip_into_busy_window_refused():
-    """Even during recovery, a busy new window refuses the move (no update)."""
+    """Even during recovery, a busy EXTERNAL window refuses the move (no update)."""
     runner = RecordingRunner({
         "calendar.event": _agent_event_json(),
         "calendar.freebusy": _freebusy_json([
@@ -225,9 +228,38 @@ def test_slip_into_busy_window_refused():
     with pytest.raises(calendar_blocks.OverbookError) as exc:
         calendar_blocks.move_focus_block(
             FOCUS_CAL, "evt_1", "tsk_abc", "2026-06-20T14:00:00+00:00", "2026-06-20T16:00:00+00:00",
-            freebusy_calendar_ids=[FOCUS_CAL], runner=runner)
+            freebusy_calendar_ids=[EXTERNAL_CAL], runner=runner)
     assert exc.value.reason == "freebusy_overlap"
     assert not runner.made("calendar.update")
+
+
+def test_freebusy_per_calendar_error_treated_as_busy():
+    """autoreview P2: a per-calendar error (inaccessible calendar) is UNKNOWN ->
+    busy -> refuse, never treated as free."""
+    import json
+    runner = RecordingRunner({
+        "calendar.freebusy": json.dumps({"calendars": {
+            EXTERNAL_CAL: {"errors": [{"reason": "notFound"}]},  # inaccessible
+        }}),
+    })
+    with pytest.raises(calendar_blocks.OverbookError) as exc:
+        calendar_blocks.create_focus_block(
+            FOCUS_CAL, "tsk_abc", "Draft", BLOCK_START, BLOCK_END,
+            freebusy_calendar_ids=[EXTERNAL_CAL], runner=runner)
+    assert exc.value.reason == "freebusy_unknown"
+
+
+def test_freebusy_missing_requested_calendar_treated_as_busy():
+    """A requested calendar absent from the response is UNKNOWN -> busy -> refuse."""
+    import json
+    runner = RecordingRunner({
+        "calendar.freebusy": json.dumps({"calendars": {}}),  # requested cal not returned
+    })
+    with pytest.raises(calendar_blocks.OverbookError) as exc:
+        calendar_blocks.create_focus_block(
+            FOCUS_CAL, "tsk_abc", "Draft", BLOCK_START, BLOCK_END,
+            freebusy_calendar_ids=[EXTERNAL_CAL], runner=runner)
+    assert exc.value.reason == "freebusy_unknown"
 
 
 # --- external_calendar_ids env assembly (focus calendar is EXCLUDED) --------
