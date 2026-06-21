@@ -6,11 +6,31 @@ Shared helpers for standup scripts.
 import json
 import os
 import subprocess
+import sys
 from datetime import date, datetime
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-def get_calendar_events() -> dict:
-    """Fetch today's calendar events via gog CLI."""
+import error_envelope
+
+
+def get_calendar_events(trigger: str = "calendar_fetch") -> dict:
+    """Fetch today's calendar events via gog CLI.
+
+    ``trigger`` attributes a fetch failure to its caller in the structured error
+    log (U1 §3a) -- standup, personal_standup, weekly_review, or a heartbeat --
+    so the log is not misattributed to a single ritual. Defaults to a neutral
+    ``"calendar_fetch"`` rather than baking in one caller's name.
+
+    Returns one of:
+    - ``{}``                              -- not configured (STANDUP_CALENDARS
+      unset/invalid). Renders as "not configured", never an error.
+    - ``{"<key>": [events...]}``          -- success.
+    - ``{"_error": "<reason>", ...}``     -- a real fetch failure (subprocess
+      timeout / tool missing / bad JSON). The U1 sentinel: the caller renders a
+      degraded notice instead of silently dropping the section, and the failure
+      is logged. NEVER a bare ``pass``/swallow (U1 §2c, fixes silent-failure G9).
+    """
     config_str = os.getenv("STANDUP_CALENDARS")
     if not config_str:
         return {}
@@ -20,7 +40,18 @@ def get_calendar_events() -> dict:
     except json.JSONDecodeError:
         return {}
 
-    events = {}
+    # If a missing/broken calendar tool has failed repeatedly, the circuit
+    # breaker is open: skip the subprocess entirely and render degraded, so a
+    # missing `gog` does not loop (re-invoke -> fail) on every standup. This is
+    # the breaker's primary motivating scenario and must be checked HERE, since
+    # calendar failures log under the "calendar_fetch" component, not the
+    # wrapping ritual's name.
+    if error_envelope.breaker_open("calendar_fetch"):
+        return {"_error": "calendar_unavailable", "reason": "breaker_open"}
+
+    events: dict = {}
+    attempted = 0
+    failed = 0
 
     for key, config in calendars_config.items():
         events[key] = []
@@ -32,6 +63,7 @@ def get_calendar_events() -> dict:
         if not calendar_id or not account:
             continue
 
+        attempted += 1
         try:
             result = subprocess.run(
                 [
@@ -48,34 +80,67 @@ def get_calendar_events() -> dict:
                 text=True,
                 timeout=10,
             )
-            if result.returncode == 0:
-                data = json.loads(result.stdout)
-                for event in data.get("events", []):
-                    if event.get("eventType") == "birthday":
-                        continue
-                    if "dateTime" not in event.get("start", {}):
-                        continue
+            if result.returncode != 0:
+                # A non-zero gog exit (auth expired, calendar not found, quota)
+                # is a real failure, NOT an empty calendar -- raise so it flows
+                # through the same no-swallow logging path as an exception
+                # (U1 §2c: never silently render an empty section on error).
+                raise subprocess.CalledProcessError(
+                    result.returncode, cmd, output=result.stdout, stderr=result.stderr
+                )
+            data = json.loads(result.stdout)
+            for event in data.get("events", []):
+                if event.get("eventType") == "birthday":
+                    continue
+                if "dateTime" not in event.get("start", {}):
+                    continue
 
-                    summary = event.get("summary", "Untitled")
-                    if label:
-                        summary = f"{summary} ({label})"
+                summary = event.get("summary", "Untitled")
+                if label:
+                    summary = f"{summary} ({label})"
 
-                    events[key].append(
-                        {
-                            "summary": summary,
-                            "start": event["start"].get("dateTime"),
-                            "end": event["end"].get("dateTime"),
-                        }
-                    )
+                events[key].append(
+                    {
+                        "summary": summary,
+                        "start": event["start"].get("dateTime"),
+                        "end": event["end"].get("dateTime"),
+                    }
+                )
         except (
             subprocess.TimeoutExpired,
             subprocess.CalledProcessError,
             json.JSONDecodeError,
             FileNotFoundError,
-        ):
-            pass
+        ) as exc:
+            # U1: do NOT swallow. Log the real error and KEEP GOING so a single
+            # failing calendar does not blank the calendars that succeeded.
+            failed += 1
+            error_envelope.log_degraded(
+                "calendar_fetch",
+                exc,
+                trigger=trigger,
+                check="calendar_fetch",
+            )
+
+    # Only surface the degraded sentinel when EVERY attempted calendar failed --
+    # otherwise the section renders the calendars that succeeded (U1 §2c: the
+    # section never silently vanishes, but a multi-calendar setup is not
+    # over-degraded by one transient failure).
+    if attempted and failed == attempted:
+        return {"_error": "calendar_unavailable", "reason": "all_calendars_failed"}
 
     return events
+
+
+def calendar_error(calendar_events: dict | None) -> str | None:
+    """Return the degraded-notice reason if the calendar result is a sentinel.
+
+    Both standup callers guard on this: a truthy return means render a one-line
+    degraded notice and DO NOT treat the dict as event data.
+    """
+    if isinstance(calendar_events, dict) and "_error" in calendar_events:
+        return str(calendar_events.get("_error") or "calendar_unavailable")
+    return None
 
 
 def format_time(iso_time: str) -> str:
@@ -100,8 +165,12 @@ def resolve_standup_date(date_str: str | None) -> date:
 
 
 def flatten_calendar_events(calendar_events: dict) -> list[dict]:
-    """Flatten calendar dict into a single sorted event list."""
-    if not calendar_events:
+    """Flatten calendar dict into a single sorted event list.
+
+    A ``{"_error": ...}`` sentinel flattens to an empty list -- callers detect
+    the degraded state via ``calendar_error()``, not by inspecting this output.
+    """
+    if not calendar_events or "_error" in calendar_events:
         return []
     all_events = []
     for key in sorted(calendar_events.keys()):

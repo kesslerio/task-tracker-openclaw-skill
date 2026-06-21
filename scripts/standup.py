@@ -16,12 +16,14 @@ from candidate_review import candidate_review_summary
 from task_audit import task_audit_summary
 from daily_notes import extract_completed_actions, extract_completed_tasks
 from standup_common import (
+    calendar_error,
     flatten_calendar_events,
     format_missed_tasks_block,
     format_time,
     get_calendar_events,
     resolve_standup_date,
 )
+import error_envelope
 from task_records import fallback_id_for
 from utils import (
     load_tasks,
@@ -91,8 +93,11 @@ def format_split_standup(output: dict, date_display: str) -> list:
     
     # Message 2: Calendar events
     msg2_lines = [f"📅 **Calendar — {date_display}**\n"]
+    cal_err = calendar_error(output['calendar'])
     all_events = flatten_calendar_events(output['calendar'])
-    if all_events:
+    if cal_err:
+        msg2_lines.append(error_envelope.degraded_notice("Calendar"))
+    elif all_events:
         for event in all_events:
             time_str = format_time(event['start'])
             msg2_lines.append(f"• {time_str} — {event['summary']}")
@@ -301,7 +306,7 @@ def generate_standup(
     output = {
         'date': str(standup_date),
         'date_display': date_display,
-        'calendar': get_calendar_events(),
+        'calendar': get_calendar_events(trigger="user_command:/standup"),
         'priority': None,
         'due_today': [],
         'q1': [],  # Urgent & Important
@@ -376,14 +381,18 @@ def generate_standup(
     lines = [f"📋 **Daily Standup — {date_display}**\n"]
     
     # Calendar events
+    cal_err = calendar_error(output['calendar'])
     all_events = flatten_calendar_events(output['calendar'])
-    if all_events:
+    if cal_err:
+        lines.append(error_envelope.degraded_notice("Calendar"))
+        lines.append("")
+    elif all_events:
         lines.append("📅 **Today's Calendar:**")
         for event in all_events:
             time_str = format_time(event['start'])
             lines.append(f"  • {time_str} — {event['summary']}")
         lines.append("")
-    
+
     if output['priority']:
         priority = output['priority']
         rec = recurrence_suffix(priority)
@@ -559,4 +568,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(error_envelope.run_main("standup", main))
