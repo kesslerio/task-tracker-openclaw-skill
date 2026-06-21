@@ -395,20 +395,19 @@ def test_run_main_preserves_main_return_code(monkeypatch, tmp_path):
     assert error_envelope.run_main("standup", main_func) == 3
 
 
-def test_done24h_failure_surfaces_friendly_line(tmp_path):
-    # The grep filter in done24h/done7d must not swallow the ⚠️ notice.
+def test_done_failure_surfaces_friendly_line(tmp_path):
+    # U5 replaced done24h/done7d with done/ledger, which route harvest_ledger.py
+    # through run_with_envelope. A crash there must surface the friendly notice,
+    # never a raw error.
     iso = _make_isolated_scripts(tmp_path)
-    (iso / "tasks.py").write_text(
-        "import error_envelope, sys\n"
-        "def main():\n"
-        "    raise RuntimeError('tasks exploded')\n"
-        "if __name__ == '__main__':\n"
-        "    sys.exit(error_envelope.run_main('tasks', main))\n"
+    (iso / "harvest_ledger.py").write_text(
+        "import sys\n"
+        "raise RuntimeError('ledger exploded')\n"
     )
     state_dir = tmp_path / "state"
     env = _clean_env(state_dir)
     result = subprocess.run(
-        ["bash", str(iso / "telegram-commands.sh"), "done24h"],
+        ["bash", str(iso / "telegram-commands.sh"), "done"],
         capture_output=True,
         text=True,
         env=env,
@@ -439,32 +438,29 @@ def test_shell_failure_branch_names_real_command(tmp_path):
     _assert_no_raw_leak(result.stdout)
 
 
-def test_done24h_surfaces_notice_even_after_partial_output(tmp_path):
-    # If tasks.py prints partial output and THEN crashes, the friendly notice
-    # trails the partial text. The done24h grep filter must still surface it
-    # (match anywhere, not just at the start) rather than silently dropping it.
+def test_done_failure_replaces_partial_output_with_notice(tmp_path):
+    # If harvest_ledger.py prints partial output and THEN crashes (non-zero exit),
+    # run_with_envelope discards the partial stdout and surfaces only the friendly
+    # notice -- the partial text must NOT leak alongside a failure.
     iso = _make_isolated_scripts(tmp_path)
-    (iso / "tasks.py").write_text(
-        "import error_envelope, sys\n"
-        "def main():\n"
-        "    print('some partial task output emitted before failure')\n"
-        "    raise RuntimeError('tasks exploded mid-render')\n"
-        "if __name__ == '__main__':\n"
-        "    sys.exit(error_envelope.run_main('tasks', main))\n"
+    (iso / "harvest_ledger.py").write_text(
+        "import sys\n"
+        "print('some partial ledger output emitted before failure')\n"
+        "raise RuntimeError('ledger exploded mid-render')\n"
     )
     state_dir = tmp_path / "state"
     env = _clean_env(state_dir)
     result = subprocess.run(
-        ["bash", str(iso / "telegram-commands.sh"), "done24h"],
+        ["bash", str(iso / "telegram-commands.sh"), "done"],
         capture_output=True,
         text=True,
         env=env,
     )
     assert result.returncode == 0
-    # The notice trails the partial output but must still surface (the done24h
-    # grep filter would otherwise drop a non-"✅ Done" tail).
     assert "unavailable" in result.stdout
-    assert "some partial task output" in result.stdout
+    # The partial stdout on a failed run is discarded, not surfaced.
+    assert "some partial ledger output" not in result.stdout
+    _assert_no_raw_leak(result.stdout)
 
 
 def test_raw_traceback_never_reaches_stdout_only_disk(tmp_path):
