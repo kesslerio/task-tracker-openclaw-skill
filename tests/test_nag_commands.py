@@ -56,12 +56,21 @@ def env(tmp_path, monkeypatch):
 
 
 def _open_loop(state, task_id="tsk_abc123"):
-    """Open a nag loop directly (as a prior nag-check fire would)."""
+    """Open a nag loop directly (as a prior nag-check fire would).
+
+    A real fire OPENS then SENDS in the same locked transition, so the loop the
+    user sees has nag_count>=1 (a genuine, fired nag). record_sent mirrors that so
+    /snooze's genuine-loop guard recognises it.
+    """
     target = {"chat_id": PRODUCTIVITY, "topic_id": "2",
               "agent_id": "niemand-work", "channel": "telegram"}
-    nag_state.transition(lambda s: nag_state.open_loop(
-        s, task_id, task_title="t", threshold_crossed=4, threshold_type="q2",
-        delivery_target=target))
+
+    def fire(s):
+        nag_state.open_loop(s, task_id, task_title="t", threshold_crossed=4,
+                            threshold_type="q2", delivery_target=target)
+        nag_state.record_sent(s, task_id)
+
+    nag_state.transition(fire)
 
 
 def _state(state):
@@ -189,6 +198,16 @@ def test_fourth_snooze_is_refused_loop_unchanged(env):
     after = _state(state)["tsk_abc123"]
     assert after["snooze_count"] == 3  # NOT incremented to 4
     assert after["snoozed_until"] == before  # unchanged
+
+
+def test_snooze_refused_when_no_open_nag_loop(env):
+    """A /snooze must PAUSE an existing fired nag, not materialise a phantom
+    snoozed stub that pre-suppresses a future first nag."""
+    board, state = env  # no loop opened for tsk_abc123
+    result = nag_commands.handle_snooze("tsk_abc123", "1d")
+    assert result["ok"] is False
+    assert result["error"]["code"] == "no-open-nag"
+    assert _state(state) == {}  # no phantom entry materialised
 
 
 def test_snooze_rejects_invalid_duration(env):

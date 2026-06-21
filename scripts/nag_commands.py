@@ -192,17 +192,31 @@ def handle_snooze(task_id: str, duration: str, *, block_reason: str | None = Non
     snooze_max = cos_config.nag_snooze_max()
     snoozed_until = (_now() + timedelta(minutes=minutes)).isoformat()
 
-    # Check the cap AND apply the snooze inside ONE locked transition so two racing
-    # 4th-snooze attempts cannot both slip past a stale read of snooze_count.
+    # Validate membership + cap AND apply the snooze inside ONE locked transition so
+    # two racing 4th-snooze attempts cannot both slip past a stale read of
+    # snooze_count. A snooze PAUSES an existing open nag loop -- it must not
+    # materialise a phantom snoozed entry for a task that was never nagged (which
+    # would pre-suppress a future first nag and leave an unreclaimed stub). So a
+    # snooze with no genuine open loop is refused, mirroring the sibling handlers'
+    # board-membership validation.
     def mutate(state: dict[str, Any]) -> dict[str, Any]:
-        if nag_state.snooze_capped(state.get(task_id), snooze_max=snooze_max):
-            return {"capped": True, "snooze_count": int((state.get(task_id) or {}).get("snooze_count") or 0)}
+        current = state.get(task_id)
+        if not (nag_state.is_open(current) and nag_state.is_genuine_nag(current)):
+            return {"refused": "no-open-loop"}
+        if nag_state.snooze_capped(current, snooze_max=snooze_max):
+            return {"refused": "cap", "snooze_count": int(current.get("snooze_count") or 0)}
         entry = nag_state.apply_snooze(state, task_id, snoozed_until=snoozed_until,
                                        block_reason=block_reason)
-        return {"capped": False, "entry": entry}
+        return {"entry": entry}
 
     outcome = nag_state.transition(mutate)
-    if outcome["capped"]:
+    if outcome.get("refused") == "no-open-loop":
+        return {"ok": False, "error": {
+            "code": "no-open-nag",
+            "message": ("No open nag loop for this task to snooze. /snooze pauses an "
+                        "active nag; nothing is firing for this task."),
+        }}
+    if outcome.get("refused") == "cap":
         return {"ok": False, "error": {
             "code": "snooze-cap-reached",
             "message": (f"You've snoozed this {snooze_max} times. Use /reschedule to set a "
