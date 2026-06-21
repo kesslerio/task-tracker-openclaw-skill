@@ -573,6 +573,24 @@ def _local_day_start(ref: datetime, *, day_start_hour: int, tz_offset_hours: int
     return local_ref.replace(hour=day_start_hour, minute=0, second=0, microsecond=0)
 
 
+def _create_cursor_start(cal_state: dict[str, Any], *, day_start: datetime, ref: datetime) -> datetime:
+    """The earliest start for a new block: after the day-start, NOW, and every
+    remaining block's end.
+
+    Clamps to ``max(day_start, ref)`` so a create firing after the anchor hour never
+    places a block in the past, then advances past the latest end of any existing
+    block so a NEW priority on a re-run does not overlap one already placed today
+    (the agent never overbooks its OWN calendar). Past-day blocks have already been
+    pruned, so every remaining block is today-or-future.
+    """
+    cursor = max(day_start, ref)
+    for block in cal_state.get("active_blocks", []):
+        end = _parse_event_start(block.get("end"))
+        if end is not None and end > cursor:
+            cursor = end
+    return cursor
+
+
 def run_create_blocks(*, now: datetime | None = None, dry_run: bool = False,
                       send: Send | None = None,
                       runner: calendar_blocks.Runner | None = None,
@@ -605,12 +623,18 @@ def run_create_blocks(*, now: datetime | None = None, dry_run: bool = False,
     fb_ids = calendar_blocks.external_calendar_ids()
     created_titles: list[str] = []
 
+    day_start = _local_day_start(ref, day_start_hour=start_hour, tz_offset_hours=offset)
+
     def _create_under_lock(cal_state: dict[str, Any]) -> None:
         calendar_id = cal_state.get("agent_calendar_id")
         # Prune past-day blocks so active_blocks does not grow unbounded and a stale
         # block never suppresses today's placement.
         focus_calendar.prune_blocks_before(cal_state, today_local)
-        cursor = _local_day_start(ref, day_start_hour=start_hour, tz_offset_hours=offset)
+        # The cursor starts no earlier than NOW (never place a block in the past when
+        # the cron fires after the anchor hour) and after every existing same-day
+        # block's end (so a NEW priority on a re-run never overlaps an already-placed
+        # block on the agent's own focus calendar).
+        cursor = _create_cursor_start(cal_state, day_start=day_start, ref=ref)
         for row in priorities:
             task_id = row.get("task_id")
             # Date-scoped idempotency: only a block placed TODAY suppresses a re-place.

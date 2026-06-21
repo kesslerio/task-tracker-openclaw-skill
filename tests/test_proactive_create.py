@@ -163,6 +163,50 @@ def test_create_blocks_places_again_on_a_new_day(harness):
     assert "2026-06-20" in starts
 
 
+def test_create_cursor_clamped_to_now_after_anchor(harness):
+    """autoreview P2: a create firing AFTER the day-start hour must not place a block
+    in the past -- the cursor clamps to NOW."""
+    state = focus_calendar.load_focus_calendar()
+    state["agent_calendar_id"] = "focus-cal"
+    focus_calendar.save_focus_calendar(state)
+    _seed_priorities([{"task_id": "tsk_rel", "title": "Finalize", "estimate_minutes": 60}])
+    # cron fires at 10:30 UTC, anchor 09:00 UTC -> block must start at 10:30, not 09:00
+    late = datetime(2026, 6, 20, 10, 30, tzinfo=timezone.utc)
+    runner = _create_runner(_ext_free([]))
+    proactive_brief.run_create_blocks(now=late, tz_offset_hours=0, day_start_hour=9,
+                                      send=lambda t, x: None, runner=runner)
+    create_cmd = next(c for c in runner.calls if c[1:3] == ["calendar", "create"])
+    from_iso = create_cmd[create_cmd.index("--from") + 1]
+    assert "T10:30:00" in from_iso  # clamped to NOW, not the past 09:00 anchor
+
+
+def test_create_new_priority_does_not_overlap_existing_same_day_block(harness):
+    """autoreview P2: on a re-run with an added priority, the new block is placed
+    AFTER an existing same-day block, not overlapping it on the agent's calendar."""
+    state = focus_calendar.load_focus_calendar()
+    state["agent_calendar_id"] = "focus-cal"
+    # an existing block today 09:00-11:00 for tsk_rel
+    state["active_blocks"] = [{
+        "event_id": "evt_existing", "task_id": "tsk_rel",
+        "start": "2026-06-20T09:00:00+00:00", "end": "2026-06-20T11:00:00+00:00",
+    }]
+    focus_calendar.save_focus_calendar(state)
+    # re-run with tsk_rel (already placed -> skipped) + a NEW tsk_pr
+    _seed_priorities([
+        {"task_id": "tsk_rel", "title": "Finalize", "estimate_minutes": 120},
+        {"task_id": "tsk_pr", "title": "Review PR", "estimate_minutes": 60},
+    ])
+    runner = _create_runner(_ext_free([]))
+    counts = proactive_brief.run_create_blocks(now=NOW, tz_offset_hours=0, day_start_hour=9,
+                                               send=lambda t, x: None, runner=runner)
+    assert counts["created"] == 1  # only the new tsk_pr
+    assert counts["skipped"] == 1  # tsk_rel already placed
+    create_cmd = next(c for c in runner.calls if c[1:3] == ["calendar", "create"])
+    from_iso = create_cmd[create_cmd.index("--from") + 1]
+    # the new block starts at/after the existing block's 11:00 end -- no overlap
+    assert "T11:00:00" in from_iso
+
+
 def test_create_blocks_no_focus_calendar_degrades(harness):
     board, state = harness
     # no focus calendar seeded
