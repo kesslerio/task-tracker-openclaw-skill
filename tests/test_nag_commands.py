@@ -130,15 +130,30 @@ def test_failed_done_does_not_close_loop(env):
 
 # --- /reschedule closes synchronously --------------------------------------
 
-def test_reschedule_moves_due_and_closes_loop(env):
+def test_reschedule_to_future_moves_due_and_recycles_loop(env, monkeypatch):
+    """A future reschedule moves the board and RECYCLES the loop (clears it, never
+    acks). A future date is no longer overdue, so the next nag-check sends nothing;
+    but if the new date later lapses, a fresh loop nags (no permanent mute)."""
     board, state = env
     _open_loop(state)
+    monkeypatch.setattr(nag_commands, "_now", lambda: REF)
     result = nag_commands.handle_reschedule("tsk_abc123", "2026-06-30")
     assert result["ok"] is True
     assert result["new_due"] == "2026-06-30"
+    assert result["nag_closed"] is False and result["nag_recycled"] is True
     assert "2026-06-30" in board.read_text()  # board moved
-    nag = _state(state)["tsk_abc123"]
-    assert nag["ack"] is True and nag["closed_by"] == "rescheduled"
+    # No lingering acked entry that would mute a future lapse.
+    assert "tsk_abc123" not in _state(state) or _state(state)["tsk_abc123"].get("ack") is not True
+    # The future date is not overdue at REF -> nag-check is quiet for now.
+    sent = []
+    nag_check.run_nag_check(send=lambda t, x: sent.append((t, x)))
+    assert sent == []
+    # When the new date later lapses, a fresh loop nags (no permanent mute).
+    monkeypatch.setattr(nag_check, "_today",
+                        lambda: datetime(2026, 7, 10, tzinfo=timezone.utc))
+    sent2 = []
+    nag_check.run_nag_check(send=lambda t, x: sent2.append((t, x)))
+    assert len(sent2) == 1
 
 
 def test_reschedule_to_still_overdue_date_recycles_loop_for_renag(env, monkeypatch):

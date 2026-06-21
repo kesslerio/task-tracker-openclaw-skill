@@ -37,6 +37,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 import cos_config
+import cron_backend
 import nag_delivery
 import nag_state
 from task_ledger import append_event, new_event
@@ -94,6 +95,21 @@ def _active_record(task_id: str, *, personal: bool = False):
     return None
 
 
+def _safe_delete(cron_id: str, *, delete: Callable[[str], Any] | None = None) -> None:
+    """Best-effort delete of a pending cron; a backend failure is swallowed.
+
+    Used when rolling back a partially-created body-double and when cancelling a
+    session: a transient gateway error must not block the state cleanup, and a
+    deleteAfterRun cron may already be gone. ``delete`` resolves to the live
+    backend at CALL time (not bound at def time) so a test can patch it.
+    """
+    delete = delete or cron_backend.delete_cron
+    try:
+        delete(cron_id)
+    except cron_backend.CronBackendError:
+        pass
+
+
 # --- /done + /reschedule: board op THEN synchronous close in the same turn ---
 
 def _close_loop_after_board_op(result: dict[str, Any], task_id: str,
@@ -141,35 +157,29 @@ def handle_done(task_id: str, *, personal: bool = False) -> dict[str, Any]:
 
 
 def handle_reschedule(task_id: str, new_due: str, *, personal: bool = False) -> dict[str, Any]:
-    """Move ``due::`` then close the loop in the SAME turn (Path C / spec T10).
+    """Move ``due::`` then RECYCLE the nag loop in the SAME turn (Path C / spec T10).
 
-    A reschedule to a FUTURE date takes the task off the overdue set, so the loop
-    is closed (rescheduled). A reschedule to a STILL-OVERDUE date is the deliberate
-    T10 case ("rescheduled to a date that is again overdue"): the loop is CLEARED,
-    not acked -- so the next nag-check opens a fresh loop with a new nag_loop_id
-    rather than leaving an acked-terminal entry that would mute the still-overdue
-    task. The user explicitly chose an overdue date; re-nagging it is correct.
+    A reschedule always CLEARS the loop rather than acking it -- never sets the
+    terminal ``ack: true``. Acking would permanently mute the task: when the new
+    due date later passes and the task is overdue again, the cron skips acked
+    entries forever (the same accountability hole the recurring-/done path
+    deliberately avoids by clearing). Clearing lets the next overdue crossing open
+    a fresh loop with a new nag_loop_id:
+
+    * future date -> off the overdue set now; re-nags only if/when it lapses again;
+    * still-overdue date (T10) -> the next nag-check opens a fresh loop right away.
     """
     result = reschedule_by_id(task_id, new_due, personal=personal, source="user_command")
     if not result.get("ok"):
         return result
-    if _is_overdue(new_due):
-        cleared = nag_state.transition(lambda state: nag_state.clear_loop(state, task_id))
-        result["nag_closed"] = False  # the loop is intentionally left to re-nag
-        result["nag_recycled"] = cleared is not None
-        return result
-    return _close_loop_after_board_op(result, task_id,
-                                      closed_by=nag_state.CLOSED_RESCHEDULED)
-
-
-def _is_overdue(due: str, *, ref: datetime | None = None) -> bool:
-    """Is ``due`` (YYYY-MM-DD) strictly before today? Garbage parses as not-overdue."""
-    try:
-        due_date = datetime.strptime(due, "%Y-%m-%d").date()
-    except ValueError:
-        return False
-    today = (ref or _now()).date()
-    return due_date < today
+    cleared = nag_state.transition(lambda state: nag_state.clear_loop(state, task_id))
+    if cleared is not None:
+        _log("nag_acked", task_id=task_id, nag_loop_id=cleared.get("nag_loop_id"),
+             closed_by=nag_state.CLOSED_RESCHEDULED)
+    # The loop is recycled, not terminally closed -- a lapse of the new date re-nags.
+    result["nag_closed"] = False
+    result["nag_recycled"] = cleared is not None
+    return result
 
 
 # --- /snooze (akrasia asymmetry) ------------------------------------------
@@ -285,9 +295,12 @@ def handle_body_double(
     the env is unset NO crons are created and the start is blocked (a body-double
     that cannot prove its check-in destination must not silently start headless).
 
-    ``create_cron`` is injectable (the gateway ``openclaw cron create`` in
-    production); it returns the created cron id.  It defaults to a no-op id so a
-    dry-run / test records the descriptors without a live gateway.
+    ``create_cron`` is injectable (a test passes a recording stub); it returns the
+    created cron id. It DEFAULTS to the real gateway backend
+    (``cron_backend.create_cron``) so the production CLI path actually schedules
+    the check-ins -- never a silent no-op that reports "started" while creating
+    nothing. A backend failure raises ``CronBackendError`` and is reported as a
+    structured error (no half-started session is recorded).
     """
     minutes = parse_duration_minutes(duration)
     if minutes <= 0:
@@ -324,15 +337,27 @@ def handle_body_double(
 
     session_id = f"bd_{uuid.uuid4().hex[:12]}"
     started_at = _now()
-    create = create_cron or (lambda _descriptor: f"cron_{uuid.uuid4().hex[:12]}")
+    create = create_cron or cron_backend.create_cron
     cron_ids: list[str] = []
-    for fraction in _CHECKIN_FRACTIONS:
-        elapsed = int(round(minutes * fraction))
-        descriptor = _checkin_cron(
-            session_id, task_id, elapsed, started_at + timedelta(minutes=elapsed),
-            delivery_target, is_final=(fraction == 1.0),
-        )
-        cron_ids.append(create(descriptor))
+    try:
+        for fraction in _CHECKIN_FRACTIONS:
+            elapsed = int(round(minutes * fraction))
+            descriptor = _checkin_cron(
+                session_id, task_id, elapsed, started_at + timedelta(minutes=elapsed),
+                delivery_target, is_final=(fraction == 1.0),
+            )
+            cron_ids.append(create(descriptor))
+    except cron_backend.CronBackendError as exc:
+        # A check-in cron could not be scheduled. Do NOT record a half-started
+        # session or report "started" -- the session would have no working
+        # check-ins. Best-effort delete any crons created before the failure.
+        for cron_id in cron_ids:
+            _safe_delete(cron_id)
+        return {"ok": False, "error": {
+            "code": "checkin-cron-failed",
+            "message": "Could not schedule the body-double check-ins; session not started.",
+            "reason": str(exc),
+        }}
 
     session = {
         "session_id": session_id,
@@ -359,10 +384,11 @@ def handle_cancel_session(
 ) -> dict[str, Any]:
     """End the active body-double session for ``task_id`` + delete its pending crons.
 
-    ``delete_cron`` is injectable (the gateway ``openclaw cron delete``); it
-    defaults to a no-op so a test exercises the state transition without a gateway.
-    The ephemeral crons are ``deleteAfterRun`` so a fired one is already gone;
-    deleting cancels the ones that have NOT yet fired.
+    ``delete_cron`` is injectable (a test passes a recording stub); it DEFAULTS to
+    the real gateway backend (``cron_backend.delete_cron``). The ephemeral crons
+    are ``deleteAfterRun`` so a fired one is already gone; deleting cancels the
+    ones that have NOT yet fired. A delete failure is swallowed (best-effort) so a
+    transient gateway hiccup cannot block ending the session in state.
     """
     existing = nag_state.read_state().get(task_id)
     session = nag_state.active_body_double_session(existing)
@@ -372,9 +398,9 @@ def handle_cancel_session(
             "message": "No active body-double session for this task.",
         }}
 
-    delete = delete_cron or (lambda _cron_id: None)
+    delete = delete_cron or cron_backend.delete_cron
     for cron_id in session.get("cron_ids") or []:
-        delete(cron_id)
+        _safe_delete(cron_id, delete=delete)
 
     ended = nag_state.transition(
         lambda state: nag_state.end_body_double_session(
