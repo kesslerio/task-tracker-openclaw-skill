@@ -229,6 +229,10 @@ bash scripts/telegram-commands.sh cancel-session <task_id>   # end a body-double
   `autonomy_gate.gate()` (act_id) → `assert_send_target()`. An unset
   `TELEGRAM_CHAT_ID_PRODUCTIVITY` / `OPENCLAW_TOPIC_PRODUCTIVITY_STANDUP` ⇒
   `nag_delivery_blocked:env_missing` and the loop STAYS OPEN.
+- Delivery: each proven+gated+asserted nag text is emitted on `nag_check.py`'s
+  stdout, which the cron job's explicit `delivery.to: -1003878985658:topic:2`
+  announces to topic 2. A nag is counted as sent only once its text is collected
+  for that announce — the script never logs `nag_sent` while delivering nothing.
 - `nag_check.py` is READ-ONLY on the board; all board mutations happen through the
   reactive command path (`/done`, `/reschedule`).
 - Body-double check-ins are ephemeral one-shot crons with `deleteAfterRun:true`

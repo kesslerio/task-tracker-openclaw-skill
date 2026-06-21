@@ -122,6 +122,50 @@ def test_t2_nag_refires_without_ack(harness):
     assert len(sent_events) == 2
 
 
+# --- Production transport: main() emits the nag text for the cron announce ----
+
+def test_main_emits_nag_text_for_delivery(harness, capsys):
+    """The production CLI path (main) must actually emit the proven nag text -- not
+    gate+log nag_sent while delivering nothing. The cron announces this stdout."""
+    board, state = harness
+    rc = nag_check.main([])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "tsk_abc123" in out  # the nag payload is in the deliverable output
+    assert "Overdue task still open" in out
+    assert "NAG_CHECK_DONE: 1 open loops, 1 sent" in out
+
+
+def test_run_nag_check_requires_transport_for_real_run(harness):
+    """A real run with no transport raises rather than silently delivering nothing."""
+    with pytest.raises(ValueError):
+        nag_check.run_nag_check()  # no send, not dry-run
+
+
+# --- Background recycle: no-longer-overdue clears (never terminally acks) ------
+
+def test_background_no_longer_overdue_recycles_not_acks(harness, monkeypatch):
+    """A still-on-board task that drops below threshold is RECYCLED (cleared), not
+    terminally acked -- so a future lapse past threshold nags again (no mute hole)."""
+    board, state = harness
+    _run(harness)  # open loop for tsk_abc123 (due 2026-06-15)
+    # The due date is edited forward so the task is no longer overdue past threshold.
+    board.write_text(
+        "# Work\n\n## 🟡 Q2\n"
+        "- [ ] **Re-evaluate ActiveCampaign** task_id::tsk_abc123 🗓️2026-06-30 area:: Marketing\n",
+        encoding="utf-8")
+    counts, _sent = _run(harness)
+    assert counts["closed"] == 1
+    # The entry is cleared (recycled), NOT a lingering acked entry.
+    assert "tsk_abc123" not in _state(state) or _state(state)["tsk_abc123"].get("ack") is not True
+    # When the new date later lapses past threshold, a fresh loop nags.
+    monkeypatch.setattr(nag_check, "_today",
+                        lambda: datetime(2026, 7, 10, tzinfo=timezone.utc))
+    sent = []
+    nag_check.run_nag_check(send=lambda t, x: sent.append((t, x)))
+    assert len(sent) == 1  # re-nags -- never permanently muted
+
+
 # --- T3: verified-done closes the loop (Path B) ----------------------------
 
 def test_t3_verified_done_closes_without_push(harness):
@@ -227,7 +271,7 @@ def test_crash_mid_run_leaves_open_loop_open(harness, monkeypatch):
 
     monkeypatch.setattr(nag_check, "_push_nag", boom)
     with pytest.raises(RuntimeError):
-        nag_check.run_nag_check()
+        nag_check.run_nag_check(send=lambda t, x: None)
     # State on disk is unchanged -- the loop is still open.
     assert _state(state)["tsk_abc123"]["ack"] is False
 

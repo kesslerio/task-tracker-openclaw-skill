@@ -177,16 +177,30 @@ def run_nag_check(*, dry_run: bool = False,
 
     Board reads are READ-ONLY.  State writes go through ``nag_state.transition``
     (flock + atomic).  A delivery block leaves the loop open.
+
+    ``send`` is the transport every nag is delivered through; it is REQUIRED for a
+    real run (a missing transport would gate + log nag_sent while delivering
+    nothing). A dry-run never sends, so it may be omitted there. ``main`` wires a
+    collector transport whose payloads it emits for the cron ``delivery.to``
+    announce; tests inject a recording stub.
     """
+    if not dry_run and send is None:
+        raise ValueError("run_nag_check requires a send transport for a real run.")
     ref = _today()
     _tasks_file, _content, records = load_records(personal=False)
     active = {r.canonical_id: r for r in active_records(records) if r.canonical_id}
     counts = {"open": 0, "sent": 0, "closed": 0, "blocked": 0}
 
-    # 1. Close GENUINE open nag loops (those that have actually fired) whose task
-    #    is gone from the active board (verified_done) or no longer overdue past
-    #    threshold (rescheduled out). No push on close. A body-double-only stub
-    #    (nag_count==0) is NOT a nag loop and must not be spuriously acked here.
+    # 1. Resolve GENUINE open nag loops (those that have actually fired). No push
+    #    on resolve. A body-double-only stub (nag_count==0) is NOT a nag loop and
+    #    must not be touched here. Two outcomes:
+    #    * task GONE from the active board -> terminally acked (verified_done): a
+    #      task off the board is genuinely done/parked, a terminal close is correct.
+    #    * task still on the board but no longer overdue past threshold -> RECYCLED
+    #      (cleared), NOT terminally acked. Acking would permanently mute the task:
+    #      if its due date later lapses past threshold again, an acked entry is
+    #      skipped forever. Clearing lets that future lapse open a fresh loop -- the
+    #      same recycle the reactive /reschedule + recurring-/done paths use.
     for task_id, entry in list(nag_state.read_state().items()):
         if not (nag_state.is_open(entry) and nag_state.is_genuine_nag(entry)):
             continue
@@ -195,7 +209,7 @@ def run_nag_check(*, dry_run: bool = False,
             _close(task_id, nag_state.CLOSED_VERIFIED_DONE, entry)
             counts["closed"] += 1
         elif _crossed(record, ref=ref) is None:
-            _close(task_id, nag_state.CLOSED_RESCHEDULED, entry)
+            _recycle(task_id, entry)
             counts["closed"] += 1
 
     # 2. Open / re-fire loops for tasks that crossed their threshold.
@@ -287,10 +301,27 @@ def _apply_fire_result(result, task_id, section, counts) -> None:
 
 
 def _close(task_id: str, closed_by: str, entry: dict[str, Any]) -> None:
-    """Close a loop in state + append the nag_acked ledger event (never silent)."""
+    """Terminally ack a loop in state + append the nag_acked ledger event.
+
+    Used only when the task is GONE from the board (verified_done) -- a terminal
+    close is correct because the task is genuinely done/parked.
+    """
     nag_state.transition(lambda live: nag_state.close_loop(live, task_id, closed_by=closed_by))
     _log("nag_acked", task_id=task_id, nag_loop_id=entry.get("nag_loop_id"),
          closed_by=closed_by)
+
+
+def _recycle(task_id: str, entry: dict[str, Any]) -> None:
+    """Recycle (clear) a loop whose task is no longer overdue past threshold.
+
+    The loop is NOT terminally acked: the entry is removed so a FUTURE lapse past
+    threshold opens a fresh loop. The nag_acked event carries ``recycled: true`` so
+    the audit trail distinguishes this reset from a terminal ack (matching the
+    reactive recycle paths).
+    """
+    nag_state.transition(lambda live: nag_state.clear_loop(live, task_id))
+    _log("nag_acked", task_id=task_id, nag_loop_id=entry.get("nag_loop_id"),
+         closed_by=nag_state.CLOSED_RESCHEDULED, recycled=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -299,7 +330,20 @@ def main(argv: list[str] | None = None) -> int:
                         help="report what would be pushed without writing state or sending")
     args = parser.parse_args(argv)
     try:
-        counts = run_nag_check(dry_run=args.dry_run)
+        # The cron job announces this script's stdout to its explicit delivery.to
+        # (topic 2). So the transport is a collector: it accumulates each proven,
+        # gated, asserted nag text, and main() PRINTS the collected payloads as the
+        # deliverable output the gateway announce delivers. This is not a silent
+        # no-op -- a nag is only counted as sent once its text is collected for
+        # delivery, and the gate<->message seam still binds every payload to its
+        # proven target before it is collected.
+        payloads: list[str] = []
+        counts = run_nag_check(dry_run=args.dry_run,
+                               send=None if args.dry_run else
+                               (lambda _target, text: payloads.append(text)))
+        for text in payloads:
+            print(text)
+            print()  # blank line between nags in the announced output
         print(f"NAG_CHECK_DONE: {counts['open']} open loops, {counts['sent']} sent, "
               f"{counts['closed']} closed, {counts['blocked']} blocked")
         return 0

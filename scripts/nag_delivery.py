@@ -95,20 +95,24 @@ def authorised_send(
     delivery_target: dict[str, Any],
     text: str,
     *,
-    send: Callable[[dict[str, Any], str], Any] | None = None,
+    send: Callable[[dict[str, Any], str], Any],
 ) -> dict[str, Any]:
     """Assert the gate<->message seam, then send ONLY to the gated target.
 
     ``assert_send_target`` is the Decision #1 seam: it confirms ``delivery_target``
     is the exact target ``act_id`` was gated for. The transport ``send`` is invoked
     only after that passes; a mismatch returns ``{"ok": False, "reason":
-    "target-mismatch"}`` and NOTHING is sent. ``send`` defaults to a no-op so a
-    dry-run / test never touches a live gateway.
+    "target-mismatch"}`` and NOTHING is sent.
+
+    ``send`` is REQUIRED (not optional): a missing transport is a delivery FAILURE,
+    not a silent success. Otherwise the production path would gate + log ``nag_sent``
+    while delivering nothing -- the nag would be inert but recorded as sent. The
+    caller is responsible for passing a real transport (or, for the cron, a
+    collector whose payloads main() emits for the gateway ``delivery.to`` announce).
     """
     check = assert_send_target(act_id, delivery_target)
     if not check["ok"]:
         return {"ok": False, "reason": check["reason"], "stage": "assert",
                 "message": check.get("message")}
-    if send is not None:
-        send(delivery_target, text)
+    send(delivery_target, text)
     return {"ok": True, "delivery_target": delivery_target}
