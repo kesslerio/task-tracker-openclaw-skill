@@ -39,6 +39,26 @@ from utils import (
 )
 
 
+def capacity_line(records=None):
+    """Build the Layer-2 capacity ceiling line for the standup, or None.
+
+    Reuses ``focus_core`` so the standup display and the ``add_task`` write-time
+    gate agree on one calculation. ``records`` is the parsed work-task record
+    list; when omitted it is loaded from the work file. Any failure degrades to
+    None (no capacity line) rather than breaking the whole standup.
+    """
+    try:
+        from focus_core import capacity_display, summarize_capacity
+
+        if records is None:
+            from task_records import load_records
+
+            _, _, records = load_records(personal=False)
+        return capacity_display(summarize_capacity(records))
+    except Exception:
+        return None
+
+
 def group_by_area(tasks):
     """Group tasks by area (falls back to department for objectives format tasks)."""
     areas = {}
@@ -285,6 +305,7 @@ def generate_standup(
     split_output: bool = False,
     tasks_data: dict | None = None,
     notes_dir: Path | None = None,
+    capacity_records=None,
 ) -> str | dict | list:
     """Generate daily standup summary.
 
@@ -315,7 +336,13 @@ def generate_standup(
         'team': [],  # Team tasks to monitor
         'completed': [],
         'objective_progress': {},
+        'capacity': None,
     }
+
+    # Layer-2 capacity ceiling line (U3): estimate-sum over active work vs ~1
+    # week of capacity. Degrades to None on any failure rather than breaking the
+    # standup. Skipped for personal standups (the cap governs the work board).
+    output['capacity'] = capacity_line(records=capacity_records)
 
     # Apply display-only priority escalation
     regrouped = regroup_by_effective_priority(tasks_data, reference_date=standup_date)
@@ -401,7 +428,11 @@ def generate_standup(
         if priority.get('blocks'):
             lines.append(f"   ↳ Blocking: {priority['blocks']}")
         lines.append("")
-    
+
+    if output.get('capacity'):
+        lines.append(output['capacity'])
+        lines.append("")
+
     if output['due_today']:
         total_est = sum(parse_duration(t.get('estimate')) for t in output['due_today'])
         est_str = f" [{format_duration(total_est)}]" if total_est > 0 else ""
