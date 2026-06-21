@@ -35,6 +35,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+import autonomy_gate
 import calendar_blocks
 import cos_config
 import error_envelope
@@ -278,12 +279,26 @@ def run_debrief_capture(reference: str, notes: str, *,
         return {"captured": False, "task_ids": []}
 
     task_ids: list[str] = []
+    failed: list[str] = []
     for spec in parse_commitments(notes):
         task_id = _create_commitment_task(spec, runner=runner)
         if task_id is None:
+            failed.append(spec["title"])
             continue
         task_ids.append(task_id)
         _log("commitment_task_created", task_id=task_id, title=spec["title"], due=spec.get("due"))
+
+    # NEVER lose a commitment: if ANY commitment failed to create, the loop stays
+    # OPEN so the user can retry, rather than silently dropping it behind a closed
+    # loop. The successfully-created tasks are kept (a partial success is recorded),
+    # and the failures are surfaced for the next re-prompt / retry.
+    if failed:
+        proactive_state.record_partial_debrief(state, event_id, task_ids)
+        proactive_state.save_proactive_state(state)
+        _log("debrief_captured", event_key=event_id, commitments_task_ids=task_ids,
+             failed_commitments=failed, partial=True)
+        return {"captured": False, "task_ids": task_ids, "reason": "commitment_create_failed",
+                "failed": failed}
 
     proactive_state.capture_debrief(state, event_id, task_ids)
     proactive_state.save_proactive_state(state)
@@ -300,6 +315,20 @@ def _load_active(personal: bool = False) -> list[Any]:
     except FileNotFoundError:
         return []
     return list(active_records(records))
+
+
+def _gate_calendar_write(act_type: str, task_id: str, snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Record an autonomous calendar write in the autonomy audit log via the gate.
+
+    A focus-block create/move is a rung-3 (monitored-auto) reversible act: its
+    reversal substrate is NOT a board line but the event record itself (event_id +
+    calendar_id + window), which is what ``snapshot`` carries -- so the act is
+    logged with a real undo payload and the rung config is actually exercised. No
+    ``delivery_target`` is bound (the Telegram notice is a SEPARATE gated push).
+    Returns the gate result; a blocked gate refuses the write upstream.
+    """
+    return autonomy_gate.gate(act_type, task_id=task_id, unit="U6",
+                              snapshot_provider=lambda: snapshot)
 
 
 def _push(act_type: str, text: str, *, surface: str, send: Send | None,
@@ -449,6 +478,16 @@ def _recover_one_block(cal_state: dict[str, Any], block: dict[str, Any], calenda
     """
     task_id = block.get("task_id")
     new_start, new_end = _next_window(block, ref=ref)
+    # Gate the autonomous move through the autonomy ladder before the gog call. The
+    # snapshot is the OLD window (the move's reversal substrate), so the act is
+    # recorded with a real undo payload.
+    gated = _gate_calendar_write("calendar_block_moved", task_id,
+                                 {"calendar_id": calendar_id, "event_id": block.get("event_id"),
+                                  "old_start": block.get("start"), "old_end": block.get("end")})
+    if not gated["ok"]:
+        _log("calendar_block_refused", task_id=task_id, reason=f"gate:{gated['reason']}",
+             event_id=block.get("event_id"))
+        return {"status": "refused"}
     try:
         moved = calendar_blocks.move_focus_block(
             calendar_id, block["event_id"], task_id, new_start, new_end,
@@ -490,6 +529,13 @@ def run_create_blocks(*, now: datetime | None = None, dry_run: bool = False,
     ``focus-calendar.json`` and a confirmation notice is pushed through the proven
     delivery seam. Idempotent: a priority that already has an active block is
     skipped. Degrades silently when no focus calendar is configured.
+
+    ``day_start_hour`` is anchored in ``now``'s OWN timezone, so the morning anchor
+    is the user's local morning ONLY when the caller passes a local-time ``now``
+    (the cron runs in PT per the spec schedule). The default ``now`` is UTC, which
+    is correct for a UTC-scheduled caller; a PT cron must pass its local now. The
+    block start/end are emitted as the resulting tz-aware ISO timestamps, so the
+    freebusy check and the stored block are unambiguous either way.
     """
     ref = now or _now()
     counts = {"created": 0, "refused": 0, "skipped": 0}
@@ -529,6 +575,17 @@ def run_create_blocks(*, now: datetime | None = None, dry_run: bool = False,
 def _place_one_block(cal_state, calendar_id, task_id, title, start_iso, end_iso, fb_ids,
                      *, ref: datetime, runner) -> str:
     """Create ONE freebusy-gated focus block, persisting + logging. -> created|refused."""
+    # Gate the autonomous calendar write through the autonomy ladder BEFORE the gog
+    # call: a blocked rung (e.g. a corrupt config that floors the act) refuses the
+    # write. The snapshot is the reversal substrate (calendar + window), not a board
+    # line. The freebusy gate inside create_focus_block is the overbook guard; this
+    # is the autonomy-audit guard.
+    gated = _gate_calendar_write("calendar_block_created", task_id,
+                                 {"calendar_id": calendar_id, "task_id": task_id,
+                                  "start": start_iso, "end": end_iso})
+    if not gated["ok"]:
+        _log("calendar_block_refused", task_id=task_id, reason=f"gate:{gated['reason']}")
+        return "refused"
     try:
         block = calendar_blocks.create_focus_block(
             calendar_id, task_id, title, start_iso, end_iso,

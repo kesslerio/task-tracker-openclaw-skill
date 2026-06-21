@@ -267,6 +267,23 @@ def capture_debrief(state: dict[str, Any], event_id: str, commitment_task_ids: l
     return entry
 
 
+def record_partial_debrief(state: dict[str, Any], event_id: str, commitment_task_ids: list[str]) -> dict[str, Any] | None:
+    """Record successfully-created commitment ids WITHOUT closing the loop.
+
+    Used when some commitments failed to create: the loop stays OPEN (no
+    ``debrief_captured_at``) so the user can retry rather than the agent silently
+    dropping a commitment behind a closed loop. The created ids are merged (de-duped,
+    order preserved) onto the entry so a successful task is recorded once.
+    """
+    entry = find_pre_brief(state, event_id)
+    if entry is None:
+        return None
+    existing = entry.get("commitments_task_ids") or []
+    seen = set(existing)
+    entry["commitments_task_ids"] = existing + [t for t in commitment_task_ids if not (t in seen or seen.add(t))]
+    return entry
+
+
 def skip_debrief(state: dict[str, Any], event_id: str) -> dict[str, Any] | None:
     """Close a debrief loop by user skip (sets ``debrief_skipped_at``)."""
     entry = find_pre_brief(state, event_id)

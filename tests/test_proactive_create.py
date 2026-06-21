@@ -160,6 +160,24 @@ def test_create_blocks_never_writes_focus_state(harness):
     assert focus_state.focus_state_path().read_text() == before
 
 
+def test_create_block_is_gated_in_autonomy_log(harness):
+    """autoreview: an autonomous calendar write is recorded in the autonomy log via
+    the gate (the calendar_block_created rung is actually exercised)."""
+    import autonomy_gate
+
+    board, state = harness
+    _seed_focus_calendar()
+    _seed_priorities([{"task_id": "tsk_rel", "title": "Finalize", "estimate_minutes": 120}])
+    runner = _create_runner(_ext_free([]))
+    proactive_brief.run_create_blocks(now=NOW, send=lambda t, x: None, runner=runner)
+    acts = [a for a in autonomy_gate.read_autonomy_log() if a.get("act_type") == "calendar_block_created"]
+    assert len(acts) == 1
+    assert acts[0]["status"] == "executed"
+    assert acts[0]["rung"] == autonomy_gate.RUNG_MONITORED_AUTO
+    # the act carries the reversal substrate (the calendar window), not a board line
+    assert acts[0]["pre_action_snapshot"]["task_id"] == "tsk_rel"
+
+
 # --- main() wiring: debrief-capture is reachable ----------------------------
 
 def test_main_debrief_capture_routes_to_handler(harness, monkeypatch, capsys):

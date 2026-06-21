@@ -324,6 +324,29 @@ def test_debrief_capture_unknown_reference_refuses(harness):
     assert result["task_ids"] == []
 
 
+def test_debrief_partial_failure_keeps_loop_open(harness):
+    """autoreview: if a commitment task FAILS to create, the loop stays OPEN so the
+    user can retry -- a commitment is never silently dropped behind a closed loop."""
+    board, state = harness
+    st = proactive_state.load_proactive_state()
+    proactive_state.mark_pre_brief_sent(st, "evt_q3", "Q3 Review", "2026-06-20T09:00:00+00:00")
+    proactive_state.open_debrief(st, "evt_q3")
+    proactive_state.save_proactive_state(st)
+
+    def failing_runner(cmd):
+        # tasks.py add returns non-zero -> _create_commitment_task yields None
+        return types.SimpleNamespace(stdout="", stderr="cap reached", returncode=2)
+
+    result = proactive_brief.run_debrief_capture(
+        "evt_q3", "I will ship by 2026-06-30", runner=failing_runner)
+    assert result["captured"] is False
+    assert result["reason"] == "commitment_create_failed"
+    assert result["failed"] == ["I will ship"]
+    # the loop is STILL open -- the commitment is not lost
+    reloaded = proactive_state.load_proactive_state()
+    assert proactive_state.is_debrief_open(reloaded["pre_briefs"][0]) is True
+
+
 def test_debrief_skip_closes_loop_no_tasks(harness):
     board, state = harness
     st = proactive_state.load_proactive_state()
