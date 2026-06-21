@@ -24,6 +24,7 @@ Every writer here is atomic (utils._atomic_write) and flock-guarded.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import uuid
@@ -53,14 +54,37 @@ DEFAULT_RUNG_FOR_UNKNOWN = RUNG_DRAFT
 RUNG_MIN = RUNG_READ
 RUNG_MAX = RUNG_NEVER_AUTO
 
+# v0.1 ships board-only (Decision: U2 owns "rung-3 push acts DISABLED"). A
+# rung-3 monitored-auto act is reversible enough to auto-execute, but in v0.1 the
+# proactive-push delivery seam (U4/U5/U6) has NOT shipped, so a rung-3 act that
+# names a delivery_target is a Telegram PUSH and must be blocked here -- not just
+# left unsent downstream. Flipping this to True is the explicit v0.2 gate, paired
+# with the U4/U5/U6 delivery wiring. A rung-3 act with NO delivery_target (a pure
+# board mutation) is unaffected; only the push variant is disabled.
+RUNG3_PUSH_ENABLED = False
+
 # Irreversible-act rungs anchored IN CODE (Finding #3b). These are the acts that
 # must never auto-execute regardless of what a JSON override claims; a corrupt or
 # tampered autonomy-config.json can only ever fail CLOSED to these, never below
 # them. A JSON override may adjust a KNOWN act_type to another valid rung, but the
 # in-code floor for these irreversible acts is the safe default.
 DEFAULT_ACT_TYPE_RUNGS: dict[str, int] = {
+    # Irreversible acts -- anchored at rung 4 so a corrupt config can only ever
+    # fail CLOSED to these, never below them.
     "email_send": RUNG_NEVER_AUTO,
     "calendar_block_deleted": RUNG_NEVER_AUTO,
+    "focus_deleted": RUNG_NEVER_AUTO,
+    # The reversibility-keyed ladder (spec-U2 §3.1). U2 lands the real rungs so the
+    # system has genuine rung-3 push acts to disable in v0.1 (RUNG3_PUSH_ENABLED).
+    # A nag is reversible (ack+silence) -> rung 3 (monitored-auto), but its PUSH is
+    # frozen in v0.1. Board mutations are execute-with-approval -> rung 2.
+    "nag_sent": RUNG_MONITORED_AUTO,
+    "nag_acked": RUNG_MONITORED_AUTO,
+    "wip_cap_enforced": RUNG_APPROVE,
+    "task_marked_done": RUNG_APPROVE,
+    "focus_set": RUNG_APPROVE,
+    "focus_updated": RUNG_APPROVE,
+    "email_draft": RUNG_DRAFT,
 }
 
 DEFAULT_AUTONOMY_CONFIG: dict[str, Any] = {
@@ -176,10 +200,13 @@ def ensure_autonomy_config() -> dict[str, Any]:
     loaded = _load_state_dict(path, "autonomy-config-corrupt")
     if isinstance(loaded, dict):
         return loaded
+    # Deep-copy the defaults so a caller that mutates ``config["act_type_rungs"]``
+    # (e.g. to register a rung) can never poison the module-level default for the
+    # next caller -- a shallow ``dict(...)`` shares the nested act_type_rungs dict.
     if loaded is _STATE_UNREADABLE:
-        return dict(DEFAULT_AUTONOMY_CONFIG)
+        return copy.deepcopy(DEFAULT_AUTONOMY_CONFIG)
     _atomic_write(path, json.dumps(DEFAULT_AUTONOMY_CONFIG, indent=2, sort_keys=True) + "\n")
-    return dict(DEFAULT_AUTONOMY_CONFIG)
+    return copy.deepcopy(DEFAULT_AUTONOMY_CONFIG)
 
 
 def _coerce_rung(value: Any) -> int | None:
@@ -378,6 +405,16 @@ def gate(
         record = _log_act(act_id, act_type, rung, "blocked:rung4",
                           delivery_target=proven_target, **common)
         return {"ok": False, "reason": "rung4", "act_id": act_id, "record": record}
+
+    # v0.1 board-only: a rung-3 act that names a delivery_target is a proactive
+    # Telegram push, and the delivery seam (U4/U5/U6) has not shipped. Block it at
+    # the gate -- even a perfectly proven target -- so no rung-3 push can execute
+    # before its owning unit lands. Board-only rung-3 acts (no delivery_target)
+    # pass through normally.
+    if rung >= RUNG_MONITORED_AUTO and proven_target is not None and not RUNG3_PUSH_ENABLED:
+        record = _log_act(act_id, act_type, rung, "blocked:push-disabled",
+                          delivery_target=proven_target, **common)
+        return {"ok": False, "reason": "push-disabled", "act_id": act_id, "record": record}
 
     # TOCTOU: snapshot taken now, right before authorising the write. A snapshot is
     # mandatory at rung >= APPROVE irrespective of reversible -- reversible=False is

@@ -147,6 +147,29 @@ python3 scripts/update_weekly_embeds.py --dry-run
 python3 scripts/update_weekly_embeds.py
 ```
 
+### Autonomy audit + undo (U2 — 🧭 Identity topic 1909)
+
+Reactive, owner-only commands that inspect or reverse a prior autonomous act.
+Both reply in-topic (origin-proven) and never push to Telegram themselves.
+
+```bash
+bash scripts/telegram-commands.sh audit            # list recent autonomous acts
+bash scripts/telegram-commands.sh audit act_<id>   # full detail for one act
+bash scripts/telegram-commands.sh undo act_<id>    # reverse a reversible act
+```
+
+- `/undo act_<id>` — undo a recent autonomous act (tiered window: 4h for a nag
+  ack, 7d for a board mutation). A board mutation is restored by re-inserting the
+  snapshot's exact `raw_line` via content search (not a line-number guess), so it
+  survives other edits to the board; a `nag_sent` act is undone by acking the nag
+  loop (`ack_type=user_undo`) so it will not re-fire.
+- `/audit` — list recent autonomous acts (act_id, type, task, target, status),
+  newest first; an already-undone act is flagged.
+
+v0.1 ships **board-only**: rung-3 proactive Telegram pushes are disabled at the
+gate (`autonomy_gate.RUNG3_PUSH_ENABLED=False`) until U4/U5/U6 land the delivery
+wiring. Boot preflight (U1) must keep `autonomy-log.jsonl` writable for these.
+
 ## Agent Invocation Guidance
 
 Use explicit, workspace-relative paths when running commands from agents:

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Telegram slash command wrapper for task-tracker skill
-# Usage: telegram-commands.sh {daily|weekly|done24h|done7d}
+# Usage: telegram-commands.sh {daily|weekly|done24h|done7d|audit|undo}
 #
 # U1 NO-RAW-ERROR-LEAK boundary: every python3 invocation goes through
 # run_with_envelope, which captures stdout AND stderr. On a non-zero exit the
@@ -97,8 +97,20 @@ case "$1" in
       printf '%s\n' "$out" | grep -A100 "✅ Done" | head -50
     fi
     ;;
+  audit)
+    # U2: list recent autonomous acts, or detail one with `audit act_<id>`.
+    # Surfaced in the 🧭 Identity topic (1909); reactive + read-only (rung 0).
+    shift
+    run_with_envelope "audit" python3 "$SCRIPT_DIR/autonomy_cli.py" audit "$@"
+    ;;
+  undo)
+    # U2: reverse a prior gated act (`undo act_<id>`). Reactive; restores the
+    # board line by content-search or acks a nag loop, inside the undo window.
+    shift
+    run_with_envelope "undo" python3 "$SCRIPT_DIR/autonomy_cli.py" undo "$@"
+    ;;
   *)
-    echo "Usage: $0 {daily|weekly|done24h|done7d}"
+    echo "Usage: $0 {daily|weekly|done24h|done7d|audit|undo}"
     exit 1
     ;;
 esac
