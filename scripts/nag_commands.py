@@ -118,17 +118,58 @@ def _close_loop_after_board_op(result: dict[str, Any], task_id: str,
 
 
 def handle_done(task_id: str, *, personal: bool = False) -> dict[str, Any]:
-    """Complete ``task_id`` then close its nag loop in the SAME turn (Path A)."""
+    """Complete ``task_id`` then close its nag loop in the SAME turn (Path A).
+
+    A one-shot task is removed from the board, so its loop is terminally acked. A
+    RECURRING task is rolled forward (same canonical_id, new future due date); its
+    loop is CLEARED instead of acked -- an acked entry is terminal and the cron
+    skips it, so acking would mute every future recurrence. Clearing lets the next
+    overdue crossing open a clean fresh loop.
+    """
     result = complete_by_id(task_id, personal=personal, source="user_command")
+    if not result.get("ok"):
+        return result
+    if result.get("recurring"):
+        cleared = nag_state.transition(lambda state: nag_state.clear_loop(state, task_id))
+        if cleared is not None:
+            _log("nag_acked", task_id=task_id, nag_loop_id=cleared.get("nag_loop_id"),
+                 closed_by=nag_state.CLOSED_EXPLICIT_DONE)
+        result["nag_closed"] = cleared is not None
+        return result
     return _close_loop_after_board_op(result, task_id,
                                       closed_by=nag_state.CLOSED_EXPLICIT_DONE)
 
 
 def handle_reschedule(task_id: str, new_due: str, *, personal: bool = False) -> dict[str, Any]:
-    """Move ``due::`` to ``new_due`` then close the loop in the SAME turn (Path C)."""
+    """Move ``due::`` then close the loop in the SAME turn (Path C / spec T10).
+
+    A reschedule to a FUTURE date takes the task off the overdue set, so the loop
+    is closed (rescheduled). A reschedule to a STILL-OVERDUE date is the deliberate
+    T10 case ("rescheduled to a date that is again overdue"): the loop is CLEARED,
+    not acked -- so the next nag-check opens a fresh loop with a new nag_loop_id
+    rather than leaving an acked-terminal entry that would mute the still-overdue
+    task. The user explicitly chose an overdue date; re-nagging it is correct.
+    """
     result = reschedule_by_id(task_id, new_due, personal=personal, source="user_command")
+    if not result.get("ok"):
+        return result
+    if _is_overdue(new_due):
+        cleared = nag_state.transition(lambda state: nag_state.clear_loop(state, task_id))
+        result["nag_closed"] = False  # the loop is intentionally left to re-nag
+        result["nag_recycled"] = cleared is not None
+        return result
     return _close_loop_after_board_op(result, task_id,
                                       closed_by=nag_state.CLOSED_RESCHEDULED)
+
+
+def _is_overdue(due: str, *, ref: datetime | None = None) -> bool:
+    """Is ``due`` (YYYY-MM-DD) strictly before today? Garbage parses as not-overdue."""
+    try:
+        due_date = datetime.strptime(due, "%Y-%m-%d").date()
+    except ValueError:
+        return False
+    today = (ref or _now()).date()
+    return due_date < today
 
 
 # --- /snooze (akrasia asymmetry) ------------------------------------------

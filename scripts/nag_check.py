@@ -143,17 +143,25 @@ def _push_nag(record, section: str, overdue: int, *, dry_run: bool,
 
     On a delivery block (env missing / work group / seam mismatch) NOTHING is
     sent and the caller logs ``nag_delivery_blocked`` + leaves the loop OPEN.
+
+    DRY-RUN: only PROVES the target (Contract 2) -- it does NOT call ``gate()``,
+    which would append an ``executed`` act to the append-only autonomy audit log
+    and manufacture a phantom undoable nag that was never sent. A dry-run touches
+    no append-only state, honouring its documented "preview, no write" contract.
     """
+    text = _nag_text(record, section, overdue)
+    if dry_run:
+        proof = nag_delivery.resolve_target()
+        if not proof["ok"]:
+            return {"sent": False, "reason": proof["reason"], "stage": "prove"}
+        return {"sent": False, "reason": "dry_run",
+                "delivery_target": proof["delivery_target"], "text": text}
+
     task_id = record.canonical_id
     gated = nag_delivery.prove_and_gate("nag_sent", task_id=task_id,
                                         metadata={"section": section, "overdue_days": overdue})
     if not gated["ok"]:
         return {"sent": False, "reason": gated["reason"], "stage": gated.get("stage")}
-
-    text = _nag_text(record, section, overdue)
-    if dry_run:
-        return {"sent": False, "reason": "dry_run", "act_id": gated["act_id"],
-                "delivery_target": gated["delivery_target"], "text": text}
 
     sent = nag_delivery.authorised_send(gated["act_id"], gated["delivery_target"],
                                         text, send=send)
@@ -175,10 +183,12 @@ def run_nag_check(*, dry_run: bool = False,
     active = {r.canonical_id: r for r in active_records(records) if r.canonical_id}
     counts = {"open": 0, "sent": 0, "closed": 0, "blocked": 0}
 
-    # 1. Close loops whose task is gone from the active board (verified_done) or no
-    #    longer overdue past threshold (rescheduled out).  No push on close.
+    # 1. Close GENUINE open nag loops (those that have actually fired) whose task
+    #    is gone from the active board (verified_done) or no longer overdue past
+    #    threshold (rescheduled out). No push on close. A body-double-only stub
+    #    (nag_count==0) is NOT a nag loop and must not be spuriously acked here.
     for task_id, entry in list(nag_state.read_state().items()):
-        if not nag_state.is_open(entry):
+        if not (nag_state.is_open(entry) and nag_state.is_genuine_nag(entry)):
             continue
         record = active.get(task_id)
         if record is None:
@@ -210,29 +220,45 @@ def run_nag_check(*, dry_run: bool = False,
 
         outcome = _push_nag(record, section, overdue, dry_run=dry_run, send=send)
         if not outcome["sent"] and outcome.get("reason") != "dry_run":
-            # Delivery blocked: log + leave the loop OPEN (env_missing never clears).
-            _log("nag_delivery_blocked", task_id=task_id,
-                 reason=outcome["reason"], section=section)
+            # Delivery blocked: leave the loop OPEN (env_missing never clears). A
+            # real run logs nag_delivery_blocked; a dry-run only counts it (no
+            # append-only write).
+            if not dry_run:
+                _log("nag_delivery_blocked", task_id=task_id,
+                     reason=outcome["reason"], section=section)
             counts["blocked"] += 1
             continue
 
         if dry_run:
             counts["open"] += 1
             continue
-        _persist_fire(task_id, record, section, overdue, outcome, counts)
+        _persist_fire(task_id, record, section, overdue, outcome, counts, ref=ref)
 
     return counts
 
 
-def _persist_fire(task_id, record, section, overdue, outcome, counts) -> None:
+def _persist_fire(task_id, record, section, overdue, outcome, counts, *,
+                  ref: datetime) -> None:
     """Persist an opened/re-fired loop under one lock + emit the ledger events.
+
+    The ack/snooze guard in step 2 is read from a snapshot OUTSIDE the lock; a
+    reactive ``/done`` can ack+close the loop in the window before this fire takes
+    the lock. So the mutator RE-CHECKS ack/snooze INSIDE the lock and skips the
+    open/record entirely if the loop was acked or snoozed since the snapshot -- the
+    cron never re-opens an acked loop (that would be the 'said /done, got nagged
+    again' trust kill). The push may already have gone out (a single low-stakes
+    message), but the state is not clobbered.
 
     The mutator returns ``(entry, opened)`` so the ledger logging reads the exact
     persisted entry without a second disk read, and ``nag_opened`` is keyed on the
-    REAL "was a fresh loop created" decision rather than a nag_count heuristic.
+    REAL "was a fresh loop created" decision.
     """
-    def mutate(live: dict[str, Any]) -> tuple[dict[str, Any], bool]:
-        opened = not nag_state.is_open(live.get(task_id))
+    def mutate(live: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
+        current = live.get(task_id)
+        if (isinstance(current, dict) and current.get("ack")) or \
+                nag_state.is_snoozed(current, now=ref):
+            return None, False  # raced with a close/snooze -- do not clobber it
+        opened = not nag_state.is_open(current)
         if opened:
             nag_state.open_loop(
                 live, task_id, task_title=record.title,
@@ -243,6 +269,8 @@ def _persist_fire(task_id, record, section, overdue, outcome, counts) -> None:
         return entry, opened
 
     entry, opened = nag_state.transition(mutate)
+    if entry is None:
+        return  # the loop was closed/snoozed under the lock; nothing recorded
     target = outcome["delivery_target"]
     if opened:
         _log("nag_opened", task_id=task_id, nag_loop_id=entry.get("nag_loop_id"),

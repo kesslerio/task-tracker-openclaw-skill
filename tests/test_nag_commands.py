@@ -86,6 +86,29 @@ def test_done_closes_loop_synchronously_same_turn(env):
     assert sent == []
 
 
+def test_recurring_done_clears_loop_so_next_recurrence_nags(env, monkeypatch):
+    """A recurring task keeps its canonical_id and rolls forward; acking the loop
+    would terminally mute every future recurrence (the cron skips acked entries).
+    So /done CLEARS the loop -- and the next overdue crossing opens a fresh one."""
+    board, state = env
+    board.write_text(
+        "# Work\n\n## 🟡 Q2\n"
+        "- [ ] **Weekly report** task_id::tsk_rec 🗓️2026-06-15 recur::weekly area:: Ops\n",
+        encoding="utf-8")
+    _open_loop(state, task_id="tsk_rec")
+    result = nag_commands.handle_done("tsk_rec")
+    assert result["ok"] is True and result["recurring"] is True
+    # The loop entry is CLEARED (no lingering acked entry), so the rolled-forward
+    # recurrence can open a clean fresh loop when it next goes overdue.
+    assert "tsk_rec" not in _state(state) or _state(state)["tsk_rec"].get("ack") is not True
+    # Drive the clock past the new due date: a fresh nag opens (not muted).
+    monkeypatch.setattr(nag_check, "_today",
+                        lambda: datetime(2026, 7, 1, tzinfo=timezone.utc))
+    sent = []
+    nag_check.run_nag_check(send=lambda t, x: sent.append((t, x)))
+    assert len(sent) == 1  # re-nags the next recurrence; never permanently muted
+
+
 def test_failed_done_does_not_close_loop(env):
     """NAG-CLOSES-ONLY-ON-ACK: a /done that does not complete the task (not on the
     board) must NOT clear the nag -- the task is still open."""
@@ -107,6 +130,23 @@ def test_reschedule_moves_due_and_closes_loop(env):
     assert "2026-06-30" in board.read_text()  # board moved
     nag = _state(state)["tsk_abc123"]
     assert nag["ack"] is True and nag["closed_by"] == "rescheduled"
+
+
+def test_reschedule_to_still_overdue_date_recycles_loop_for_renag(env, monkeypatch):
+    """T10: rescheduling to a date that is STILL overdue is deliberate -- the loop
+    is cleared (not acked-terminal) so the next nag-check opens a FRESH loop."""
+    board, state = env
+    _open_loop(state)
+    monkeypatch.setattr(nag_commands, "_now", lambda: REF)  # today = 2026-06-19
+    # 2026-06-14 is 5 days overdue at REF -- past the q2 threshold (3 days).
+    result = nag_commands.handle_reschedule("tsk_abc123", "2026-06-14")
+    assert result["ok"] is True
+    assert result["nag_closed"] is False  # NOT closed -- it must re-nag
+    assert result["nag_recycled"] is True
+    # The cron then opens a fresh loop (the task is still overdue past threshold).
+    sent = []
+    nag_check.run_nag_check(send=lambda t, x: sent.append((t, x)))
+    assert len(sent) == 1
 
 
 def test_reschedule_rejects_bad_date(env):

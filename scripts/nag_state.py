@@ -171,6 +171,37 @@ def close_loop(state: dict[str, Any], task_id: str, *, closed_by: str) -> dict[s
     return entry
 
 
+def clear_loop(state: dict[str, Any], task_id: str) -> dict[str, Any] | None:
+    """Remove the task's nag entry entirely (returns the removed entry, or None).
+
+    Used when a RECURRING task is completed: the same canonical_id rolls forward to
+    a new due date, so acking the loop would terminally mute it and the next
+    recurrence would never nag (an acked entry is skipped by the cron). Clearing
+    the entry lets the next overdue crossing open a clean, fresh loop. A
+    body-double session attached to the entry is preserved by re-attaching it.
+    """
+    entry = state.pop(task_id, None)
+    if isinstance(entry, dict):
+        sessions = [s for s in (entry.get("body_double_sessions") or [])
+                    if isinstance(s, dict) and not s.get("ended_at")]
+        if sessions:
+            fresh = default_nag_entry(new_nag_loop_id())
+            fresh["body_double_sessions"] = sessions
+            state[task_id] = fresh
+    return entry if isinstance(entry, dict) else None
+
+
+def is_genuine_nag(entry: dict[str, Any] | None) -> bool:
+    """Has this entry actually nagged (an open NAG loop), vs a body-double-only stub?
+
+    ``add_body_double_session`` may create an entry with ``nag_count == 0`` for a
+    task that never crossed a nag threshold. The cron's close pass must not treat
+    such a stub as an open nag loop to ack/close -- only a loop that has fired
+    (``nag_count > 0``) is a genuine nag the cron owns.
+    """
+    return isinstance(entry, dict) and int(entry.get("nag_count") or 0) > 0
+
+
 def apply_snooze(
     state: dict[str, Any],
     task_id: str,

@@ -236,6 +236,11 @@ def complete_by_id(
         "title": record.title,
         "event": event,
         "extra_events": extra_events,
+        # A recurring task is rolled forward (kept on the board with the same
+        # canonical_id and a new due date), not removed. Callers that key state on
+        # task_id (U4's nag loop) need this so they can RESET the loop for the next
+        # recurrence rather than mark it terminally acked.
+        "recurring": bool(recur_value),
     }
 
 

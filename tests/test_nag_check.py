@@ -239,6 +239,55 @@ def test_crash_mid_run_leaves_open_loop_open(harness, monkeypatch):
     assert _state(state)["tsk_abc123"]["ack"] is False
 
 
+# --- Race: a /done that acks under the lock is NOT clobbered into a reopen ---
+
+def test_concurrent_done_under_lock_is_not_reopened_by_cron(harness, monkeypatch):
+    """If a reactive /done acks the loop in the window between the cron's snapshot
+    read and the locked fire, the cron must NOT re-open it (the re-nag trust kill).
+    We simulate the race by acking inside the push, just before _persist_fire."""
+    board, state = harness
+    _run(harness)  # open loop, nag_count=1
+
+    real_push = nag_check._push_nag
+
+    def push_then_ack(record, section, overdue, *, dry_run, send):
+        result = real_push(record, section, overdue, dry_run=dry_run, send=send)
+        # A /done lands right after the push, before the locked _persist_fire.
+        nag_state.transition(lambda s: nag_state.close_loop(
+            s, "tsk_abc123", closed_by="explicit_done"))
+        return result
+
+    monkeypatch.setattr(nag_check, "_push_nag", push_then_ack)
+    nag_check.run_nag_check(send=lambda t, x: None)
+    nag = _state(state)["tsk_abc123"]
+    assert nag["ack"] is True  # the /done close survived
+    assert nag["closed_by"] == "explicit_done"  # NOT reopened/archived
+    assert nag["archived_nag_loops"] == []  # no spurious archive+reopen
+
+
+# --- Body-double-only entry must not be spuriously acked by the cron --------
+
+def test_body_double_only_entry_not_acked_by_cron(tmp_path, monkeypatch):
+    """A body-double on a NON-overdue task creates a nag_count==0 stub entry; the
+    cron's close pass must not treat it as an open nag loop and ack it."""
+    board = tmp_path / "Work Tasks.md"
+    # Task due in the FUTURE -- not overdue, so it would never cross a threshold.
+    board.write_text(
+        "# Work\n\n## 🟡 Q2\n- [ ] **Soon** task_id::tsk_future 🗓️2026-07-15 area:: Ops\n",
+        encoding="utf-8")
+    state = tmp_path / "state"
+    _set_env(monkeypatch, board, state)
+    monkeypatch.setattr(nag_check, "_today", lambda: REF)
+    # Attach a body-double-only entry (nag_count stays 0).
+    session = {"session_id": "bd_1", "cron_ids": ["c"], "started_at": "x", "ended_at": None}
+    nag_state.transition(lambda s: nag_state.add_body_double_session(s, "tsk_future", session))
+
+    counts = nag_check.run_nag_check(send=lambda t, x: None)
+    assert counts["closed"] == 0  # the stub is NOT a nag loop to close
+    nag = _state(state)["tsk_future"]
+    assert nag["ack"] is False  # not spuriously acked
+
+
 # --- T10: ack:true is terminal; a re-nag is a NEW loop ---------------------
 
 def test_t10_acked_loop_not_reactivated_in_background(harness):
@@ -309,3 +358,18 @@ def test_dry_run_writes_no_state_and_sends_nothing(harness):
     assert sent == []
     assert counts["open"] == 1  # would open one
     assert not (state / "nag-state.json").exists()  # no state written
+
+
+def test_dry_run_does_not_append_to_autonomy_audit_log(harness):
+    """A --dry-run must NOT gate() (which appends an executed act) -- it only proves
+    the target. Otherwise it manufactures a phantom undoable nag never sent."""
+    import autonomy_gate  # noqa: PLC0415 -- local import keeps the harness imports lean
+    board, state = harness
+    nag_check.run_nag_check(dry_run=True, send=lambda t, x: None)
+    assert read_autonomy_log_for(state, autonomy_gate) == []
+    assert not (state / "autonomy-log.jsonl").exists()
+
+
+def read_autonomy_log_for(state, autonomy_gate):
+    path = autonomy_gate.autonomy_log_path()
+    return autonomy_gate.read_autonomy_log() if path.exists() else []
