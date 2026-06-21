@@ -53,27 +53,45 @@ def isolated_state(tmp_path, monkeypatch):
 TOPIC_2 = {"chat_id": PRODUCTIVITY_CHAT, "topic_id": "2", "agent_id": "niemand-work", "channel": "telegram"}
 TOPIC_6 = {"chat_id": PRODUCTIVITY_CHAT, "topic_id": "6", "agent_id": "niemand-work", "channel": "telegram"}
 
+# Seam-mechanism probe. The gate<->message seam (Decision #1) is orthogonal to the
+# v0.1 push-freeze: it must stay testable with an act that actually EXECUTES and
+# BINDS a target. ``nag_sent`` is a real rung-3 push and is therefore frozen in
+# v0.1 (RUNG3_PUSH_ENABLED=False); an unregistered act type defaults to rung 1
+# (draft), so it executes + binds a proven target and exercises the seam without
+# being a frozen push. The v0.1 push-freeze itself is asserted separately below
+# (test_nag_sent_push_is_frozen_in_v0_1).
+SEAM_ACT = "seam_probe_unregistered"
+
 
 def test_gate_returns_act_id_bound_to_delivery_target():
-    result = autonomy_gate.gate("nag_sent", delivery_target=TOPIC_2, unit="U4")
+    result = autonomy_gate.gate(SEAM_ACT, delivery_target=TOPIC_2, unit="U4")
     assert result["ok"] is True
     assert result["act_id"].startswith("act_")
     assert result["delivery_target"] == TOPIC_2
 
 
 def test_send_to_gated_target_allowed():
-    gated = autonomy_gate.gate("nag_sent", delivery_target=TOPIC_2, unit="U4")
+    gated = autonomy_gate.gate(SEAM_ACT, delivery_target=TOPIC_2, unit="U4")
     check = autonomy_gate.assert_send_target(gated["act_id"], TOPIC_2)
     assert check["ok"] is True
 
 
 def test_send_to_non_gated_target_blocked():
     # Gate topic:2, then attempt to send topic:6 -> must be blocked (Decision #1).
-    gated = autonomy_gate.gate("nag_sent", delivery_target=TOPIC_2, unit="U4")
+    gated = autonomy_gate.gate(SEAM_ACT, delivery_target=TOPIC_2, unit="U4")
     check = autonomy_gate.assert_send_target(gated["act_id"], TOPIC_6)
     assert check["ok"] is False
     assert check["reason"] == "target-mismatch"
     assert check["gated_target"] == TOPIC_2
+
+
+def test_nag_sent_push_is_frozen_in_v0_1():
+    """nag_sent is a real rung-3 push; v0.1 ships board-only, so it is blocked."""
+    assert autonomy_gate.rung_for_act_type("nag_sent") == autonomy_gate.RUNG_MONITORED_AUTO
+    assert autonomy_gate.RUNG3_PUSH_ENABLED is False
+    result = autonomy_gate.gate("nag_sent", delivery_target=TOPIC_2, unit="U4")
+    assert result["ok"] is False
+    assert result["reason"] == "push-disabled"
 
 
 def test_send_for_unknown_act_blocked():
@@ -185,7 +203,7 @@ def test_assert_send_target_blocks_missing_snapshot_act():
 
 def test_assert_send_target_ignores_benign_extra_keys():
     """Finding #9: extra keys (e.g. message_id) must not block a legitimate send."""
-    gated = autonomy_gate.gate("nag_sent", delivery_target=TOPIC_2, unit="U4")
+    gated = autonomy_gate.gate(SEAM_ACT, delivery_target=TOPIC_2, unit="U4")
     attempted = dict(TOPIC_2, message_id=12345)
     check = autonomy_gate.assert_send_target(gated["act_id"], attempted)
     assert check["ok"] is True
@@ -193,7 +211,7 @@ def test_assert_send_target_ignores_benign_extra_keys():
 
 def test_assert_send_target_fails_on_missing_canonical_key():
     """Finding #9: a missing canonical key still fails (not a benign extra)."""
-    gated = autonomy_gate.gate("nag_sent", delivery_target=TOPIC_2, unit="U4")
+    gated = autonomy_gate.gate(SEAM_ACT, delivery_target=TOPIC_2, unit="U4")
     attempted = {k: v for k, v in TOPIC_2.items() if k != "topic_id"}
     check = autonomy_gate.assert_send_target(gated["act_id"], attempted)
     assert check["ok"] is False
@@ -242,7 +260,7 @@ def test_gate_normalises_int_chat_id():
     """Finding #2 footgun: int chat/topic ids normalise to the canonical str target."""
     int_target = {"chat_id": int(PRODUCTIVITY_CHAT), "topic_id": 2,
                   "agent_id": "niemand-work", "channel": "telegram"}
-    result = autonomy_gate.gate("nag_sent", delivery_target=int_target, unit="U4")
+    result = autonomy_gate.gate(SEAM_ACT, delivery_target=int_target, unit="U4")
     assert result["ok"] is True
     assert result["delivery_target"] == TOPIC_2  # str-normalised
 
@@ -328,7 +346,7 @@ def test_state_dir_is_0700():
 
 
 def test_autonomy_log_and_config_are_0600():
-    autonomy_gate.gate("nag_sent", delivery_target=TOPIC_2, unit="U4")
+    autonomy_gate.gate(SEAM_ACT, delivery_target=TOPIC_2, unit="U4")
     autonomy_gate.ensure_autonomy_config()
     assert _mode(autonomy_gate.autonomy_log_path()) == 0o600
     assert _mode(autonomy_gate.autonomy_config_path()) == 0o600
@@ -359,20 +377,20 @@ def test_concurrent_ack_nag_keeps_all_entries():
 # --- Finding #8: tolerant log read + nag-state rename-aside ------------------
 
 def test_read_autonomy_log_tolerates_torn_line():
-    autonomy_gate.gate("nag_sent", delivery_target=TOPIC_2, unit="U4")
+    autonomy_gate.gate(SEAM_ACT, delivery_target=TOPIC_2, unit="U4")
     log_path = autonomy_gate.autonomy_log_path()
     with log_path.open("a", encoding="utf-8") as fh:
         fh.write('{"act_id": "act_torn", "incomplete  \n')  # torn line
-    autonomy_gate.gate("nag_sent", delivery_target=TOPIC_2, unit="U4")
+    autonomy_gate.gate(SEAM_ACT, delivery_target=TOPIC_2, unit="U4")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         records = autonomy_gate.read_autonomy_log()
     # The two good gate records survive; the torn line is skipped, not raised.
-    assert len([r for r in records if r.get("act_type") == "nag_sent"]) == 2
+    assert len([r for r in records if r.get("act_type") == SEAM_ACT]) == 2
 
 
 def test_assert_send_target_survives_torn_log_line():
-    gated = autonomy_gate.gate("nag_sent", delivery_target=TOPIC_2, unit="U4")
+    gated = autonomy_gate.gate(SEAM_ACT, delivery_target=TOPIC_2, unit="U4")
     with autonomy_gate.autonomy_log_path().open("a", encoding="utf-8") as fh:
         fh.write("{not valid json at all\n")
     with warnings.catch_warnings():
@@ -398,7 +416,7 @@ def test_corrupt_nag_state_renamed_aside_not_destroyed():
 
 def test_find_act_binds_first_executed_record():
     """A later forged append for the same act_id cannot rebind the gated target."""
-    gated = autonomy_gate.gate("nag_sent", delivery_target=TOPIC_2, unit="U4")
+    gated = autonomy_gate.gate(SEAM_ACT, delivery_target=TOPIC_2, unit="U4")
     act_id = gated["act_id"]
     # Forge a later record for the same act_id pointing at a different target.
     forged = dict(gated["record"], delivery_target=dict(TOPIC_2, topic_id="6"))
@@ -430,7 +448,7 @@ def test_forged_executed_cannot_override_first_blocked_record():
 def test_send_blocked_when_act_has_no_bound_target():
     """gate() with delivery_target=None executes but binds no target; any later
     send for that act_id is refused (no-gated-target), not silently allowed."""
-    result = autonomy_gate.gate("nag_sent", delivery_target=None, unit="U4")
+    result = autonomy_gate.gate(SEAM_ACT, delivery_target=None, unit="U4")
     assert result["ok"] is True
     assert result["record"]["delivery_target"] is None
     check = autonomy_gate.assert_send_target(result["act_id"], TOPIC_2)
@@ -440,7 +458,7 @@ def test_send_blocked_when_act_has_no_bound_target():
 
 def test_send_with_none_attempted_target_is_blocked():
     """A send that names no target at all is refused, not treated as a match."""
-    gated = autonomy_gate.gate("nag_sent", delivery_target=TOPIC_2, unit="U4")
+    gated = autonomy_gate.gate(SEAM_ACT, delivery_target=TOPIC_2, unit="U4")
     check = autonomy_gate.assert_send_target(gated["act_id"], None)
     assert check["ok"] is False
     assert check["reason"] == "target-mismatch"
