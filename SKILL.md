@@ -27,6 +27,23 @@ Use this skill when the user asks to:
 - Report completed daily items against weekly todos without changing canonical
   task state
 - Review completion evidence candidates before confirming task completion
+- Schedule freebusy-gated focus blocks for the day's priorities on an agent-owned
+  "Task Focus" calendar, send a morning brief / pre-brief / debrief, and propose
+  next week's priorities on Friday (U6 proactive layer; opt-in — degrades silently
+  when the focus calendar / `STANDUP_CALENDARS` are absent and never overbooks)
+
+## Proactive layer (U6)
+
+`scripts/proactive_brief.py --mode {brief,prebrief,slip,friday}` is the cron entry
+point for the proactive layer. Every push proves its delivery target FIRST
+(`prove_delivery_target` -> gated `act_id` -> `assert_send_target`) and lands only
+on the proven Productivity topic; an unset/wrong target blocks the push and sends
+nothing. Calendar writes go through `scripts/calendar_blocks.py`, which
+freebusy-gates every create/move (an overlap OR an unknown freebusy refuses the
+write — NEVER-OVERBOOK-EXTERNAL), slides a slipped block via `gog calendar update`
+(never delete+create), and refuses to delete/move any non-`agent_created` event
+(`ExternalEventError`). State lives in `focus-calendar.json` and `proactive-state.json`
+(atomic, torn-read safe — no duplicate briefs on a `*/5` scan).
 
 ## Quick Start
 
