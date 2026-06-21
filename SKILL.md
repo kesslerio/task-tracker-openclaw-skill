@@ -109,6 +109,38 @@ Task audits are read-only health checks. They can flag duplicate titles, stale
 active tasks, unresolved candidates, missing IDs, and backlog pressure, but they
 must not be treated as authority to freeze, delete, merge, or complete tasks.
 
+### Daily Priorities + capacity cap (Focus Core)
+
+Two layers (Decision #7):
+
+- **Layer 1 — Daily Top Priorities.** Each morning the agent proposes 2-3
+  must-do-today priorities (veto/approve). This is a *selection* over active
+  tasks; it surfaces and chases, it does not limit how many tasks exist.
+- **Layer 2 — Active-inventory cap.** `tasks add` is gated at write time: when the
+  active board's estimate-sum exceeds `WEEKLY_CAPACITY_HOURS` (default 25h;
+  unestimated tasks counted at `UNESTIMATED_TASK_HOURS`=2h) OR the active count
+  exceeds `ACTIVE_TASK_HARD_CAP` (default 20), a new add is blocked and nudged to
+  the parking lot. It NEVER force-evicts existing tasks. `--force-parking` routes
+  an over-cap add to the parking lot.
+
+```bash
+# /focus*  → propose / approve / veto / override / status
+python3 scripts/focus_commands.py focus
+python3 scripts/focus_commands.py approve
+python3 scripts/focus_commands.py veto 2
+python3 scripts/focus_commands.py override
+python3 scripts/focus_commands.py status
+
+# Capacity cap on add (blocks before the board write when over capacity)
+python3 scripts/tasks.py add "New task"                 # blocked when over cap
+python3 scripts/tasks.py add "New task" --force-parking  # route to parking lot
+```
+
+Map `/focus`, `/focus-approve`, `/focus-veto <N>`, `/focus-override`, and
+`/focus-status` to these subcommands. The cap is date-independent (it governs
+total active load, not today's plan), so it applies even if the morning ritual is
+skipped; `focus-state.json` (Layer-1) is re-proposed each day.
+
 ### Backlog ops
 
 ```bash

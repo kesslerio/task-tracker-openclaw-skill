@@ -32,6 +32,7 @@ class TaskRecord:
     owner: str | None = None
     goal: str | None = None
     recur: str | None = None
+    estimate: str | None = None
     parent_objective: str | None = None
     is_objective: bool = False
 
@@ -112,6 +113,7 @@ def task_records(content: str, personal: bool = False, fmt: str = "obsidian") ->
                 owner=task.get("owner"),
                 goal=task.get("goal"),
                 recur=task.get("recur"),
+                estimate=task.get("estimate"),
                 parent_objective=task.get("parent_objective"),
                 is_objective=bool(task.get("is_objective")),
             )
@@ -127,9 +129,18 @@ def load_records(personal: bool = False) -> tuple[Path, str, list[TaskRecord]]:
     return tasks_file, content, task_records(content, personal=personal, fmt=fmt)
 
 
+# Sections excluded from the active set: a parked or backlogged task is not
+# active work. The single source of truth shared by active_records() and the
+# Layer-2 add-gate's "does this destination count as active?" check.
+INACTIVE_SECTIONS: frozenset[str] = frozenset({"backlog", "parking_lot"})
+
+
 def active_records(records: Iterable[TaskRecord]) -> list[TaskRecord]:
-    inactive_sections = {"backlog", "parking_lot"}
-    return [record for record in records if not record.done and record.section not in inactive_sections]
+    return [
+        record
+        for record in records
+        if not record.done and record.section not in INACTIVE_SECTIONS
+    ]
 
 
 def record_to_task_dict(record: TaskRecord) -> dict:

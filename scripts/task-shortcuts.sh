@@ -66,8 +66,23 @@ case "${1:-}" in
     echo "Blockers"
     python3 "$SCRIPT_DIR/tasks.py" blockers || true
     ;;
+  focus)
+    python3 "$SCRIPT_DIR/focus_commands.py" focus
+    ;;
+  focus-approve)
+    python3 "$SCRIPT_DIR/focus_commands.py" approve
+    ;;
+  focus-override)
+    python3 "$SCRIPT_DIR/focus_commands.py" override
+    ;;
+  focus-veto)
+    python3 "$SCRIPT_DIR/focus_commands.py" veto "${2:?Usage: $0 focus-veto <N>}"
+    ;;
+  focus-status)
+    python3 "$SCRIPT_DIR/focus_commands.py" status
+    ;;
   *)
-    echo "Usage: $0 {daily|standup|weekly|done24h|done7d|tasks}"
+    echo "Usage: $0 {daily|standup|weekly|done24h|done7d|tasks|focus|focus-approve|focus-override|focus-veto|focus-status}"
     exit 1
     ;;
 esac

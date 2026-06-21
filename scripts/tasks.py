@@ -158,16 +158,111 @@ def list_tasks(args):
         print(f"{checkbox} **{task['title']}**{due_str}{area_str}")
 
 
+def _add_destination_is_active(priority: str | None, content: str) -> bool:
+    """True when an add with this priority lands in an ACTIVE board section.
+
+    The cap must scope to where the task ACTUALLY lands. ``--priority low`` only
+    routes to the inactive Backlog when a ``## ⚪`` Backlog section exists; with no
+    Backlog section the add falls back to the active ``## 📋 All Tasks`` area
+    (section=None, counted as active), so it MUST be gated. Deriving this from the
+    real board content keeps the gate's notion of "active" from drifting from the
+    writer's insertion fallback. Reuses ``PRIORITY_TO_SECTION``/``INACTIVE_SECTIONS``
+    so it never drifts from ``active_records()`` either.
+    """
+    from task_records import INACTIVE_SECTIONS
+    from utils import PRIORITY_TO_SECTION
+
+    section = PRIORITY_TO_SECTION.get(priority or "medium", "q2")
+    if section not in INACTIVE_SECTIONS:
+        return True
+    # The destination section is nominally inactive (Backlog) -- but only honour
+    # that if the board actually has a Backlog header for the writer to target.
+    has_backlog = re.search(r'^##\s+⚪(?:\s|$)', content, re.MULTILINE) is not None
+    return not has_backlog
+
+
+def _log_wip_cap_enforced(title: str, summary, routing: str | None) -> None:
+    """Append a ``wip_cap_enforced`` ledger event (best-effort).
+
+    Both the blocked-add and the ``--force-parking`` paths are user-initiated CLI
+    commands, so both are ``source="user_command"`` -- the routing decision is
+    carried in ``proposed_routing`` metadata, not by mislabeling the actor source.
+    """
+    try:
+        from task_ledger import append_event, new_event
+
+        metadata = {
+            "task_title": title,
+            "current_count": summary.active_count,
+            "estimated_minutes": summary.estimated_minutes,
+            "capacity_minutes": summary.capacity_minutes,
+            "hard_cap": summary.hard_cap,
+        }
+        if routing:
+            metadata["proposed_routing"] = routing
+        append_event(
+            new_event(
+                "wip_cap_enforced",
+                actor="niemand-work",
+                source="user_command",
+                metadata=metadata,
+            )
+        )
+    except Exception:
+        pass
+
+
 def add_task(args):
     """Add a new task."""
     tasks_file, format = get_tasks_file(args.personal)
-    
+
     if not tasks_file.exists():
         print(f"❌ Tasks file not found: {tasks_file}")
         return
-    
+
     content = tasks_file.read_text()
-    
+
+    # Layer-2 active-inventory cap (Contract 6 / Decision #7): a WRITE-TIME gate.
+    # The decision is computed once in focus_core (the canonical capacity layer)
+    # AFTER reading the file and BEFORE any board write, so a blocked add leaves
+    # the board byte-identical. The cap is date-INDEPENDENT (it governs total
+    # active load, not today's plan), so a skipped morning ritual never silences
+    # it. It NEVER force-evicts; an over-cap add is nudged to the parking lot, and
+    # --force-parking routes it there instead of blocking.
+    #
+    # Scope: the cap governs the WORK board only (the knobs are sized for the work
+    # inventory), matching standup / standup-summary -- a personal add is never
+    # gated. And it only fires for adds destined for an ACTIVE section:
+    # --priority low routes to the inactive Backlog (excluded from active_records),
+    # so it adds zero active load and must not be blocked.
+    from focus_core import evaluate_add
+
+    destination_active = (not args.personal) and _add_destination_is_active(args.priority, content)
+    gate = evaluate_add(
+        content,
+        format,
+        args.title,
+        destination_active=destination_active,
+        personal=args.personal,
+    )
+    if not gate.allowed:
+        if getattr(args, "force_parking", False):
+            from parking_lot import add_item
+
+            # add_item returns an error STRING (parking lot full / no section)
+            # instead of raising. A failed route must NOT exit 0 or log a
+            # successful routing -- otherwise a piping agent believes the task
+            # was captured when it was dropped. Only log + succeed on a real add.
+            result = add_item(tasks_file, args.title, dept=args.area, priority="low")
+            print(result)
+            if result.startswith("❌"):
+                sys.exit(2)
+            _log_wip_cap_enforced(args.title, gate.summary, routing="parking_lot")
+            return
+        print(gate.denial_message)
+        _log_wip_cap_enforced(args.title, gate.summary, routing=None)
+        sys.exit(2)
+
     # Build task entry with emoji date format
     priority_patterns = {
         'high': r'^##\s+🔴(?:\s|$)',
@@ -798,6 +893,27 @@ def cmd_standup_summary(args):
     dos_records = [record for record in active if record.section in {"q1", "q2", "today"}]
     dos = [_canonical_record(record) for record in dos_records]
 
+    # Layer-2 capacity ceiling (U3): surface the active-inventory load against
+    # ~1 week of capacity so the /standup consumer can show the cap state. The
+    # cap governs the WORK board only (the knobs are sized for the work
+    # inventory), so it is omitted for personal standups -- matching the
+    # work-only standup.py entrypoint.
+    capacity = None
+    if not args.personal:
+        try:
+            from focus_core import capacity_display, summarize_capacity
+            capacity_summary = summarize_capacity(records)
+            capacity = {
+                "active_count": capacity_summary.active_count,
+                "estimated_minutes": capacity_summary.estimated_minutes,
+                "capacity_minutes": capacity_summary.capacity_minutes,
+                "hard_cap": capacity_summary.hard_cap,
+                "over_cap": capacity_summary.over_cap,
+                "display": capacity_display(capacity_summary),
+            }
+        except Exception:
+            capacity = None
+
     overdue_records = []
     for record in active:
         if not record.due:
@@ -834,6 +950,7 @@ def cmd_standup_summary(args):
             "dones": dones,
             "dos": dos,
             "overdue": overdue,
+            "capacity": capacity,
             "carryover_suggestions": carryover_suggestions,
             "completion_candidates": candidate_review_summary(personal=args.personal),
             "task_audit": task_audit_summary(personal=args.personal),
@@ -1374,6 +1491,11 @@ def main():
     add_parser.add_argument('--due', help='Due date (YYYY-MM-DD)')
     add_parser.add_argument('--owner', default='me')
     add_parser.add_argument('--area', help='Area/category')
+    add_parser.add_argument(
+        '--force-parking',
+        action='store_true',
+        help='When the active-inventory cap is reached, route to the parking lot instead of blocking',
+    )
     add_parser.set_defaults(func=add_task)
     
     # Done command
