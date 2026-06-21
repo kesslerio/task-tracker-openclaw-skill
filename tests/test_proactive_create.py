@@ -67,9 +67,15 @@ def _seed_focus_calendar():
     focus_calendar.save_focus_calendar(state)
 
 
-def _seed_priorities(rows):
+# The tests anchor blocks at NOW's local date (tz_offset 0 -> 2026-06-20). The
+# approved Defended Three must carry that SAME date or the is_current/approved gate
+# (which U6 honours -- no stale/unapproved plan drives placement) rejects it.
+SEED_DATE = NOW.date().isoformat()
+
+
+def _seed_priorities(rows, *, date=SEED_DATE, status="approved"):
     focus_state.save_focus_state({
-        "date": focus_state.today_str(), "status": "approved", "daily_priorities": rows,
+        "date": date, "status": status, "daily_priorities": rows,
     })
 
 
@@ -205,6 +211,30 @@ def test_create_new_priority_does_not_overlap_existing_same_day_block(harness):
     from_iso = create_cmd[create_cmd.index("--from") + 1]
     # the new block starts at/after the existing block's 11:00 end -- no overlap
     assert "T11:00:00" in from_iso
+
+
+def test_create_blocks_ignores_stale_plan(harness):
+    """autoreview P2: a stale (prior-day) Defended Three must NOT drive placement."""
+    _seed_focus_calendar()
+    _seed_priorities([{"task_id": "tsk_rel", "title": "x", "estimate_minutes": 60}],
+                     date="2026-06-19")  # yesterday's plan
+    runner = _create_runner(_ext_free([]))
+    counts = proactive_brief.run_create_blocks(now=NOW, tz_offset_hours=0, day_start_hour=9,
+                                               send=lambda t, x: None, runner=runner)
+    assert counts == {"created": 0, "refused": 0, "skipped": 0}
+    assert runner.calls == []  # no calendar write for a stale plan
+
+
+def test_create_blocks_ignores_unapproved_plan(harness):
+    """autoreview P2: a merely-proposed (unapproved) plan must NOT drive placement."""
+    _seed_focus_calendar()
+    _seed_priorities([{"task_id": "tsk_rel", "title": "x", "estimate_minutes": 60}],
+                     status="proposed")  # today's date but not approved
+    runner = _create_runner(_ext_free([]))
+    counts = proactive_brief.run_create_blocks(now=NOW, tz_offset_hours=0, day_start_hour=9,
+                                               send=lambda t, x: None, runner=runner)
+    assert counts == {"created": 0, "refused": 0, "skipped": 0}
+    assert runner.calls == []  # no calendar write for an unapproved plan
 
 
 def test_create_blocks_no_focus_calendar_degrades(harness):

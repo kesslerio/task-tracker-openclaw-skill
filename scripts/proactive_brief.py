@@ -619,7 +619,14 @@ def run_create_blocks(*, now: datetime | None = None, dry_run: bool = False,
     counts = {"created": 0, "refused": 0, "skipped": 0}
     if not focus_calendar.load_focus_calendar().get("agent_calendar_id"):
         return counts  # no focus calendar configured -- degrade silently
-    priorities = (focus_state.load_focus_state() or {}).get("daily_priorities") or []
+    # Only place blocks for an APPROVED, CURRENT (today's) Defended Three -- the same
+    # is_current + STATUS_APPROVED gate every other focus-state consumer applies. A
+    # stale (yesterday's) or merely-proposed/unapproved plan must NOT drive calendar
+    # writes. ``today_local`` is the placement date, so the staleness check uses it.
+    fs = focus_state.load_focus_state()
+    if focus_state.status_for_today(fs, reference_date=today_local) != focus_state.STATUS_APPROVED:
+        return counts  # no approved plan for today -- nothing to place
+    priorities = (fs or {}).get("daily_priorities") or []
     fb_ids = calendar_blocks.external_calendar_ids()
     created_titles: list[str] = []
 
