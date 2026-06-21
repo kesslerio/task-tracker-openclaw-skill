@@ -387,6 +387,28 @@ def test_debrief_partial_failure_keeps_loop_open(harness):
     assert proactive_state.is_debrief_open(reloaded["pre_briefs"][0]) is True
 
 
+def test_commitment_add_does_not_force_parking(harness):
+    """autoreview P1: the commitment add must NOT pass --force-parking (a parking-lot
+    add prints an unparseable line that would be misread as a failure)."""
+    board, state = harness
+    st = proactive_state.load_proactive_state()
+    proactive_state.mark_pre_brief_sent(st, "evt_q3", "Q3 Review", "2026-06-20T09:00:00+00:00")
+    proactive_state.open_debrief(st, "evt_q3")
+    proactive_state.save_proactive_state(st)
+
+    seen_cmds: list = []
+
+    def recording_runner(cmd):
+        seen_cmds.append(cmd)
+        return types.SimpleNamespace(
+            stdout=f"✅ Added work task: {cmd[3]} (tsk_c1)", stderr="", returncode=0)
+
+    proactive_brief.run_debrief_capture("evt_q3", "I will ship by 2026-06-30",
+                                        runner=recording_runner)
+    assert seen_cmds, "the add CLI should have been invoked"
+    assert all("--force-parking" not in cmd for cmd in seen_cmds)
+
+
 def test_debrief_notes_with_no_commitment_does_not_close_loop(harness):
     """autoreview P3: notes that parse to ZERO commitments (no 'will' phrasing) must
     NOT close the loop -- a real commitment would otherwise be silently dropped."""

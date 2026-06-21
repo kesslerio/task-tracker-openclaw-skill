@@ -213,8 +213,26 @@ def test_create_block_is_gated_in_autonomy_log(harness):
     assert len(acts) == 1
     assert acts[0]["status"] == "executed"
     assert acts[0]["rung"] == autonomy_gate.RUNG_MONITORED_AUTO
-    # the act carries the reversal substrate (the calendar window), not a board line
+    # the act is recorded AFTER the write, so it carries the real event_id to undo against
+    assert acts[0]["pre_action_snapshot"]["event_id"] == "evt_new"
     assert acts[0]["pre_action_snapshot"]["task_id"] == "tsk_rel"
+
+
+def test_create_refused_logs_no_phantom_executed_act(harness):
+    """autoreview P3: a freebusy refusal must NOT leave an executed calendar_block_created
+    act in the autonomy log (the gate is recorded only after a real write)."""
+    import autonomy_gate
+
+    board, state = harness
+    _seed_focus_calendar()
+    _seed_priorities([{"task_id": "tsk_rel", "title": "Finalize", "estimate_minutes": 120}])
+    # external calendar is busy over the whole window -> the create is refused
+    runner = _create_runner(_ext_free([{"start": "2026-06-20T09:00:00+00:00", "end": "2026-06-20T12:00:00+00:00"}]))
+    counts = proactive_brief.run_create_blocks(now=NOW, tz_offset_hours=0, day_start_hour=9,
+                                               send=lambda t, x: None, runner=runner)
+    assert counts["refused"] == 1
+    acts = [a for a in autonomy_gate.read_autonomy_log() if a.get("act_type") == "calendar_block_created"]
+    assert acts == []  # no phantom executed act for a refused write
 
 
 # --- main() wiring: debrief-capture is reachable ----------------------------

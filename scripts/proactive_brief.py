@@ -229,15 +229,18 @@ def parse_commitments(notes: str) -> list[dict[str, str]]:
 def _create_commitment_task(spec: dict[str, str], *, runner: "ShellRunner | None") -> str | None:
     """Add ONE commitment task via the canonical ``tasks.py add`` CLI; return its id.
 
-    The board write goes through the existing add path (which honours U3's
-    capacity cap and atomic write) -- U6 never reimplements a board writer.
-    ``--force-parking`` routes an over-cap commitment to the parking lot rather
-    than dropping it (a commitment must never be silently lost). Returns the new
-    task id parsed from the CLI output, or None if the add failed.
+    The board write goes through the existing add path (which honours U3's capacity
+    cap and atomic write) -- U6 never reimplements a board writer. ``--force-parking``
+    is deliberately NOT used: a parking-lot add prints ``✅ Added to Parking Lot: ...
+    [n/cap]`` (no trailing ``(task_id)``), which is unparseable, so a force-parked
+    commitment would be misread as a failure -- the loop would never close and a
+    retry would duplicate it. Instead an over-cap add fails (the CLI exits non-zero),
+    which the caller treats as a real failure that keeps the loop OPEN so the user
+    is nudged to make room -- never silently lost, never duplicated. Returns the new
+    task id parsed from the ``✅ Added ... (task_id)`` output, or None on any failure.
     """
     run = runner or _default_shell_runner
-    cmd = ["python3", str(Path(__file__).resolve().parent / "tasks.py"), "add",
-           spec["title"], "--force-parking"]
+    cmd = ["python3", str(Path(__file__).resolve().parent / "tasks.py"), "add", spec["title"]]
     if spec.get("due"):
         cmd += ["--due", spec["due"]]
     result = run(cmd)
@@ -505,39 +508,32 @@ def _block_has_slipped(block: dict[str, Any], *, ref: datetime, active_ids: set[
     return end is not None and end <= ref and block.get("task_id") in active_ids
 
 
-def _next_window(block: dict[str, Any], *, ref: datetime) -> tuple[str, str]:
-    """The next free window to try for a slipped block: start in 1h, same duration."""
+def _block_duration(block: dict[str, Any]) -> timedelta:
+    """A block's original duration, defaulting to 1h when its window is unparseable."""
     start = _parse_event_start(block.get("start"))
     end = _parse_event_start(block.get("end"))
-    duration = (end - start) if (start and end and end > start) else timedelta(hours=1)
-    new_start = ref + timedelta(hours=1)
-    return new_start.isoformat(), (new_start + duration).isoformat()
+    return (end - start) if (start and end and end > start) else timedelta(hours=1)
 
 
 def _recover_one_block(cal_state: dict[str, Any], block: dict[str, Any], calendar_id: str,
-                       fb_ids: list[str], *, ref: datetime,
+                       fb_ids: list[str], *, ref: datetime, new_start: str, new_end: str,
                        runner: calendar_blocks.Runner | None) -> dict[str, Any]:
-    """Move ONE slipped block via UPDATE, mutating the LOCKED state + logging.
+    """Move ONE slipped block to [new_start, new_end] via UPDATE, mutating LOCKED state.
 
     Returns ``{"status": "moved", "new_start", "new_end"}`` or ``{"status":
     "refused"}``. Mutates ``cal_state`` in place; the surrounding
     ``focus_calendar.transition`` persists once on exit. The move is a ``gog calendar
     update`` so the block keeps its id (reversible); an overlap/unknown freebusy or a
     non-agent event refuses the move (block left in place, ``calendar_block_refused``
-    logged) -- NEVER-OVERBOOK-EXTERNAL holds even during recovery.
+    logged) -- NEVER-OVERBOOK-EXTERNAL holds even during recovery. ``new_start`` /
+    ``new_end`` are supplied by the caller's cursor so multiple slipped blocks in one
+    pass do not all stack on the same window.
+
+    The autonomy gate is recorded AFTER the gog write succeeds (with the real
+    event_id), so a freebusy/external refusal leaves NO phantom ``executed`` audit
+    entry and the recorded snapshot always has an event_id to undo against.
     """
     task_id = block.get("task_id")
-    new_start, new_end = _next_window(block, ref=ref)
-    # Gate the autonomous move through the autonomy ladder before the gog call. The
-    # snapshot is the OLD window (the move's reversal substrate), so the act is
-    # recorded with a real undo payload.
-    gated = _gate_calendar_write("calendar_block_moved", task_id,
-                                 {"calendar_id": calendar_id, "event_id": block.get("event_id"),
-                                  "old_start": block.get("start"), "old_end": block.get("end")})
-    if not gated["ok"]:
-        _log("calendar_block_refused", task_id=task_id, reason=f"gate:{gated['reason']}",
-             event_id=block.get("event_id"))
-        return {"status": "refused"}
     try:
         moved = calendar_blocks.move_focus_block(
             calendar_id, block["event_id"], task_id, new_start, new_end,
@@ -549,6 +545,11 @@ def _recover_one_block(cal_state: dict[str, Any], block: dict[str, Any], calenda
                                       {"reason": reason})
         _log("calendar_block_refused", task_id=task_id, reason=reason, event_id=block.get("event_id"))
         return {"status": "refused"}
+    # Record the executed move in the autonomy audit with the OLD window as the undo
+    # substrate (move it back) and the event_id, now that the write has happened.
+    _gate_calendar_write("calendar_block_moved", task_id,
+                         {"calendar_id": calendar_id, "event_id": block["event_id"],
+                          "old_start": block.get("start"), "old_end": block.get("end")})
     block["start"], block["end"] = moved["start"], moved["end"]
     block["slip_count"] = (block.get("slip_count") or 0) + 1
     block["last_slipped_at"] = ref.isoformat()
@@ -644,19 +645,12 @@ def _place_one_block(cal_state, calendar_id, task_id, title, start_iso, end_iso,
     """Create ONE freebusy-gated focus block, mutating the LOCKED state. -> created|refused.
 
     Mutates ``cal_state`` in place; the surrounding ``focus_calendar.transition``
-    persists once on exit (this helper never writes the file itself).
+    persists once on exit (this helper never writes the file itself). The freebusy
+    gate inside ``create_focus_block`` is the overbook guard; the autonomy gate is
+    recorded AFTER the write succeeds (with the real event_id), so a freebusy
+    refusal leaves NO phantom ``executed`` audit entry and the snapshot always has
+    an event_id to undo against.
     """
-    # Gate the autonomous calendar write through the autonomy ladder BEFORE the gog
-    # call: a blocked rung (e.g. a corrupt config that floors the act) refuses the
-    # write. The snapshot is the reversal substrate (calendar + window), not a board
-    # line. The freebusy gate inside create_focus_block is the overbook guard; this
-    # is the autonomy-audit guard.
-    gated = _gate_calendar_write("calendar_block_created", task_id,
-                                 {"calendar_id": calendar_id, "task_id": task_id,
-                                  "start": start_iso, "end": end_iso})
-    if not gated["ok"]:
-        _log("calendar_block_refused", task_id=task_id, reason=f"gate:{gated['reason']}")
-        return "refused"
     try:
         block = calendar_blocks.create_focus_block(
             calendar_id, task_id, title, start_iso, end_iso,
@@ -666,6 +660,11 @@ def _place_one_block(cal_state, calendar_id, task_id, title, start_iso, end_iso,
                                       {"task_id": task_id, "start": start_iso}, {"reason": exc.reason})
         _log("calendar_block_refused", task_id=task_id, reason=exc.reason)
         return "refused"
+    # Record the executed create in the autonomy audit with the event_id (the undo
+    # substrate is a delete of THIS event), now that the write has happened.
+    _gate_calendar_write("calendar_block_created", task_id,
+                         {"calendar_id": calendar_id, "task_id": task_id,
+                          "event_id": block["event_id"], "start": block["start"], "end": block["end"]})
     cal_state.setdefault("active_blocks", []).append({
         "event_id": block["event_id"], "task_id": task_id, "task_title": title,
         "start": block["start"], "end": block["end"], "created_at": ref.isoformat(),
@@ -704,16 +703,24 @@ def run_slip_recovery(*, now: datetime | None = None, dry_run: bool = False,
 
     def _slip_under_lock(cal_state: dict[str, Any]) -> None:
         calendar_id = cal_state.get("agent_calendar_id")
+        # Cursor for the next free window: blocks slid in one pass are placed
+        # back-to-back from ref+1h so multiple slipped blocks do not stack/overlap.
+        cursor = ref + timedelta(hours=1)
         for block in list(cal_state.get("active_blocks", [])):
             if not _block_has_slipped(block, ref=ref, active_ids=active_ids):
                 continue
+            duration = _block_duration(block)
+            new_start, new_end = cursor.isoformat(), (cursor + duration).isoformat()
             if dry_run:
                 counts["moved"] += 1
+                cursor = cursor + duration
                 continue
-            result = _recover_one_block(cal_state, block, calendar_id, fb_ids, ref=ref, runner=runner)
+            result = _recover_one_block(cal_state, block, calendar_id, fb_ids, ref=ref,
+                                        new_start=new_start, new_end=new_end, runner=runner)
             if result["status"] != "moved":
                 counts["refused"] += 1
                 continue
+            cursor = cursor + duration  # advance past this block so the next does not overlap
             counts["moved"] += 1
             notices.append((slip_notice_text(block, result["new_start"], result["new_end"]),
                             block.get("task_id")))

@@ -204,6 +204,44 @@ def test_future_block_not_slipped(harness):
     assert runner.calls == []
 
 
+def test_two_slipped_blocks_do_not_stack(harness):
+    """autoreview P2: two blocks slipping in one pass must be placed back-to-back
+    (not both at ref+1h, where they would overlap each other)."""
+    board, state = harness
+    # two slipped agent-owned blocks for two active tasks
+    BOARD2 = BOARD + "- [ ] **Review PR** task_id::tsk_pr 🗓️2026-06-20 estimate:: 1h area:: Eng\n"
+    board.write_text(BOARD2, encoding="utf-8")
+    cal = focus_calendar.load_focus_calendar()
+    cal["agent_calendar_id"] = "focus-cal"
+    cal["active_blocks"] = [
+        {"event_id": "evt_1", "task_id": "tsk_rel", "start": "2026-06-20T09:00:00+00:00", "end": "2026-06-20T10:00:00+00:00"},
+        {"event_id": "evt_2", "task_id": "tsk_pr", "start": "2026-06-20T09:00:00+00:00", "end": "2026-06-20T10:00:00+00:00"},
+    ]
+    focus_calendar.save_focus_calendar(cal)
+
+    import json
+    moves: list = []
+
+    def runner(cmd):
+        key = f"{cmd[1]}.{cmd[2]}"
+        if key == "calendar.event":
+            return _completed(json.dumps({"id": cmd[4], "extendedProperties": {"private": {"agent_created": "task-tracker"}}}))
+        if key == "calendar.freebusy":
+            return _completed(_external_freebusy([]))
+        if key == "calendar.update":
+            moves.append((cmd[4], cmd[cmd.index("--from") + 1]))  # (event_id, new start)
+            return _completed(json.dumps({"id": cmd[4]}))
+        raise AssertionError(cmd)
+
+    _sent, send = _collector()
+    counts = proactive_brief.run_slip_recovery(now=NOW, send=send, runner=runner)
+    assert counts["moved"] == 2
+    starts = sorted(s for _id, s in moves)
+    # NOW is noon; first block -> 13:00 (1h), second -> 14:00 (no overlap)
+    assert starts[0] != starts[1]
+    assert "13:00" in starts[0] and "14:00" in starts[1]
+
+
 def test_block_in_progress_not_slipped(harness):
     """autoreview P3: a block currently in its active window (started but NOT ended)
     is NOT moved out from under the user. NOW is noon; an 11:00-13:00 block is
