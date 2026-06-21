@@ -77,6 +77,7 @@ RUNG3_PUSH_ENABLED = True
 PUSH_NO_BOARD_WRITE_ACTS: frozenset[str] = frozenset({
     "nag_sent",            # U4 nag re-fire -- reversal is the ack, not a board edit
     "body_double_checkin",  # U4 body-double check-in -- pure push
+    "brief_sent",          # U6 daily brief / pre-brief / slip notice / Friday proposal -- pure push
 })
 
 # Irreversible-act rungs anchored IN CODE (Finding #3b). These are the acts that
@@ -97,6 +98,16 @@ DEFAULT_ACT_TYPE_RUNGS: dict[str, int] = {
     "nag_sent": RUNG_MONITORED_AUTO,
     "nag_acked": RUNG_MONITORED_AUTO,
     "body_double_checkin": RUNG_MONITORED_AUTO,  # U4 push, no board write
+    # U6 proactive layer. A brief/pre-brief/slip-notice/Friday-proposal push is
+    # reversible (it is just a message; its "undo" is reading the channel) and
+    # makes no board write -> rung 3 (monitored-auto), exempt from the snapshot
+    # requirement via PUSH_NO_BOARD_WRITE_ACTS. A focus-block create/move IS a
+    # calendar write but it is agent-owned and reversible by construction (the
+    # event id is stored; move/delete undoes it) -> rung 3. A focus-block DELETE
+    # is irreversible -> already anchored at rung 4 above.
+    "brief_sent": RUNG_MONITORED_AUTO,
+    "calendar_block_created": RUNG_MONITORED_AUTO,
+    "calendar_block_moved": RUNG_MONITORED_AUTO,
     "wip_cap_enforced": RUNG_APPROVE,
     "task_marked_done": RUNG_APPROVE,
     "focus_set": RUNG_APPROVE,

@@ -76,6 +76,37 @@ def nag_snooze_max() -> int:
     return _int_env("NAG_SNOOZE_MAX", 3)
 
 
+# --- Proactive layer knobs (U6) -------------------------------------------
+
+def focus_block_day_start_hour() -> int:
+    """Local-clock hour the day's focus blocks start at (default 09:00)."""
+    return _int_env("FOCUS_BLOCK_DAY_START_HOUR", 9)
+
+
+def focus_tz_offset_hours() -> int:
+    """Fixed UTC offset (hours) for the user's local clock when placing focus blocks.
+
+    Focus blocks anchor to the user's LOCAL morning, but a UTC-scheduled cron passes
+    a UTC ``now``. This offset converts: the day-start hour is applied in
+    ``UTC+offset``, then the result is expressed as a tz-aware timestamp. Default -7
+    (US Pacific daylight) matches the spec's PT cron schedule; set
+    ``FOCUS_TZ_OFFSET_HOURS`` for another zone. A fixed offset avoids a tz database
+    dependency; DST drift is acceptable for a focus-block start hint.
+    """
+    return _int_env("FOCUS_TZ_OFFSET_HOURS", -7)
+
+
+def debrief_reprompt_interval_minutes() -> int:
+    """Minimum minutes between debrief follow-up re-prompts for one open loop.
+
+    The ``*/5`` pre-brief scan would otherwise re-prompt an ignored debrief every
+    five minutes (dozens of messages a day). This paces it: an open loop is nudged
+    at most once per interval, matching the U4 nag engine's habituation-aware
+    pacing rather than spamming the ADHD-focused surface (default 120 min).
+    """
+    return _int_env("DEBRIEF_REPROMPT_INTERVAL_MINUTES", 120)
+
+
 # --- Undo windows (Decision #8) -------------------------------------------
 
 def undo_window_nag_hours() -> int:
