@@ -204,6 +204,18 @@ def test_future_block_not_slipped(harness):
     assert runner.calls == []
 
 
+def test_block_in_progress_not_slipped(harness):
+    """autoreview P3: a block currently in its active window (started but NOT ended)
+    is NOT moved out from under the user. NOW is noon; an 11:00-13:00 block is
+    mid-session -> not slipped."""
+    board, state = harness
+    _seed_block(start="2026-06-20T11:00:00+00:00", end="2026-06-20T13:00:00+00:00")
+    runner = _agent_event_runner(_external_freebusy([]))
+    counts = proactive_brief.run_slip_recovery(now=NOW, send=None, runner=runner)
+    assert counts == {"moved": 0, "refused": 0, "notified": 0}
+    assert runner.calls == []  # in-progress block is left alone
+
+
 # --- Debrief follow-up re-prompts an OPEN loop but never closes it ----------
 
 def test_debrief_followup_reprompts_open_loop(harness, monkeypatch):
@@ -247,3 +259,24 @@ def test_debrief_reprompt_is_paced_no_spam(harness, monkeypatch):
     # A scan past the interval -> re-prompt again (the loop is still open).
     c3 = proactive_brief.run_pre_brief_scan(now=NOW + timedelta(minutes=121), send=send)
     assert c3["debrief_reprompts"] == 1
+
+
+def test_debrief_not_reprompted_while_event_in_progress(harness, monkeypatch):
+    """autoreview P2: a debrief loop is NOT nudged until the event has ENDED -- a
+    meeting still in progress (started, not ended) gets no mid-meeting prompt."""
+    board, state = harness
+    st = proactive_state.load_proactive_state()
+    # Event started at 11:00 but ends at 13:00; NOW is noon -> mid-meeting.
+    proactive_state.mark_pre_brief_sent(
+        st, "evt_q3", "Q3 Review", "2026-06-20T11:00:00+00:00", "2026-06-20T13:00:00+00:00")
+    proactive_state.open_debrief(st, "evt_q3")
+    proactive_state.save_proactive_state(st)
+    monkeypatch.setattr(proactive_brief, "get_calendar_events", lambda **_k: {"work": []})
+
+    sent: list = []
+    counts = proactive_brief.run_pre_brief_scan(now=NOW, send=lambda t, x: sent.append((t, x)))
+    assert counts["debrief_reprompts"] == 0  # event not ended -> no nudge
+    assert sent == []
+    # the loop is still open (waiting for the event to end), never closed by time
+    reloaded = proactive_state.load_proactive_state()
+    assert proactive_state.is_debrief_open(reloaded["pre_briefs"][0]) is True

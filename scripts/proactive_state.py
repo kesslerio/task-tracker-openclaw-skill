@@ -150,14 +150,20 @@ def pre_brief_due(state: dict[str, Any], event_id: str) -> bool:
     return not (entry and entry.get("brief_sent"))
 
 
-def mark_pre_brief_sent(state: dict[str, Any], event_id: str, event_summary: str, event_start: str) -> dict[str, Any]:
-    """Record that a pre-brief was sent for ``event_id``; returns the entry."""
+def mark_pre_brief_sent(state: dict[str, Any], event_id: str, event_summary: str,
+                        event_start: str, event_end: str = "") -> dict[str, Any]:
+    """Record that a pre-brief was sent for ``event_id``; returns the entry.
+
+    ``event_end`` is stored so the debrief loop can wait for the event to END
+    before nudging (a mid-meeting "capture commitments" prompt makes no sense).
+    """
     entry = find_pre_brief(state, event_id)
     if entry is None:
         entry = {
             "event_id": event_id,
             "event_summary": event_summary,
             "event_start": event_start,
+            "event_end": event_end,
             "brief_sent": False,
             "brief_sent_at": None,
             "debrief_requested": False,

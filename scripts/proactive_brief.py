@@ -88,6 +88,19 @@ def _parse_event_start(value: str | None) -> datetime | None:
         return None
 
 
+def _event_has_ended(entry: dict[str, Any], *, ref: datetime) -> bool:
+    """True if a pre-brief entry's event has fully ENDED by ``ref``.
+
+    A debrief is meaningful only AFTER the event ends -- nudging mid-meeting makes
+    no sense. Uses ``event_end`` when present; falls back to ``event_start`` for an
+    entry written before end was tracked (a started-but-untimed event is treated as
+    ended, the prior behaviour). An entry with no parseable time is treated as
+    ended (better to offer a debrief than to silently never close the loop).
+    """
+    end = _parse_event_start(entry.get("event_end")) or _parse_event_start(entry.get("event_start"))
+    return end is None or end <= ref
+
+
 def upcoming_events(events: list[dict[str, Any]], *, now: datetime, lead_window_minutes: int) -> list[dict[str, Any]]:
     """Events starting within the next ``lead_window_minutes`` (sorted by start).
 
@@ -346,7 +359,8 @@ def run_pre_brief_scan(*, now: datetime | None = None, dry_run: bool = False,
                        send=send, dry_run=dry_run)
         if result["sent"]:
             entry = proactive_state.mark_pre_brief_sent(
-                state, key, event.get("summary") or "", event.get("start") or "")
+                state, key, event.get("summary") or "",
+                event.get("start") or "", event.get("end") or "")
             proactive_state.open_debrief(state, key)  # debrief loop opens with the pre-brief
             proactive_state.save_proactive_state(state)
             _log("brief_sent", brief_type="pre_brief", event_key=key,
@@ -355,16 +369,17 @@ def run_pre_brief_scan(*, now: datetime | None = None, dry_run: bool = False,
         elif not dry_run:
             counts["blocked"] += 1
 
-    # Re-prompt every OPEN debrief loop whose event has ended (NAG-CLOSES-ONLY-ON-ACK),
+    # Re-prompt every OPEN debrief loop whose event has ENDED (NAG-CLOSES-ONLY-ON-ACK),
     # PACED so an ignored loop is nudged at most once per interval rather than every
-    # `*/5` scan (autoreview P3: no dozens-of-messages-a-day spam).
+    # `*/5` scan (no dozens-of-messages-a-day spam). The wait is on the event END,
+    # not its start, so a long meeting never gets a mid-meeting "capture commitments"
+    # prompt.
     interval = cos_config.debrief_reprompt_interval_minutes()
     for entry in state.get("pre_briefs", []):
         if not proactive_state.is_debrief_open(entry):
             continue
-        start = _parse_event_start(entry.get("event_start"))
-        if start is not None and start > ref:
-            continue  # event has not happened yet -- nothing to debrief
+        if not _event_has_ended(entry, ref=ref):
+            continue  # event is upcoming or still in progress -- nothing to debrief yet
         if not proactive_state.debrief_reprompt_due(entry, now=ref, interval_minutes=interval):
             continue  # nudged recently -- respect the pacing interval
         result = _push("brief_sent", debrief_followup_text(entry), surface="standup",
@@ -395,9 +410,16 @@ def run_friday_proposal(*, now: datetime | None = None, dry_run: bool = False,
 
 
 def _block_has_slipped(block: dict[str, Any], *, ref: datetime, active_ids: set[str]) -> bool:
-    """True if ``block`` has slipped: started in the past and its task is still active."""
-    start = _parse_event_start(block.get("start"))
-    return start is not None and start <= ref and block.get("task_id") in active_ids
+    """True if ``block`` has slipped: its window has fully ENDED and the task is
+    still active.
+
+    Keys off the block END, not its start, so a block currently in its active
+    window (started but not yet ended) is NOT moved out from under the user
+    mid-session. Falls back to start for an untimed end. A block whose task is no
+    longer active (done/parked) has not slipped -- it is just stale and left alone.
+    """
+    end = _parse_event_start(block.get("end")) or _parse_event_start(block.get("start"))
+    return end is not None and end <= ref and block.get("task_id") in active_ids
 
 
 def _next_window(block: dict[str, Any], *, ref: datetime) -> tuple[str, str]:
