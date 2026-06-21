@@ -263,9 +263,19 @@ def run_debrief_capture(reference: str, notes: str, *,
     On a match: parse the notes into commitments, create each as a task, record the
     new task ids (sets ``debrief_captured_at`` -> CLOSED), and emit
     ``commitment_task_created`` + ``debrief_captured``. A "skip" closes via skip.
+    Notes that parse to ZERO commitments (and are not "skip") do NOT close the loop
+    -- the user wrote something that was not understood as a commitment, so the loop
+    stays open to be retried rather than silently dropping it. Runs UNDER the
+    proactive-state lock so a concurrent cron re-prompt cannot race the close.
     Returns ``{captured, task_ids[, reason]}``.
     """
-    state = proactive_state.load_proactive_state()
+    return proactive_state.transition(
+        lambda state: _capture_under_lock(state, reference, notes, runner))
+
+
+def _capture_under_lock(state: dict[str, Any], reference: str, notes: str,
+                        runner: "ShellRunner | None") -> dict[str, Any]:
+    """The locked body of run_debrief_capture: resolve, create commitments, close."""
     entry = proactive_state.resolve_open_debrief(state, reference)
     if entry is None:
         # No OPEN loop for this reference: it was already captured/skipped, or the
@@ -275,17 +285,23 @@ def run_debrief_capture(reference: str, notes: str, *,
 
     if notes.strip().lower() == "skip":
         proactive_state.skip_debrief(state, event_id)
-        proactive_state.save_proactive_state(state)
         return {"captured": False, "task_ids": []}
+
+    commitments = parse_commitments(notes)
+    if not commitments:
+        # The user wrote notes that parsed to no commitment (e.g. no "will" phrasing).
+        # Do NOT close the loop -- a real commitment would be silently lost. Keep it
+        # open and ask the user to rephrase on the next nudge.
+        return {"captured": False, "task_ids": [], "reason": "no_commitment_parsed"}
 
     # A retry after a partial failure re-submits the SAME notes, so skip any
     # commitment whose title was already created on a prior attempt (recorded on the
-    # entry) -- this is the dedup that stops a retry from duplicating board tasks
-    # while still letting the previously-failed ones through.
+    # entry) -- the dedup that stops a retry from duplicating board tasks while still
+    # letting the previously-failed ones through.
     already = set(entry.get("created_commitment_titles") or [])
     task_ids: list[str] = []
     failed: list[str] = []
-    for spec in parse_commitments(notes):
+    for spec in commitments:
         if spec["title"] in already:
             continue  # already created on a prior attempt -- do not duplicate
         task_id = _create_commitment_task(spec, runner=runner)
@@ -297,19 +313,15 @@ def run_debrief_capture(reference: str, notes: str, *,
         _log("commitment_task_created", task_id=task_id, title=spec["title"], due=spec.get("due"))
 
     # NEVER lose a commitment: if ANY commitment failed to create, the loop stays
-    # OPEN so the user can retry, rather than silently dropping it behind a closed
-    # loop. The created task ids + titles are recorded so a retry dedups; the
-    # failures are surfaced for the next re-prompt.
+    # OPEN so the user can retry. Created ids + titles are recorded so a retry dedups.
     if failed:
         proactive_state.record_partial_debrief(state, event_id, task_ids, sorted(already))
-        proactive_state.save_proactive_state(state)
         _log("debrief_captured", event_key=event_id, commitments_task_ids=task_ids,
              failed_commitments=failed, partial=True)
         return {"captured": False, "task_ids": task_ids, "reason": "commitment_create_failed",
                 "failed": failed}
 
     proactive_state.capture_debrief(state, event_id, task_ids)
-    proactive_state.save_proactive_state(state)
     _log("debrief_captured", event_key=event_id, commitments_task_ids=task_ids)
     return {"captured": True, "task_ids": task_ids}
 
@@ -365,19 +377,26 @@ def _push(act_type: str, text: str, *, surface: str, send: Send | None,
 
 def run_daily_brief(*, now: datetime | None = None, dry_run: bool = False,
                     send: Send | None = None) -> dict[str, Any]:
-    """Send today's daily brief once (idempotent). Returns ``{sent, reason}``."""
-    ref = now or _now()
-    state = proactive_state.load_proactive_state()
-    if not proactive_state.daily_brief_due(state):
-        return {"sent": False, "reason": "already_sent"}
-    events = flatten_calendar_events(get_calendar_events(trigger="proactive_brief"))
-    text = daily_brief_text(events, _load_active())
-    result = _push("brief_sent", text, surface="standup", send=send, dry_run=dry_run)
-    if result["sent"]:
-        proactive_state.mark_daily_brief_sent(state)
-        proactive_state.save_proactive_state(state)
-        _log("brief_sent", brief_type="daily", delivery_target=result["delivery_target"])
-    return result
+    """Send today's daily brief once (idempotent). Returns ``{sent, reason}``.
+
+    The due-check + push + mark run UNDER the proactive-state lock so two cron modes
+    firing in the same minute cannot both send (the idempotency claim is atomic).
+    """
+    if dry_run:
+        return _push("brief_sent", "", surface="standup", send=send, dry_run=True)
+
+    def _claim_and_send(state: dict[str, Any]) -> dict[str, Any]:
+        if not proactive_state.daily_brief_due(state):
+            return {"sent": False, "reason": "already_sent"}
+        events = flatten_calendar_events(get_calendar_events(trigger="proactive_brief"))
+        text = daily_brief_text(events, _load_active())
+        result = _push("brief_sent", text, surface="standup", send=send, dry_run=False)
+        if result["sent"]:
+            proactive_state.mark_daily_brief_sent(state)
+            _log("brief_sent", brief_type="daily", delivery_target=result["delivery_target"])
+        return result
+
+    return proactive_state.transition(_claim_and_send)
 
 
 def run_pre_brief_scan(*, now: datetime | None = None, dry_run: bool = False,
@@ -386,36 +405,53 @@ def run_pre_brief_scan(*, now: datetime | None = None, dry_run: bool = False,
 
     Idempotency is mandatory (spec §4.6): a pre-brief is sent at most once per
     event per day, gated on ``proactive-state.json``; an open debrief loop is
-    re-prompted until capture/skip but never closed by time.
+    re-prompted until capture/skip but never closed by time. The whole scan runs
+    UNDER the proactive-state lock so two `*/5` fires in the same minute cannot
+    both send the same brief (the idempotency claim is atomic).
     """
     ref = now or _now()
-    state = proactive_state.load_proactive_state()
     counts = {"briefed": 0, "debrief_reprompts": 0, "blocked": 0}
-
     events = flatten_calendar_events(get_calendar_events(trigger="proactive_brief"))
-    for event in upcoming_events(events, now=ref, lead_window_minutes=PRE_BRIEF_LEAD_WINDOW_MINUTES):
-        key = event_key(event)
-        if not proactive_state.pre_brief_due(state, key):
-            continue
-        result = _push("brief_sent", pre_brief_text(event), surface="standup",
-                       send=send, dry_run=dry_run)
-        if result["sent"]:
-            entry = proactive_state.mark_pre_brief_sent(
-                state, key, event.get("summary") or "",
-                event.get("start") or "", event.get("end") or "")
-            proactive_state.open_debrief(state, key)  # debrief loop opens with the pre-brief
-            proactive_state.save_proactive_state(state)
-            _log("brief_sent", brief_type="pre_brief", event_key=key,
-                 delivery_target=result["delivery_target"])
-            counts["briefed"] += 1
-        elif not dry_run:
-            counts["blocked"] += 1
+    upcoming = upcoming_events(events, now=ref, lead_window_minutes=PRE_BRIEF_LEAD_WINDOW_MINUTES)
 
-    # Re-prompt every OPEN debrief loop whose event has ENDED (NAG-CLOSES-ONLY-ON-ACK),
-    # PACED so an ignored loop is nudged at most once per interval rather than every
-    # `*/5` scan (no dozens-of-messages-a-day spam). The wait is on the event END,
-    # not its start, so a long meeting never gets a mid-meeting "capture commitments"
-    # prompt.
+    def _scan(state: dict[str, Any]) -> None:
+        for event in upcoming:
+            _maybe_pre_brief(state, event, ref=ref, dry_run=dry_run, send=send, counts=counts)
+        _reprompt_open_debriefs(state, ref=ref, dry_run=dry_run, send=send, counts=counts)
+
+    if dry_run:
+        _scan(proactive_state.load_proactive_state())  # no lock/persist on a dry-run
+    else:
+        proactive_state.transition(_scan)
+    return counts
+
+
+def _maybe_pre_brief(state, event, *, ref, dry_run, send, counts) -> None:
+    """Send a pre-brief for ONE upcoming event if it has not been briefed today."""
+    key = event_key(event)
+    if not proactive_state.pre_brief_due(state, key):
+        return
+    result = _push("brief_sent", pre_brief_text(event), surface="standup",
+                   send=send, dry_run=dry_run)
+    if result["sent"]:
+        proactive_state.mark_pre_brief_sent(
+            state, key, event.get("summary") or "",
+            event.get("start") or "", event.get("end") or "")
+        proactive_state.open_debrief(state, key)  # debrief loop opens with the pre-brief
+        _log("brief_sent", brief_type="pre_brief", event_key=key,
+             delivery_target=result["delivery_target"])
+        counts["briefed"] += 1
+    elif not dry_run:
+        counts["blocked"] += 1
+
+
+def _reprompt_open_debriefs(state, *, ref, dry_run, send, counts) -> None:
+    """Re-prompt every OPEN debrief loop whose event has ENDED, PACED per interval.
+
+    The wait is on the event END (not its start), so a long meeting never gets a
+    mid-meeting "capture commitments" prompt; the pacing keeps an ignored loop to
+    at most one nudge per interval (NAG-CLOSES-ONLY-ON-ACK -- never closed by time).
+    """
     interval = cos_config.debrief_reprompt_interval_minutes()
     for entry in state.get("pre_briefs", []):
         if not proactive_state.is_debrief_open(entry):
@@ -428,27 +464,32 @@ def run_pre_brief_scan(*, now: datetime | None = None, dry_run: bool = False,
                        send=send, dry_run=dry_run)
         if result["sent"]:
             proactive_state.mark_debrief_reprompted(entry, now=ref)
-            proactive_state.save_proactive_state(state)
             counts["debrief_reprompts"] += 1
         elif not dry_run:
             counts["blocked"] += 1
 
-    return counts
-
 
 def run_friday_proposal(*, now: datetime | None = None, dry_run: bool = False,
                         send: Send | None = None) -> dict[str, Any]:
-    """Send the Friday next-week proposal once (idempotent). NEVER writes U3 state."""
-    state = proactive_state.load_proactive_state()
-    if not proactive_state.friday_proposal_due(state):
-        return {"sent": False, "reason": "already_sent"}
-    text = friday_proposal_text(_load_active())
-    result = _push("brief_sent", text, surface="weekly", send=send, dry_run=dry_run)
-    if result["sent"]:
-        proactive_state.mark_friday_proposal_sent(state)
-        proactive_state.save_proactive_state(state)
-        _log("brief_sent", brief_type="friday_proposal", delivery_target=result["delivery_target"])
-    return result
+    """Send the Friday next-week proposal once (idempotent). NEVER writes U3 state.
+
+    The due-check + push + mark run UNDER the proactive-state lock so a concurrent
+    fire cannot double-send.
+    """
+    if dry_run:
+        return _push("brief_sent", "", surface="weekly", send=send, dry_run=True)
+
+    def _claim_and_send(state: dict[str, Any]) -> dict[str, Any]:
+        if not proactive_state.friday_proposal_due(state):
+            return {"sent": False, "reason": "already_sent"}
+        text = friday_proposal_text(_load_active())
+        result = _push("brief_sent", text, surface="weekly", send=send, dry_run=False)
+        if result["sent"]:
+            proactive_state.mark_friday_proposal_sent(state)
+            _log("brief_sent", brief_type="friday_proposal", delivery_target=result["delivery_target"])
+        return result
+
+    return proactive_state.transition(_claim_and_send)
 
 
 def _block_has_slipped(block: dict[str, Any], *, ref: datetime, active_ids: set[str]) -> bool:

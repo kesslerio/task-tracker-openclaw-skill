@@ -387,6 +387,27 @@ def test_debrief_partial_failure_keeps_loop_open(harness):
     assert proactive_state.is_debrief_open(reloaded["pre_briefs"][0]) is True
 
 
+def test_debrief_notes_with_no_commitment_does_not_close_loop(harness):
+    """autoreview P3: notes that parse to ZERO commitments (no 'will' phrasing) must
+    NOT close the loop -- a real commitment would otherwise be silently dropped."""
+    board, state = harness
+    st = proactive_state.load_proactive_state()
+    proactive_state.mark_pre_brief_sent(st, "evt_q3", "Q3 Review", "2026-06-20T09:00:00+00:00")
+    proactive_state.open_debrief(st, "evt_q3")
+    proactive_state.save_proactive_state(st)
+
+    def fail_runner(cmd):
+        raise AssertionError("no task may be created when nothing parsed")
+
+    result = proactive_brief.run_debrief_capture("evt_q3", "it was a good meeting",
+                                                 runner=fail_runner)
+    assert result["captured"] is False
+    assert result["reason"] == "no_commitment_parsed"
+    # the loop is STILL open -- the user can rephrase rather than losing a commitment
+    reloaded = proactive_state.load_proactive_state()
+    assert proactive_state.is_debrief_open(reloaded["pre_briefs"][0]) is True
+
+
 def test_debrief_skip_closes_loop_no_tasks(harness):
     board, state = harness
     st = proactive_state.load_proactive_state()

@@ -111,3 +111,15 @@ def test_debrief_skip_closes(state_dir):
 def test_open_debrief_missing_event_returns_none(state_dir):
     state = proactive_state.load_proactive_state()
     assert proactive_state.open_debrief(state, "no_such_event") is None
+
+
+def test_transition_serializes_no_lost_update(state_dir):
+    """The locked transition does read-modify-write under flock, so two sequential
+    transitions accumulate -- the second never clobbers the first's update (the
+    lost-update the */5 cron flock prevents)."""
+    proactive_state.transition(lambda s: proactive_state.mark_daily_brief_sent(s))
+    # a second transition mutating a DIFFERENT flag must preserve the first's
+    proactive_state.transition(lambda s: proactive_state.mark_friday_proposal_sent(s))
+    reloaded = proactive_state.load_proactive_state()
+    assert proactive_state.daily_brief_due(reloaded) is False  # first survived
+    assert proactive_state.friday_proposal_due(reloaded) is False  # second applied

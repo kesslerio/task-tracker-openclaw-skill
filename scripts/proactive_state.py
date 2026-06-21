@@ -24,9 +24,15 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 
 import cos_config
 from utils import _atomic_write
@@ -36,6 +42,10 @@ SCHEMA_VERSION = 1
 
 def proactive_state_path() -> Path:
     return cos_config.state_dir() / "proactive-state.json"
+
+
+def proactive_lock_path() -> Path:
+    return cos_config.state_dir() / "proactive-state.lock"
 
 
 def _now_iso() -> str:
@@ -106,6 +116,49 @@ def save_proactive_state(state: dict[str, Any]) -> dict[str, Any]:
     state["updated_at"] = _now_iso()
     _atomic_write(proactive_state_path(), json.dumps(state, indent=2, sort_keys=True) + "\n")
     return state
+
+
+@contextmanager
+def _locked_state(reference_date: str | None = None) -> Iterator[dict[str, Any]]:
+    """Yield the current proactive-state under an exclusive sidecar flock.
+
+    The lock is held for the WHOLE read-modify-write so two cron modes firing in
+    the same minute (e.g. the ``*/5`` pre-brief and the daily brief) cannot lose
+    each other's update -- without it, ``os.replace`` is last-writer-wins and one
+    mode could resurrect a just-cleared idempotency flag, producing the duplicate
+    brief this module exists to prevent. The caller mutates the yielded dict in
+    place; on a clean exit it is persisted atomically. An exception inside the
+    block does NOT write (a crash never corrupts or resurrects idempotency state).
+    """
+    cos_config.state_dir()  # ensure the 0o700 dir exists before opening the lockfile
+    lock_path = proactive_lock_path()
+    with lock_path.open("a", encoding="utf-8") as lock_handle:
+        try:
+            os.fchmod(lock_handle.fileno(), 0o600)
+        except OSError:
+            pass
+        if fcntl is not None:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            state = load_proactive_state(reference_date)
+            yield state
+            save_proactive_state(state)
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
+def transition(mutator: Callable[[dict[str, Any]], Any], *, reference_date: str | None = None) -> Any:
+    """Run ``mutator(state)`` under the lock and persist the result atomically.
+
+    The single mutation primitive every proactive-state change funnels through so
+    concurrent cron modes serialise their read-modify-write. ``mutator`` receives
+    the live state dict, mutates it in place, and may return a value passed back to
+    the caller. A mutator that decides NOT to change anything still re-persists the
+    (unchanged) state, which is harmless.
+    """
+    with _locked_state(reference_date) as state:
+        return mutator(state)
 
 
 def find_pre_brief(state: dict[str, Any], event_id: str) -> dict[str, Any] | None:
