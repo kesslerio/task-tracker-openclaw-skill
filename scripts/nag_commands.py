@@ -368,7 +368,19 @@ def handle_body_double(
         "ended_at": None,
         "outcome": None,
     }
-    nag_state.transition(lambda state: nag_state.add_body_double_session(state, task_id, session))
+    # The append re-validates the one-session-per-task invariant UNDER the lock; if
+    # a concurrent /body-double won the race, it returns None and we roll back the
+    # crons we just created (the early pre-check above is only fast feedback).
+    added = nag_state.transition(
+        lambda state: nag_state.add_body_double_session(state, task_id, session))
+    if added is None:
+        for cron_id in cron_ids:
+            _safe_delete(cron_id)
+        return {"ok": False, "error": {
+            "code": "session-already-active",
+            "message": (f"There's already an active body-double session for this task. "
+                        f"Reply /cancel-session {task_id} to end it first."),
+        }}
     _log("body_double_started", task_id=task_id, session_id=session_id,
          duration_min=minutes, cron_ids=cron_ids)
     return {"ok": True, "task_id": task_id, "session_id": session_id,

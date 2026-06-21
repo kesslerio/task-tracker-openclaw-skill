@@ -21,6 +21,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import utils  # noqa: E402
+import cron_backend  # noqa: E402
 import nag_state  # noqa: E402
 import nag_commands  # noqa: E402
 import nag_check  # noqa: E402
@@ -303,6 +304,39 @@ def test_body_double_refuses_second_concurrent_session(env):
     result = nag_commands.handle_body_double("tsk_abc123", "60m", create_cron=lambda d: "c")
     assert result["ok"] is False
     assert result["error"]["code"] == "session-already-active"
+
+
+def test_body_double_second_session_under_lock_rolls_back_crons(env, monkeypatch):
+    """If a session is inserted AFTER the early pre-check but BEFORE the locked
+    append (the TOCTOU window), the under-lock guard rejects and the just-created
+    crons are rolled back -- no orphaned cron pair, no second session."""
+    board, state = env
+    deleted = []
+    monkeypatch.setattr(cron_backend, "delete_cron", lambda cid: deleted.append(cid))
+
+    real_transition = nag_state.transition
+    inserted = {"done": False}
+
+    def racing_transition(mutator):
+        # Simulate a concurrent /body-double landing a session right before THIS
+        # call's locked append (only for the body-double add, once).
+        if not inserted["done"]:
+            inserted["done"] = True
+            other = {"session_id": "bd_other", "cron_ids": ["c_other"],
+                     "started_at": "x", "ended_at": None}
+            real_transition(lambda s: nag_state.add_body_double_session(s, "tsk_abc123", other))
+        return real_transition(mutator)
+
+    monkeypatch.setattr(nag_state, "transition", racing_transition)
+    result = nag_commands.handle_body_double("tsk_abc123", "90m",
+                                             create_cron=lambda d: "c_mine")
+    monkeypatch.setattr(nag_state, "transition", real_transition)
+    assert result["ok"] is False
+    assert result["error"]["code"] == "session-already-active"
+    assert deleted == ["c_mine", "c_mine"]  # both of MY crons rolled back
+    # Only the other session survives.
+    sessions = _state(state)["tsk_abc123"]["body_double_sessions"]
+    assert [s["session_id"] for s in sessions] == ["bd_other"]
 
 
 def test_body_double_blocks_when_delivery_unproven(env, monkeypatch):

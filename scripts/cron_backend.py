@@ -67,9 +67,11 @@ def create_cron(descriptor: dict[str, Any]) -> str:
 def delete_cron(cron_id: str) -> None:
     """Delete a pending cron by id via ``openclaw cron delete``.
 
-    Best-effort: a body-double's check-in crons are ``deleteAfterRun``, so a fired
-    one is already gone -- a "not found" on an already-reaped cron is not an error.
-    Other failures raise ``CronBackendError``.
+    Any non-zero gateway exit (including a benign "not found" on an already-reaped
+    ``deleteAfterRun`` cron) surfaces as ``CronBackendError``. Callers that want to
+    tolerate a not-found wrap this in ``nag_commands._safe_delete``, which swallows
+    ``CronBackendError`` -- that is where the best-effort policy lives, so this
+    primitive stays simple and honest about what it does.
     """
     _run(["cron", "delete", cron_id])
 
@@ -85,7 +87,10 @@ def _parse_cron_id(stdout: str) -> str:
         payload = json.loads(stdout)
     except json.JSONDecodeError as exc:
         raise CronBackendError("gateway returned a non-JSON cron response.") from exc
-    cron_id = payload.get("id") or (payload.get("cron") or {}).get("id")
+    if not isinstance(payload, dict):
+        raise CronBackendError("gateway cron response was not a JSON object.")
+    nested = payload.get("cron")
+    cron_id = payload.get("id") or (nested.get("id") if isinstance(nested, dict) else None)
     if not cron_id:
         raise CronBackendError("gateway cron response had no id.")
     return str(cron_id)

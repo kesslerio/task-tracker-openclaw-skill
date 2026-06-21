@@ -63,6 +63,33 @@ def test_create_cron_rejects_response_with_no_id(monkeypatch):
         cron_backend.create_cron({"name": "x"})
 
 
+@pytest.mark.parametrize("stdout", [
+    '{"cron": "created"}',   # non-dict 'cron' must not AttributeError
+    '"a string payload"',    # non-object JSON
+    'not json at all',       # invalid JSON
+])
+def test_parse_cron_id_malformed_response_raises_cron_backend_error(monkeypatch, stdout):
+    monkeypatch.setattr(cron_backend, "gateway_available", lambda: True)
+
+    class _Result:
+        pass
+
+    _Result.stdout = stdout
+    monkeypatch.setattr(cron_backend, "_run", lambda *a, **k: _Result())
+    with pytest.raises(cron_backend.CronBackendError):
+        cron_backend.create_cron({"name": "x"})
+
+
+def test_create_cron_parses_nested_cron_id(monkeypatch):
+    monkeypatch.setattr(cron_backend, "gateway_available", lambda: True)
+
+    class _Result:
+        stdout = '{"cron": {"id": "cron_nested"}}'
+
+    monkeypatch.setattr(cron_backend, "_run", lambda *a, **k: _Result())
+    assert cron_backend.create_cron({"name": "x"}) == "cron_nested"
+
+
 def test_body_double_reports_failure_when_backend_errors(env):
     """The default production path: if the gateway cron create fails, the body-
     double is NOT reported as started and no session is recorded."""

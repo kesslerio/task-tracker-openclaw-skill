@@ -233,12 +233,21 @@ def add_body_double_session(
     state: dict[str, Any],
     task_id: str,
     session: dict[str, Any],
-) -> dict[str, Any]:
-    """Append a body-double session record to the task's entry (creating one if
-    the task has no nag loop yet -- a body-double is independent of an open nag)."""
+) -> dict[str, Any] | None:
+    """Append a body-double session IFF no other session is active (one-per-task).
+
+    Re-validates the no-active-session invariant UNDER the caller's lock (the
+    early pre-check in the handler is outside the lock and is only fast feedback):
+    if another concurrent ``/body-double`` slipped a session in first, this returns
+    ``None`` and appends nothing, so the caller can roll back its just-created
+    crons. On success it returns the entry. A body-double is independent of an open
+    nag loop, so the entry is created if the task has none yet.
+    """
+    entry = state.get(task_id)
+    if active_body_double_session(entry) is not None:
+        return None
     entry = state.setdefault(task_id, default_nag_entry(new_nag_loop_id()))
-    sessions = entry.setdefault("body_double_sessions", [])
-    sessions.append(session)
+    entry.setdefault("body_double_sessions", []).append(session)
     return entry
 
 
