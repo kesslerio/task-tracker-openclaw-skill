@@ -297,7 +297,15 @@ def debrief_reprompt_due(entry: dict[str, Any], *, now: datetime, interval_minut
         last_dt = datetime.fromisoformat(str(last))
     except ValueError:
         return True
-    return (now - last_dt) >= timedelta(minutes=interval_minutes)
+    # A hand-edited NAIVE timestamp would raise TypeError when subtracted from the
+    # tz-aware ``now``; normalise it to ``now``'s tzinfo so the pacing check never
+    # crashes (degrade to "due" only on a truly unusable value).
+    if last_dt.tzinfo is None and now.tzinfo is not None:
+        last_dt = last_dt.replace(tzinfo=now.tzinfo)
+    try:
+        return (now - last_dt) >= timedelta(minutes=interval_minutes)
+    except TypeError:
+        return True
 
 
 def mark_debrief_reprompted(entry: dict[str, Any], *, now: datetime) -> None:

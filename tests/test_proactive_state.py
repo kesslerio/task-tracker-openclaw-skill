@@ -113,6 +113,19 @@ def test_open_debrief_missing_event_returns_none(state_dir):
     assert proactive_state.open_debrief(state, "no_such_event") is None
 
 
+def test_debrief_reprompt_due_tolerates_naive_timestamp(state_dir):
+    """autoreview P3: a hand-edited NAIVE last-reprompt timestamp must not raise
+    TypeError against the tz-aware now -- it degrades gracefully."""
+    from datetime import datetime, timezone
+    now = datetime(2026, 6, 20, 12, 0, tzinfo=timezone.utc)
+    # naive timestamp 30 min ago -> within the 120-min interval -> NOT due, no crash
+    entry = {"debrief_last_reprompt_at": "2026-06-20T11:30:00"}  # no tzinfo
+    assert proactive_state.debrief_reprompt_due(entry, now=now, interval_minutes=120) is False
+    # naive timestamp 3h ago -> past interval -> due
+    entry2 = {"debrief_last_reprompt_at": "2026-06-20T09:00:00"}
+    assert proactive_state.debrief_reprompt_due(entry2, now=now, interval_minutes=120) is True
+
+
 def test_transition_serializes_no_lost_update(state_dir):
     """The locked transition does read-modify-write under flock, so two sequential
     transitions accumulate -- the second never clobbers the first's update (the

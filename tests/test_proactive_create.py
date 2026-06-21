@@ -292,6 +292,26 @@ def test_create_block_is_gated_in_autonomy_log(harness):
     assert acts[0]["pre_action_snapshot"]["task_id"] == "tsk_rel"
 
 
+def test_create_audit_failure_does_not_orphan_block(harness, monkeypatch):
+    """autoreview P3: a ledger/audit I/O failure AFTER a successful gog write must
+    not abort the transition and discard the block append -- the event stays tracked."""
+    _seed_focus_calendar()
+    _seed_priorities([{"task_id": "tsk_rel", "title": "Finalize", "estimate_minutes": 60}])
+    runner = _create_runner(_ext_free([]))
+
+    # the gate write succeeds, but the ledger append raises OSError
+    def boom(*_a, **_k):
+        raise OSError("ledger unwritable")
+
+    monkeypatch.setattr(proactive_brief, "_log", boom)
+    counts = proactive_brief.run_create_blocks(now=NOW, tz_offset_hours=0, day_start_hour=9,
+                                               send=lambda t, x: None, runner=runner)
+    assert counts["created"] == 1
+    # the block is still tracked despite the audit failure -- the event is not orphaned
+    reloaded = focus_calendar.load_focus_calendar()
+    assert focus_calendar.block_for_task(reloaded, "tsk_rel") is not None
+
+
 def test_create_refused_logs_no_phantom_executed_act(harness):
     """autoreview P3: a freebusy refusal must NOT leave an executed calendar_block_created
     act in the autonomy log (the gate is recorded only after a real write)."""

@@ -247,8 +247,18 @@ def create_focus_block(
             f"Focus-block create for {task_id} failed at the calendar tool. No block written.",
             reason="create_failed",
         )
+    event_id = data.get("id") or data.get("event_id")
+    if not event_id:
+        # A create that returns no id leaves a block we can never slide or delete --
+        # reversibility is broken. Treat it as a failure rather than storing a
+        # null-id block.
+        raise OverbookError(
+            f"Focus-block create for {task_id} returned no event id; refusing to "
+            "store an un-reversible block.",
+            reason="no_event_id",
+        )
     return {
-        "event_id": data.get("id") or data.get("event_id"),
+        "event_id": event_id,
         "start": start,
         "end": end,
         "request": {"calendar_id": calendar_id, "task_id": task_id, "start": start, "end": end},

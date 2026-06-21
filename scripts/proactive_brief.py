@@ -206,10 +206,14 @@ def parse_commitments(notes: str) -> list[dict[str, str]]:
     Each spec is ``{"title", "due"}`` (``due`` may be empty). This is a pure parser
     so the debrief capture is testable without a board write; the caller turns each
     spec into a task and logs ``commitment_task_created``.
+
+    Splits on newlines and on a sentence boundary (a period FOLLOWED BY whitespace),
+    NOT on every ``.`` -- so a date (``2026-06-30``) or an abbreviation (``Inc.``) is
+    not chopped mid-title. A trailing sentence period is then stripped.
     """
     commitments: list[dict[str, str]] = []
-    for chunk in re.split(r"[.\n]", notes):
-        chunk = chunk.strip()
+    for chunk in re.split(r"\n|(?<=\.)\s+", notes):
+        chunk = chunk.strip().rstrip(".").strip()
         if not chunk:
             continue
         if not re.search(r"\bwill\b", chunk, re.IGNORECASE):
@@ -352,6 +356,24 @@ def _gate_calendar_write(act_type: str, task_id: str, snapshot: dict[str, Any]) 
     """
     return autonomy_gate.gate(act_type, task_id=task_id, unit="U6",
                               snapshot_provider=lambda: snapshot)
+
+
+def _record_calendar_write_audit(act_type: str, task_id: str, snapshot: dict[str, Any],
+                                 ledger_event: str, **ledger_meta: Any) -> None:
+    """Best-effort audit (autonomy gate + ledger) for a SUCCESSFUL calendar write.
+
+    Called AFTER the block has been appended to the locked ``cal_state`` and the gog
+    write has succeeded, so the block is already tracked when this runs. Any failure
+    here (a transient ledger/audit-log I/O error) is swallowed: it must NOT abort the
+    enclosing ``focus_calendar.transition`` and discard the block append, which would
+    orphan a real calendar event with no record. The audit is a breadcrumb; the
+    tracked block is the source of truth for reversibility.
+    """
+    try:
+        _gate_calendar_write(act_type, task_id, snapshot)
+        _log(ledger_event, task_id=task_id, **ledger_meta)
+    except OSError:
+        pass
 
 
 def _push(act_type: str, text: str, *, surface: str, send: Send | None,
@@ -545,17 +567,21 @@ def _recover_one_block(cal_state: dict[str, Any], block: dict[str, Any], calenda
                                       {"reason": reason})
         _log("calendar_block_refused", task_id=task_id, reason=reason, event_id=block.get("event_id"))
         return {"status": "refused"}
-    # Record the executed move in the autonomy audit with the OLD window as the undo
-    # substrate (move it back) and the event_id, now that the write has happened.
-    _gate_calendar_write("calendar_block_moved", task_id,
-                         {"calendar_id": calendar_id, "event_id": block["event_id"],
-                          "old_start": block.get("start"), "old_end": block.get("end")})
+    # The move succeeded: UPDATE the tracked block's window FIRST (its event_id is
+    # unchanged) so state matches the calendar, THEN record the audit best-effort
+    # with the OLD window as the undo substrate (move it back). A logging failure
+    # must not abort the transition and revert the tracked window.
+    old_start, old_end = block.get("start"), block.get("end")
     block["start"], block["end"] = moved["start"], moved["end"]
     block["slip_count"] = (block.get("slip_count") or 0) + 1
     block["last_slipped_at"] = ref.isoformat()
     focus_calendar.record_dry_run(cal_state, "calendar.update", moved["request"], moved)
-    _log("calendar_block_moved", task_id=task_id, event_id=block["event_id"],
-         new_start=moved["start"], new_end=moved["end"])
+    _record_calendar_write_audit(
+        "calendar_block_moved", task_id,
+        {"calendar_id": calendar_id, "event_id": block["event_id"],
+         "old_start": old_start, "old_end": old_end},
+        "calendar_block_moved", event_id=block["event_id"],
+        new_start=moved["start"], new_end=moved["end"])
     return {"status": "moved", "new_start": moved["start"], "new_end": moved["end"]}
 
 
@@ -691,19 +717,21 @@ def _place_one_block(cal_state, calendar_id, task_id, title, start_iso, end_iso,
                                       {"task_id": task_id, "start": start_iso}, {"reason": exc.reason})
         _log("calendar_block_refused", task_id=task_id, reason=exc.reason)
         return "refused"
-    # Record the executed create in the autonomy audit with the event_id (the undo
-    # substrate is a delete of THIS event), now that the write has happened.
-    _gate_calendar_write("calendar_block_created", task_id,
-                         {"calendar_id": calendar_id, "task_id": task_id,
-                          "event_id": block["event_id"], "start": block["start"], "end": block["end"]})
+    # The write succeeded: TRACK the block in the locked state FIRST so the event is
+    # never orphaned, THEN record the audit best-effort (a logging failure must not
+    # abort the transition and discard this append).
     cal_state.setdefault("active_blocks", []).append({
         "event_id": block["event_id"], "task_id": task_id, "task_title": title,
         "start": block["start"], "end": block["end"], "created_at": ref.isoformat(),
         "slip_count": 0, "last_slipped_at": None,
     })
     focus_calendar.record_dry_run(cal_state, "calendar.create", block["request"], block)
-    _log("calendar_block_created", task_id=task_id, event_id=block["event_id"],
-         start=block["start"], end=block["end"])
+    _record_calendar_write_audit(
+        "calendar_block_created", task_id,
+        {"calendar_id": calendar_id, "task_id": task_id, "event_id": block["event_id"],
+         "start": block["start"], "end": block["end"]},
+        "calendar_block_created", event_id=block["event_id"],
+        start=block["start"], end=block["end"])
     return "created"
 
 

@@ -126,6 +126,20 @@ def test_no_freebusy_calendars_treated_as_busy():
 
 # --- Happy path: free slot creates the block (REVERSIBILITY: id stored) -----
 
+def test_create_with_no_event_id_refuses():
+    """autoreview P3: a create response missing an id must NOT store an un-reversible
+    block -- it is treated as a failure (OverbookError reason=no_event_id)."""
+    runner = RecordingRunner({
+        "calendar.freebusy": _freebusy_json([]),
+        "calendar.create": '{"summary": "x"}',  # no id / event_id
+    })
+    with pytest.raises(calendar_blocks.OverbookError) as exc:
+        calendar_blocks.create_focus_block(
+            FOCUS_CAL, "tsk_abc", "Draft", BLOCK_START, BLOCK_END,
+            freebusy_calendar_ids=[FOCUS_CAL], runner=runner)
+    assert exc.value.reason == "no_event_id"
+
+
 def test_create_on_free_slot_succeeds():
     runner = RecordingRunner({
         "calendar.freebusy": _freebusy_json([

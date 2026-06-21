@@ -222,6 +222,18 @@ def test_parse_commitments_extracts_title_and_due():
     ]
 
 
+def test_parse_commitments_splits_on_sentence_not_every_period(harness):
+    """autoreview P3: splitting on a sentence boundary (period + space), not every
+    '.', keeps dates and abbreviations intact in the title."""
+    # newline-separated and sentence-separated both work; the date is preserved
+    out = proactive_brief.parse_commitments(
+        "I will ship v1.2 by 2026-06-30\nMartin will sign off by 2026-07-02.")
+    assert out == [
+        {"title": "I will ship v1.2", "due": "2026-06-30"},
+        {"title": "Martin will sign off", "due": "2026-07-02"},
+    ]
+
+
 def test_debrief_capture_creates_tasks_and_closes_loop(harness):
     board, state = harness
     # Seed an open debrief loop for an event.
