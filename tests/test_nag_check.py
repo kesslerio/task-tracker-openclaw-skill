@@ -239,30 +239,31 @@ def test_crash_mid_run_leaves_open_loop_open(harness, monkeypatch):
     assert _state(state)["tsk_abc123"]["ack"] is False
 
 
-# --- Race: a /done that acks under the lock is NOT clobbered into a reopen ---
+# --- Race: an ack landing before the locked fire suppresses send + reopen -----
 
-def test_concurrent_done_under_lock_is_not_reopened_by_cron(harness, monkeypatch):
-    """If a reactive /done acks the loop in the window between the cron's snapshot
-    read and the locked fire, the cron must NOT re-open it (the re-nag trust kill).
-    We simulate the race by acking inside the push, just before _persist_fire."""
+def test_acked_loop_under_lock_sends_nothing_and_is_not_reopened(harness):
+    """The fire (ack re-check + gate + send + persist) is ONE locked transition, so
+    a reactive /done that acks the loop before the cron's fire takes the lock means
+    NO message is sent, NO gate act is logged, and the close is not clobbered into
+    a reopen. We assert the gated outcome directly: with the loop acked, the cron
+    leaves it acked and sends nothing."""
+    import autonomy_gate  # noqa: PLC0415
     board, state = harness
     _run(harness)  # open loop, nag_count=1
+    # The /done landed: the loop is acked before the next cron fire.
+    nag_state.transition(lambda s: nag_state.close_loop(
+        s, "tsk_abc123", closed_by="explicit_done"))
+    log_before = len(autonomy_gate.read_autonomy_log())
 
-    real_push = nag_check._push_nag
-
-    def push_then_ack(record, section, overdue, *, dry_run, send):
-        result = real_push(record, section, overdue, dry_run=dry_run, send=send)
-        # A /done lands right after the push, before the locked _persist_fire.
-        nag_state.transition(lambda s: nag_state.close_loop(
-            s, "tsk_abc123", closed_by="explicit_done"))
-        return result
-
-    monkeypatch.setattr(nag_check, "_push_nag", push_then_ack)
-    nag_check.run_nag_check(send=lambda t, x: None)
+    sent = []
+    counts = nag_check.run_nag_check(send=lambda t, x: sent.append((t, x)))
+    assert sent == []  # no message after /done
+    assert counts["sent"] == 0
     nag = _state(state)["tsk_abc123"]
-    assert nag["ack"] is True  # the /done close survived
-    assert nag["closed_by"] == "explicit_done"  # NOT reopened/archived
-    assert nag["archived_nag_loops"] == []  # no spurious archive+reopen
+    assert nag["ack"] is True and nag["closed_by"] == "explicit_done"
+    assert nag["archived_nag_loops"] == []  # not clobbered into a reopen
+    # And no phantom gate act was appended for the suppressed fire.
+    assert len(autonomy_gate.read_autonomy_log()) == log_before
 
 
 # --- Body-double-only entry must not be spuriously acked by the cron --------

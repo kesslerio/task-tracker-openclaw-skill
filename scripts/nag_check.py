@@ -198,83 +198,88 @@ def run_nag_check(*, dry_run: bool = False,
             _close(task_id, nag_state.CLOSED_RESCHEDULED, entry)
             counts["closed"] += 1
 
-    # 2. Open / re-fire loops for tasks that crossed their threshold. Re-read state
-    #    once AFTER the step-1 closes; each task is unique in `active`, so a single
-    #    snapshot is enough to decide ack/snooze (the per-task fire writes under its
-    #    own lock and never re-reads this task in the same pass).
-    post_close_state = nag_state.read_state()
+    # 2. Open / re-fire loops for tasks that crossed their threshold.
     for task_id, record in active.items():
         crossed = _crossed(record, ref=ref)
         if crossed is None:
             continue
         section, overdue = crossed
-        entry = post_close_state.get(task_id)
-
-        # ack:true is terminal for the current loop -- do NOT reactivate it in the
-        # background. A re-nag is a deliberate NEW loop; an open, acked entry stays
-        # acked, and a snoozed loop is paused until its window passes.
-        if isinstance(entry, dict) and entry.get("ack"):
-            continue
-        if nag_state.is_snoozed(entry, now=ref):
-            continue
-
-        outcome = _push_nag(record, section, overdue, dry_run=dry_run, send=send)
-        if not outcome["sent"] and outcome.get("reason") != "dry_run":
-            # Delivery blocked: leave the loop OPEN (env_missing never clears). A
-            # real run logs nag_delivery_blocked; a dry-run only counts it (no
-            # append-only write).
-            if not dry_run:
-                _log("nag_delivery_blocked", task_id=task_id,
-                     reason=outcome["reason"], section=section)
-            counts["blocked"] += 1
-            continue
-
-        if dry_run:
-            counts["open"] += 1
-            continue
-        _persist_fire(task_id, record, section, overdue, outcome, counts, ref=ref)
+        _fire_one(task_id, record, section, overdue, counts,
+                  ref=ref, dry_run=dry_run, send=send)
 
     return counts
 
 
-def _persist_fire(task_id, record, section, overdue, outcome, counts, *,
-                  ref: datetime) -> None:
-    """Persist an opened/re-fired loop under one lock + emit the ledger events.
+def _fire_one(task_id, record, section, overdue, counts, *,
+              ref: datetime, dry_run: bool,
+              send: Callable[[dict[str, Any], str], Any] | None) -> None:
+    """Fire (or skip) ONE task's nag, deciding ack/snooze UNDER the lock.
 
-    The ack/snooze guard in step 2 is read from a snapshot OUTSIDE the lock; a
-    reactive ``/done`` can ack+close the loop in the window before this fire takes
-    the lock. So the mutator RE-CHECKS ack/snooze INSIDE the lock and skips the
-    open/record entirely if the loop was acked or snoozed since the snapshot -- the
-    cron never re-opens an acked loop (that would be the 'said /done, got nagged
-    again' trust kill). The push may already have gone out (a single low-stakes
-    message), but the state is not clobbered.
+    The whole decision -- re-check ack/snooze, prove+gate, send, persist -- happens
+    inside ONE locked transition so a reactive ``/done`` that acks the loop can
+    never be raced: if the loop is acked/snoozed when the lock is held, NO message
+    is sent, NO gate act is logged, and state is untouched (closing the 'said
+    /done, got nagged again' trust window AND the phantom-gate-act audit hole).
 
-    The mutator returns ``(entry, opened)`` so the ledger logging reads the exact
-    persisted entry without a second disk read, and ``nag_opened`` is keyed on the
-    REAL "was a fresh loop created" decision.
+    A dry-run takes no lock and never gates/sends -- it only previews.
     """
-    def mutate(live: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
-        current = live.get(task_id)
-        if (isinstance(current, dict) and current.get("ack")) or \
-                nag_state.is_snoozed(current, now=ref):
-            return None, False  # raced with a close/snooze -- do not clobber it
-        opened = not nag_state.is_open(current)
-        if opened:
-            nag_state.open_loop(
-                live, task_id, task_title=record.title,
-                threshold_crossed=overdue, threshold_type=section,
-                delivery_target=outcome["delivery_target"],
-            )
-        entry = nag_state.record_sent(live, task_id)
-        return entry, opened
+    if dry_run:
+        outcome = _push_nag(record, section, overdue, dry_run=True, send=send)
+        if outcome["sent"] is False and outcome["reason"] == "dry_run":
+            counts["open"] += 1
+        else:
+            counts["blocked"] += 1
+        return
 
-    entry, opened = nag_state.transition(mutate)
-    if entry is None:
-        return  # the loop was closed/snoozed under the lock; nothing recorded
-    target = outcome["delivery_target"]
+    result = nag_state.transition(
+        lambda live: _fire_locked(live, task_id, record, section, overdue,
+                                  ref=ref, send=send))
+    _apply_fire_result(result, task_id, section, counts)
+
+
+def _fire_locked(live, task_id, record, section, overdue, *, ref, send):
+    """The under-lock fire decision for ONE task (runs inside nag_state.transition).
+
+    Returns a small result dict the caller turns into ledger events + counts. The
+    gate+send happen here, AFTER the ack/snooze re-check, so a raced-out fire never
+    sends a message or logs a gate act.
+    """
+    current = live.get(task_id)
+    if (isinstance(current, dict) and current.get("ack")) or \
+            nag_state.is_snoozed(current, now=ref):
+        return {"status": "skipped"}  # raced with a close/snooze -- do nothing
+
+    outcome = _push_nag(record, section, overdue, dry_run=False, send=send)
+    if not outcome["sent"]:
+        return {"status": "blocked", "reason": outcome["reason"]}
+
+    opened = not nag_state.is_open(current)
     if opened:
+        nag_state.open_loop(
+            live, task_id, task_title=record.title,
+            threshold_crossed=overdue, threshold_type=section,
+            delivery_target=outcome["delivery_target"],
+        )
+    entry = nag_state.record_sent(live, task_id)
+    return {"status": "sent", "entry": entry, "opened": opened,
+            "delivery_target": outcome["delivery_target"], "overdue": overdue}
+
+
+def _apply_fire_result(result, task_id, section, counts) -> None:
+    """Translate the under-lock fire result into ledger events + counters."""
+    status = result["status"]
+    if status == "skipped":
+        return
+    if status == "blocked":
+        _log("nag_delivery_blocked", task_id=task_id, reason=result["reason"],
+             section=section)
+        counts["blocked"] += 1
+        return
+    entry, target = result["entry"], result["delivery_target"]
+    if result["opened"]:
         _log("nag_opened", task_id=task_id, nag_loop_id=entry.get("nag_loop_id"),
-             overdue_days=overdue, threshold_type=section, delivery_target=target)
+             overdue_days=result["overdue"], threshold_type=section,
+             delivery_target=target)
         counts["open"] += 1
     _log("nag_sent", task_id=task_id, nag_loop_id=entry.get("nag_loop_id"),
          nag_count=entry.get("nag_count"), delivery_target=target)
