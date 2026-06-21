@@ -139,6 +139,30 @@ def test_create_blocks_idempotent_per_task(harness):
     assert not any(c[1:3] == ["calendar", "create"] for c in runner2.calls)
 
 
+def test_create_blocks_places_again_on_a_new_day(harness):
+    """autoreview: a task that stays a priority gets a fresh block each day -- a
+    PRIOR day's block must not suppress today's (date-scoped idempotency + prune)."""
+    state = focus_calendar.load_focus_calendar()
+    state["agent_calendar_id"] = "focus-cal"
+    # a block for tsk_rel placed YESTERDAY (relative to the test's local day)
+    state["active_blocks"] = [{
+        "event_id": "evt_yesterday", "task_id": "tsk_rel",
+        "start": "2026-06-19T09:00:00+00:00", "end": "2026-06-19T11:00:00+00:00",
+    }]
+    focus_calendar.save_focus_calendar(state)
+    _seed_priorities([{"task_id": "tsk_rel", "title": "Finalize", "estimate_minutes": 120}])
+    runner = _create_runner(_ext_free([]))
+    # NOW is 2026-06-20 07:00 UTC; with tz_offset 0 the local day is 06-20
+    counts = proactive_brief.run_create_blocks(now=NOW, tz_offset_hours=0, day_start_hour=9,
+                                               send=lambda t, x: None, runner=runner)
+    assert counts["created"] == 1  # a NEW block is placed today
+    reloaded = focus_calendar.load_focus_calendar()
+    # yesterday's block was pruned; today's remains
+    starts = sorted(b["start"][:10] for b in reloaded["active_blocks"])
+    assert "2026-06-19" not in starts
+    assert "2026-06-20" in starts
+
+
 def test_create_blocks_no_focus_calendar_degrades(harness):
     board, state = harness
     # no focus calendar seeded

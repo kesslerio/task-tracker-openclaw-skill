@@ -517,13 +517,14 @@ def _next_window(block: dict[str, Any], *, ref: datetime) -> tuple[str, str]:
 def _recover_one_block(cal_state: dict[str, Any], block: dict[str, Any], calendar_id: str,
                        fb_ids: list[str], *, ref: datetime,
                        runner: calendar_blocks.Runner | None) -> dict[str, Any]:
-    """Move ONE slipped block via UPDATE, persisting + logging the outcome.
+    """Move ONE slipped block via UPDATE, mutating the LOCKED state + logging.
 
     Returns ``{"status": "moved", "new_start", "new_end"}`` or ``{"status":
-    "refused"}``. The move is a ``gog calendar update`` so the block keeps its id
-    (reversible); an overlap/unknown freebusy or a non-agent event refuses the move
-    (block left in place, ``calendar_block_refused`` logged) -- NEVER-OVERBOOK-EXTERNAL
-    holds even during recovery.
+    "refused"}``. Mutates ``cal_state`` in place; the surrounding
+    ``focus_calendar.transition`` persists once on exit. The move is a ``gog calendar
+    update`` so the block keeps its id (reversible); an overlap/unknown freebusy or a
+    non-agent event refuses the move (block left in place, ``calendar_block_refused``
+    logged) -- NEVER-OVERBOOK-EXTERNAL holds even during recovery.
     """
     task_id = block.get("task_id")
     new_start, new_end = _next_window(block, ref=ref)
@@ -546,22 +547,15 @@ def _recover_one_block(cal_state: dict[str, Any], block: dict[str, Any], calenda
         focus_calendar.record_dry_run(cal_state, "calendar.move_refused",
                                       {"event_id": block.get("event_id"), "task_id": task_id},
                                       {"reason": reason})
-        focus_calendar.save_focus_calendar(cal_state)
         _log("calendar_block_refused", task_id=task_id, reason=reason, event_id=block.get("event_id"))
         return {"status": "refused"}
     block["start"], block["end"] = moved["start"], moved["end"]
     block["slip_count"] = (block.get("slip_count") or 0) + 1
     block["last_slipped_at"] = ref.isoformat()
     focus_calendar.record_dry_run(cal_state, "calendar.update", moved["request"], moved)
-    focus_calendar.save_focus_calendar(cal_state)
     _log("calendar_block_moved", task_id=task_id, event_id=block["event_id"],
          new_start=moved["start"], new_end=moved["end"])
     return {"status": "moved", "new_start": moved["start"], "new_end": moved["end"]}
-
-
-def _block_already_placed(cal_state: dict[str, Any], task_id: str) -> bool:
-    """True if an active focus block already exists for ``task_id`` (idempotency)."""
-    return focus_calendar.block_for_task(cal_state, task_id) is not None
 
 
 def _local_day_start(ref: datetime, *, day_start_hour: int, tz_offset_hours: int) -> datetime:
@@ -602,33 +596,42 @@ def run_create_blocks(*, now: datetime | None = None, dry_run: bool = False,
     ref = now or _now()
     start_hour = day_start_hour if day_start_hour is not None else cos_config.focus_block_day_start_hour()
     offset = tz_offset_hours if tz_offset_hours is not None else cos_config.focus_tz_offset_hours()
+    today_local = _local_day_start(ref, day_start_hour=start_hour, tz_offset_hours=offset).date().isoformat()
     counts = {"created": 0, "refused": 0, "skipped": 0}
-    cal_state = focus_calendar.load_focus_calendar()
-    calendar_id = cal_state.get("agent_calendar_id")
-    if not calendar_id:
+    if not focus_calendar.load_focus_calendar().get("agent_calendar_id"):
         return counts  # no focus calendar configured -- degrade silently
     priorities = (focus_state.load_focus_state() or {}).get("daily_priorities") or []
     fb_ids = calendar_blocks.external_calendar_ids()
-    cursor = _local_day_start(ref, day_start_hour=start_hour, tz_offset_hours=offset)
     created_titles: list[str] = []
 
-    for row in priorities:
-        task_id = row.get("task_id")
-        if not task_id or _block_already_placed(cal_state, task_id):
-            counts["skipped"] += 1
-            continue
-        minutes = int(row.get("estimate_minutes") or 60)
-        start_iso = cursor.isoformat()
-        end_iso = (cursor + timedelta(minutes=minutes)).isoformat()
-        cursor = cursor + timedelta(minutes=minutes)
-        if dry_run:
-            counts["created"] += 1
-            continue
-        outcome = _place_one_block(cal_state, calendar_id, task_id, row.get("title") or "",
-                                   start_iso, end_iso, fb_ids, ref=ref, runner=runner)
-        counts[outcome] += 1
-        if outcome == "created":
-            created_titles.append(row.get("title") or task_id)
+    def _create_under_lock(cal_state: dict[str, Any]) -> None:
+        calendar_id = cal_state.get("agent_calendar_id")
+        # Prune past-day blocks so active_blocks does not grow unbounded and a stale
+        # block never suppresses today's placement.
+        focus_calendar.prune_blocks_before(cal_state, today_local)
+        cursor = _local_day_start(ref, day_start_hour=start_hour, tz_offset_hours=offset)
+        for row in priorities:
+            task_id = row.get("task_id")
+            # Date-scoped idempotency: only a block placed TODAY suppresses a re-place.
+            if not task_id or focus_calendar.block_for_task_on_date(cal_state, task_id, today_local):
+                counts["skipped"] += 1
+                continue
+            minutes = int(row.get("estimate_minutes") or 60)
+            start_iso, end_iso = cursor.isoformat(), (cursor + timedelta(minutes=minutes)).isoformat()
+            cursor = cursor + timedelta(minutes=minutes)
+            if dry_run:
+                counts["created"] += 1
+                continue
+            outcome = _place_one_block(cal_state, calendar_id, task_id, row.get("title") or "",
+                                       start_iso, end_iso, fb_ids, ref=ref, runner=runner)
+            counts[outcome] += 1
+            if outcome == "created":
+                created_titles.append(row.get("title") or task_id)
+
+    if dry_run:
+        _create_under_lock(focus_calendar.load_focus_calendar())  # no lock/persist on dry-run
+    else:
+        focus_calendar.transition(_create_under_lock)
 
     if created_titles and not dry_run:
         notice = "🗓️ Created focus blocks: " + ", ".join(f'"{t}"' for t in created_titles)
@@ -638,7 +641,11 @@ def run_create_blocks(*, now: datetime | None = None, dry_run: bool = False,
 
 def _place_one_block(cal_state, calendar_id, task_id, title, start_iso, end_iso, fb_ids,
                      *, ref: datetime, runner) -> str:
-    """Create ONE freebusy-gated focus block, persisting + logging. -> created|refused."""
+    """Create ONE freebusy-gated focus block, mutating the LOCKED state. -> created|refused.
+
+    Mutates ``cal_state`` in place; the surrounding ``focus_calendar.transition``
+    persists once on exit (this helper never writes the file itself).
+    """
     # Gate the autonomous calendar write through the autonomy ladder BEFORE the gog
     # call: a blocked rung (e.g. a corrupt config that floors the act) refuses the
     # write. The snapshot is the reversal substrate (calendar + window), not a board
@@ -657,7 +664,6 @@ def _place_one_block(cal_state, calendar_id, task_id, title, start_iso, end_iso,
     except calendar_blocks.OverbookError as exc:
         focus_calendar.record_dry_run(cal_state, "calendar.create_refused",
                                       {"task_id": task_id, "start": start_iso}, {"reason": exc.reason})
-        focus_calendar.save_focus_calendar(cal_state)
         _log("calendar_block_refused", task_id=task_id, reason=exc.reason)
         return "refused"
     cal_state.setdefault("active_blocks", []).append({
@@ -666,7 +672,6 @@ def _place_one_block(cal_state, calendar_id, task_id, title, start_iso, end_iso,
         "slip_count": 0, "last_slipped_at": None,
     })
     focus_calendar.record_dry_run(cal_state, "calendar.create", block["request"], block)
-    focus_calendar.save_focus_calendar(cal_state)
     _log("calendar_block_created", task_id=task_id, event_id=block["event_id"],
          start=block["start"], end=block["end"])
     return "created"
@@ -677,18 +682,17 @@ def run_slip_recovery(*, now: datetime | None = None, dry_run: bool = False,
                       runner: calendar_blocks.Runner | None = None) -> dict[str, int]:
     """Slide every slipped agent-owned focus block to the next free window + notify.
 
-    Recovery is a ``gog calendar update`` (NEVER delete+create). After a successful
-    move it pushes a slip notice through the proven delivery seam (prove FIRST, then
-    gate + assert), so the user is told their focus block was rescheduled rather
-    than having it silently moved out from under them. Degrades silently when no
-    focus calendar is configured. A dry-run counts the slipped blocks without
+    Recovery is a ``gog calendar update`` (NEVER delete+create). The moves run UNDER
+    the focus-calendar lock so an overlapping create/slip run cannot lose the update.
+    After the lock releases, a slip notice for each moved block is pushed through the
+    proven delivery seam, so the user is told their focus block was rescheduled
+    rather than having it silently moved out from under them. Degrades silently when
+    no focus calendar is configured. A dry-run counts the slipped blocks without
     touching the calendar or sending.
     """
     ref = now or _now()
     counts = {"moved": 0, "refused": 0, "notified": 0}
-    cal_state = focus_calendar.load_focus_calendar()
-    calendar_id = cal_state.get("agent_calendar_id")
-    if not calendar_id:
+    if not focus_calendar.load_focus_calendar().get("agent_calendar_id"):
         return counts  # no focus calendar configured -- degrade silently
     active_ids = {r.canonical_id for r in _load_active() if r.canonical_id}
     # Freebusy-check the slid window against EXTERNAL (human) calendars only -- the
@@ -696,21 +700,34 @@ def run_slip_recovery(*, now: datetime | None = None, dry_run: bool = False,
     # FreeBusy cannot exclude per-event, so including the focus calendar would
     # always self-overlap and refuse the move.
     fb_ids = calendar_blocks.external_calendar_ids()
+    notices: list[tuple[str, str | None]] = []  # (text, task_id) collected under the lock
 
-    for block in list(cal_state.get("active_blocks", [])):
-        if not _block_has_slipped(block, ref=ref, active_ids=active_ids):
-            continue
-        if dry_run:
+    def _slip_under_lock(cal_state: dict[str, Any]) -> None:
+        calendar_id = cal_state.get("agent_calendar_id")
+        for block in list(cal_state.get("active_blocks", [])):
+            if not _block_has_slipped(block, ref=ref, active_ids=active_ids):
+                continue
+            if dry_run:
+                counts["moved"] += 1
+                continue
+            result = _recover_one_block(cal_state, block, calendar_id, fb_ids, ref=ref, runner=runner)
+            if result["status"] != "moved":
+                counts["refused"] += 1
+                continue
             counts["moved"] += 1
-            continue
-        result = _recover_one_block(cal_state, block, calendar_id, fb_ids, ref=ref, runner=runner)
-        if result["status"] != "moved":
-            counts["refused"] += 1
-            continue
-        counts["moved"] += 1
-        notice = slip_notice_text(block, result["new_start"], result["new_end"])
-        if _push("brief_sent", notice, surface="standup", send=send, dry_run=False,
-                 task_id=block.get("task_id"))["sent"]:
+            notices.append((slip_notice_text(block, result["new_start"], result["new_end"]),
+                            block.get("task_id")))
+
+    if dry_run:
+        _slip_under_lock(focus_calendar.load_focus_calendar())  # no lock/persist on dry-run
+    else:
+        focus_calendar.transition(_slip_under_lock)
+
+    # Push the slip notices AFTER releasing the focus-calendar lock (the push touches
+    # the autonomy log + ledger, not the focus calendar) so no lock is held across I/O.
+    for text, task_id in notices:
+        if _push("brief_sent", text, surface="standup", send=send, dry_run=False,
+                 task_id=task_id)["sent"]:
             counts["notified"] += 1
     return counts
 

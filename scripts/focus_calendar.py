@@ -22,9 +22,15 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 
 import cos_config
 from utils import _atomic_write
@@ -37,6 +43,10 @@ MAX_DRY_RUN_HISTORY = 50
 
 def focus_calendar_path() -> Path:
     return cos_config.state_dir() / "focus-calendar.json"
+
+
+def focus_calendar_lock_path() -> Path:
+    return cos_config.state_dir() / "focus-calendar.lock"
 
 
 def _now_iso() -> str:
@@ -111,6 +121,45 @@ def save_focus_calendar(state: dict[str, Any]) -> dict[str, Any]:
     return state
 
 
+@contextmanager
+def _locked_state() -> Iterator[dict[str, Any]]:
+    """Yield the focus-calendar state under an exclusive sidecar flock.
+
+    The lock is held for the WHOLE read-modify-write so overlapping create/slip cron
+    runs cannot lose each other's update via last-writer-wins ``os.replace`` and
+    desync the stored block list from the real calendar (the same guarantee
+    proactive-state.json was given). The caller mutates the yielded dict in place;
+    on a clean exit it is persisted atomically. An exception inside the block does
+    NOT write (a crash never corrupts the stored block list).
+    """
+    cos_config.state_dir()  # ensure the 0o700 dir exists before opening the lockfile
+    lock_path = focus_calendar_lock_path()
+    with lock_path.open("a", encoding="utf-8") as lock_handle:
+        try:
+            os.fchmod(lock_handle.fileno(), 0o600)
+        except OSError:
+            pass
+        if fcntl is not None:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            state = load_focus_calendar()
+            yield state
+            save_focus_calendar(state)
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
+def transition(mutator: Callable[[dict[str, Any]], Any]) -> Any:
+    """Run ``mutator(state)`` under the lock and persist the result atomically.
+
+    The single mutation primitive every focus-calendar write funnels through so
+    concurrent create/slip cron runs serialise their read-modify-write.
+    """
+    with _locked_state() as state:
+        return mutator(state)
+
+
 def record_dry_run(state: dict[str, Any], op: str, request: dict[str, Any], result: dict[str, Any]) -> None:
     """Append a dry-run payload to the in-memory state (REVERSIBILITY substrate).
 
@@ -136,3 +185,42 @@ def block_for_task(state: dict[str, Any], task_id: str) -> dict[str, Any] | None
         if block.get("task_id") == task_id:
             return block
     return None
+
+
+def _block_date(block: dict[str, Any]) -> str | None:
+    """The local date (YYYY-MM-DD) a block starts on, from its ISO ``start``."""
+    start = block.get("start")
+    if not start:
+        return None
+    try:
+        return datetime.fromisoformat(str(start).replace("Z", "+00:00")).date().isoformat()
+    except (ValueError, AttributeError):
+        return None
+
+
+def block_for_task_on_date(state: dict[str, Any], task_id: str, date_iso: str) -> dict[str, Any] | None:
+    """Return ``task_id``'s active block that STARTS on ``date_iso``, or None.
+
+    The create idempotency check is date-scoped: a block placed on a PRIOR day must
+    not suppress today's block for a task that is still a priority. Only a block
+    starting today blocks a re-placement today.
+    """
+    for block in state.get("active_blocks", []):
+        if block.get("task_id") == task_id and _block_date(block) == date_iso:
+            return block
+    return None
+
+
+def prune_blocks_before(state: dict[str, Any], date_iso: str) -> int:
+    """Drop active blocks that start STRICTLY before ``date_iso``; return the count.
+
+    Keeps ``active_blocks`` from growing unbounded: a past day's blocks are history
+    (they have already happened or been slid), not live focus blocks. A block with
+    no parseable start is kept (we cannot prove it is stale). Returns how many were
+    pruned so the caller can log it.
+    """
+    blocks = state.get("active_blocks", [])
+    kept = [b for b in blocks if (_block_date(b) is None or _block_date(b) >= date_iso)]
+    pruned = len(blocks) - len(kept)
+    state["active_blocks"] = kept
+    return pruned
