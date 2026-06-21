@@ -87,9 +87,14 @@ def load_proactive_state(reference_date: str | None = None) -> dict[str, Any]:
 
     A missing/corrupt/unreadable file yields a fresh empty state for today; a
     corrupt file is quarantined aside (forensics preserved). A state file whose
-    ``date`` is not today is also reset to a fresh empty state -- the previous
-    day's "already sent" flags must never suppress today's briefs. A torn read
-    therefore never raises and never carries stale idempotency forward.
+    ``date`` is not today is reset to a fresh empty state -- the previous day's
+    "already sent" idempotency flags must never suppress today's briefs.
+
+    The ONE thing carried across the date rollover is any OPEN debrief loop (one
+    still awaiting capture or skip): a debrief closes ONLY on capture/skip, never by
+    time (spec §5.5), so a loop opened late yesterday must not be silently dropped at
+    midnight -- it migrates into today's ``pre_briefs`` to keep being nudged. A torn
+    read never raises.
     """
     ref = today_str(reference_date)
     path = proactive_state_path()
@@ -102,10 +107,15 @@ def load_proactive_state(reference_date: str | None = None) -> dict[str, Any]:
         return _empty_state(ref)
     except OSError:
         return _empty_state(ref)
-    if not isinstance(loaded, dict) or loaded.get("date") != ref:
-        if not isinstance(loaded, dict):
-            _rename_corrupt_aside(path)
+    if not isinstance(loaded, dict):
+        _rename_corrupt_aside(path)
         return _empty_state(ref)
+    if loaded.get("date") != ref:
+        fresh = _empty_state(ref)
+        # Carry forward open debrief loops so a debrief that crossed midnight is not
+        # lost (it closes only on capture/skip, never by time).
+        fresh["pre_briefs"] = [e for e in loaded.get("pre_briefs", []) if is_debrief_open(e)]
+        return fresh
     loaded.setdefault("pre_briefs", [])
     return loaded
 

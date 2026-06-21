@@ -75,6 +75,30 @@ def test_unreadable_state_not_clobbered(state_dir, monkeypatch):
     assert path.read_text() == original  # file untouched
 
 
+def test_open_debrief_loop_carries_across_date_rollover(state_dir):
+    """autoreview P3: a debrief closes ONLY on capture/skip, never by time -- so an
+    open loop from yesterday must migrate into today's state, not be dropped at
+    midnight. A CLOSED loop is not carried."""
+    path = proactive_state.proactive_state_path()
+    path.write_text(json.dumps({
+        "schema_version": 1, "date": "2020-01-01",
+        "daily_brief_sent": True, "friday_proposal_sent": True,
+        "pre_briefs": [
+            {"event_id": "open_evt", "event_summary": "Open", "debrief_requested": True,
+             "debrief_captured_at": None, "debrief_skipped_at": None},
+            {"event_id": "closed_evt", "event_summary": "Closed", "debrief_requested": True,
+             "debrief_captured_at": "2020-01-01T12:00:00+00:00", "debrief_skipped_at": None},
+        ],
+    }), encoding="utf-8")
+    state = proactive_state.load_proactive_state()  # today
+    # idempotency flags reset for the new day
+    assert proactive_state.daily_brief_due(state) is True
+    # the OPEN loop survives; the CLOSED one does not
+    keys = [e["event_id"] for e in state["pre_briefs"]]
+    assert keys == ["open_evt"]
+    assert proactive_state.is_debrief_open(state["pre_briefs"][0]) is True
+
+
 def test_stale_date_resets(state_dir):
     """A state from a prior date never suppresses today's briefs."""
     path = proactive_state.proactive_state_path()
