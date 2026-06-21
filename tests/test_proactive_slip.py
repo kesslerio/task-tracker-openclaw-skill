@@ -105,11 +105,17 @@ def _agent_event_runner(freebusy_stdout):
 
 # --- T5: slip recovery slides via UPDATE, never delete+create ---------------
 
+def _collector():
+    sent: list = []
+    return sent, (lambda target, text: sent.append((target, text)))
+
+
 def test_t5_slip_recovery_moves_via_update(harness):
     board, state = harness
     _seed_block()
     runner = _agent_event_runner(_external_freebusy([]))  # external calendar free
-    counts = proactive_brief.run_slip_recovery(now=NOW, send=None, runner=runner)
+    sent, send = _collector()
+    counts = proactive_brief.run_slip_recovery(now=NOW, send=send, runner=runner)
     assert counts["moved"] == 1
     assert counts["refused"] == 0
     # the block kept its id and was UPDATED, not delete+created
@@ -120,6 +126,10 @@ def test_t5_slip_recovery_moves_via_update(harness):
     moved = focus_calendar.find_block(reloaded, "evt_1")
     assert moved["slip_count"] == 1
     assert "calendar_block_moved" in _types(state)
+    # a slip notice was pushed through the proven delivery seam (not silent)
+    assert counts["notified"] == 1
+    assert len(sent) == 1
+    assert sent[0][0]["topic_id"] == "2"
 
 
 def test_slip_succeeds_despite_block_own_slot_busy_on_focus_calendar(harness):
@@ -133,7 +143,8 @@ def test_slip_succeeds_despite_block_own_slot_busy_on_focus_calendar(harness):
     # The freebusy stub answers for the EXTERNAL calendar (primary) only; it is free.
     # The focus calendar is never queried, so the block's own slot cannot self-overlap.
     runner = _agent_event_runner(_external_freebusy([]))
-    counts = proactive_brief.run_slip_recovery(now=NOW, send=None, runner=runner)
+    _sent, send = _collector()
+    counts = proactive_brief.run_slip_recovery(now=NOW, send=send, runner=runner)
     assert counts["moved"] == 1
     assert counts["refused"] == 0
     # the freebusy command was issued for `primary`, NOT the focus calendar
@@ -150,9 +161,11 @@ def test_slip_into_busy_window_refused_and_block_stays(harness):
     # An EXTERNAL human meeting overlaps the proposed 13:00-15:00 window -> refuse.
     runner = _agent_event_runner(_external_freebusy(
         [{"start": "2026-06-20T13:00:00+00:00", "end": "2026-06-20T14:00:00+00:00"}]))
-    counts = proactive_brief.run_slip_recovery(now=NOW, send=None, runner=runner)
+    _sent, send = _collector()
+    counts = proactive_brief.run_slip_recovery(now=NOW, send=send, runner=runner)
     assert counts["moved"] == 0
     assert counts["refused"] == 1
+    assert counts["notified"] == 0  # no move -> no notice
     assert not any(c[1:3] == ["calendar", "update"] for c in runner.calls)  # no move
     # the block is left in place at its original time
     reloaded = focus_calendar.load_focus_calendar()
@@ -165,7 +178,8 @@ def test_slip_freebusy_unknown_refused(harness):
     board, state = harness
     _seed_block()
     runner = _agent_event_runner("not json")  # freebusy unparseable -> unknown
-    counts = proactive_brief.run_slip_recovery(now=NOW, send=None, runner=runner)
+    _sent, send = _collector()
+    counts = proactive_brief.run_slip_recovery(now=NOW, send=send, runner=runner)
     assert counts["refused"] == 1
     assert "calendar_block_refused" in _types(state)
 
@@ -176,7 +190,7 @@ def test_no_focus_calendar_degrades_silently(harness, monkeypatch):
     # focus-calendar.json has no agent_calendar_id
     runner = _agent_event_runner('{"calendars": {}}')
     counts = proactive_brief.run_slip_recovery(now=NOW, send=None, runner=runner)
-    assert counts == {"moved": 0, "refused": 0}
+    assert counts == {"moved": 0, "refused": 0, "notified": 0}
     assert runner.calls == []  # never touched gog
 
 
@@ -186,7 +200,7 @@ def test_future_block_not_slipped(harness):
     _seed_block(start="2026-06-20T15:00:00+00:00", end="2026-06-20T17:00:00+00:00")
     runner = _agent_event_runner(_external_freebusy([]))
     counts = proactive_brief.run_slip_recovery(now=NOW, send=None, runner=runner)
-    assert counts == {"moved": 0, "refused": 0}
+    assert counts == {"moved": 0, "refused": 0, "notified": 0}
     assert runner.calls == []
 
 

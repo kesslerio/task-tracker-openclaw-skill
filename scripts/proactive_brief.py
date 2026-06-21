@@ -39,6 +39,7 @@ import calendar_blocks
 import cos_config
 import error_envelope
 import focus_calendar
+import focus_state
 import proactive_delivery
 import proactive_state
 from standup_common import flatten_calendar_events, get_calendar_events
@@ -138,6 +139,15 @@ def debrief_followup_text(entry: dict[str, Any]) -> str:
     return (
         f'📝 Did you capture commitments from "{summary}"? '
         "Reply with notes (\"I will X by DATE\") or 'skip' to close."
+    )
+
+
+def slip_notice_text(block: dict[str, Any], new_start: str, new_end: str) -> str:
+    """Notice that a slipped focus block was auto-slid to a new free window."""
+    title = block.get("task_title") or block.get("task_id") or "(focus block)"
+    return (
+        f'⏱️ "{title}" focus block slipped (still open at its start). '
+        f"Moved to {new_start}–{new_end} (next free window, no conflicts)."
     )
 
 
@@ -401,13 +411,14 @@ def _next_window(block: dict[str, Any], *, ref: datetime) -> tuple[str, str]:
 
 def _recover_one_block(cal_state: dict[str, Any], block: dict[str, Any], calendar_id: str,
                        fb_ids: list[str], *, ref: datetime,
-                       runner: calendar_blocks.Runner | None) -> str:
+                       runner: calendar_blocks.Runner | None) -> dict[str, Any]:
     """Move ONE slipped block via UPDATE, persisting + logging the outcome.
 
-    Returns ``"moved"`` or ``"refused"``. The move is a ``gog calendar update`` so
-    the block keeps its id (reversible); an overlap/unknown freebusy or a
-    non-agent event refuses the move (block left in place, ``calendar_block_refused``
-    logged) -- NEVER-OVERBOOK-EXTERNAL holds even during recovery.
+    Returns ``{"status": "moved", "new_start", "new_end"}`` or ``{"status":
+    "refused"}``. The move is a ``gog calendar update`` so the block keeps its id
+    (reversible); an overlap/unknown freebusy or a non-agent event refuses the move
+    (block left in place, ``calendar_block_refused`` logged) -- NEVER-OVERBOOK-EXTERNAL
+    holds even during recovery.
     """
     task_id = block.get("task_id")
     new_start, new_end = _next_window(block, ref=ref)
@@ -422,7 +433,7 @@ def _recover_one_block(cal_state: dict[str, Any], block: dict[str, Any], calenda
                                       {"reason": reason})
         focus_calendar.save_focus_calendar(cal_state)
         _log("calendar_block_refused", task_id=task_id, reason=reason, event_id=block.get("event_id"))
-        return "refused"
+        return {"status": "refused"}
     block["start"], block["end"] = moved["start"], moved["end"]
     block["slip_count"] = (block.get("slip_count") or 0) + 1
     block["last_slipped_at"] = ref.isoformat()
@@ -430,20 +441,103 @@ def _recover_one_block(cal_state: dict[str, Any], block: dict[str, Any], calenda
     focus_calendar.save_focus_calendar(cal_state)
     _log("calendar_block_moved", task_id=task_id, event_id=block["event_id"],
          new_start=moved["start"], new_end=moved["end"])
-    return "moved"
+    return {"status": "moved", "new_start": moved["start"], "new_end": moved["end"]}
+
+
+def _block_already_placed(cal_state: dict[str, Any], task_id: str) -> bool:
+    """True if an active focus block already exists for ``task_id`` (idempotency)."""
+    return focus_calendar.block_for_task(cal_state, task_id) is not None
+
+
+def run_create_blocks(*, now: datetime | None = None, dry_run: bool = False,
+                      send: Send | None = None,
+                      runner: calendar_blocks.Runner | None = None,
+                      day_start_hour: int = 9) -> dict[str, int]:
+    """Create freebusy-gated focus blocks for today's Defended Three.
+
+    Reads the day's priorities from U3's ``focus-state.json`` (READ-ONLY -- U6
+    never writes it), sizes each block from ``estimate_minutes``, and places them
+    back-to-back starting at ``day_start_hour`` -- each via the freebusy-gated
+    ``create_focus_block`` (NEVER-OVERBOOK-EXTERNAL: an overlap/unknown freebusy
+    refuses that block; the others still place). Created blocks are recorded in
+    ``focus-calendar.json`` and a confirmation notice is pushed through the proven
+    delivery seam. Idempotent: a priority that already has an active block is
+    skipped. Degrades silently when no focus calendar is configured.
+    """
+    ref = now or _now()
+    counts = {"created": 0, "refused": 0, "skipped": 0}
+    cal_state = focus_calendar.load_focus_calendar()
+    calendar_id = cal_state.get("agent_calendar_id")
+    if not calendar_id:
+        return counts  # no focus calendar configured -- degrade silently
+    priorities = (focus_state.load_focus_state() or {}).get("daily_priorities") or []
+    fb_ids = calendar_blocks.external_calendar_ids()
+    cursor = ref.replace(hour=day_start_hour, minute=0, second=0, microsecond=0)
+    created_titles: list[str] = []
+
+    for row in priorities:
+        task_id = row.get("task_id")
+        if not task_id or _block_already_placed(cal_state, task_id):
+            counts["skipped"] += 1
+            continue
+        minutes = int(row.get("estimate_minutes") or 60)
+        start_iso = cursor.isoformat()
+        end_iso = (cursor + timedelta(minutes=minutes)).isoformat()
+        cursor = cursor + timedelta(minutes=minutes)
+        if dry_run:
+            counts["created"] += 1
+            continue
+        outcome = _place_one_block(cal_state, calendar_id, task_id, row.get("title") or "",
+                                   start_iso, end_iso, fb_ids, ref=ref, runner=runner)
+        counts[outcome] += 1
+        if outcome == "created":
+            created_titles.append(row.get("title") or task_id)
+
+    if created_titles and not dry_run:
+        notice = "🗓️ Created focus blocks: " + ", ".join(f'"{t}"' for t in created_titles)
+        _push("brief_sent", notice, surface="standup", send=send, dry_run=False)
+    return counts
+
+
+def _place_one_block(cal_state, calendar_id, task_id, title, start_iso, end_iso, fb_ids,
+                     *, ref: datetime, runner) -> str:
+    """Create ONE freebusy-gated focus block, persisting + logging. -> created|refused."""
+    try:
+        block = calendar_blocks.create_focus_block(
+            calendar_id, task_id, title, start_iso, end_iso,
+            freebusy_calendar_ids=fb_ids, runner=runner, trigger="proactive_brief")
+    except calendar_blocks.OverbookError as exc:
+        focus_calendar.record_dry_run(cal_state, "calendar.create_refused",
+                                      {"task_id": task_id, "start": start_iso}, {"reason": exc.reason})
+        focus_calendar.save_focus_calendar(cal_state)
+        _log("calendar_block_refused", task_id=task_id, reason=exc.reason)
+        return "refused"
+    cal_state.setdefault("active_blocks", []).append({
+        "event_id": block["event_id"], "task_id": task_id, "task_title": title,
+        "start": block["start"], "end": block["end"], "created_at": ref.isoformat(),
+        "slip_count": 0, "last_slipped_at": None,
+    })
+    focus_calendar.record_dry_run(cal_state, "calendar.create", block["request"], block)
+    focus_calendar.save_focus_calendar(cal_state)
+    _log("calendar_block_created", task_id=task_id, event_id=block["event_id"],
+         start=block["start"], end=block["end"])
+    return "created"
 
 
 def run_slip_recovery(*, now: datetime | None = None, dry_run: bool = False,
                       send: Send | None = None,
                       runner: calendar_blocks.Runner | None = None) -> dict[str, int]:
-    """Slide every slipped agent-owned focus block to the next free window.
+    """Slide every slipped agent-owned focus block to the next free window + notify.
 
-    Recovery is a ``gog calendar update`` (NEVER delete+create). Degrades silently
-    when no focus calendar is configured. A dry-run counts the slipped blocks
-    without touching the calendar.
+    Recovery is a ``gog calendar update`` (NEVER delete+create). After a successful
+    move it pushes a slip notice through the proven delivery seam (prove FIRST, then
+    gate + assert), so the user is told their focus block was rescheduled rather
+    than having it silently moved out from under them. Degrades silently when no
+    focus calendar is configured. A dry-run counts the slipped blocks without
+    touching the calendar or sending.
     """
     ref = now or _now()
-    counts = {"moved": 0, "refused": 0}
+    counts = {"moved": 0, "refused": 0, "notified": 0}
     cal_state = focus_calendar.load_focus_calendar()
     calendar_id = cal_state.get("agent_calendar_id")
     if not calendar_id:
@@ -461,32 +555,56 @@ def run_slip_recovery(*, now: datetime | None = None, dry_run: bool = False,
         if dry_run:
             counts["moved"] += 1
             continue
-        counts[_recover_one_block(cal_state, block, calendar_id, fb_ids, ref=ref, runner=runner)] += 1
+        result = _recover_one_block(cal_state, block, calendar_id, fb_ids, ref=ref, runner=runner)
+        if result["status"] != "moved":
+            counts["refused"] += 1
+            continue
+        counts["moved"] += 1
+        notice = slip_notice_text(block, result["new_start"], result["new_end"])
+        if _push("brief_sent", notice, surface="standup", send=send, dry_run=False,
+                 task_id=block.get("task_id"))["sent"]:
+            counts["notified"] += 1
     return counts
 
 
-# Mode -> the name of the flow function on this module. Stored as NAMES (resolved
-# via getattr at call time), not function objects, so a test can monkeypatch a
-# flow and the dispatcher honours it -- and the indirection stays a thin lookup.
+# Cron/scheduled modes -> the name of the flow function on this module. Stored as
+# NAMES (resolved via getattr at call time), not function objects, so a test can
+# monkeypatch a flow and the dispatcher honours it. Every one takes the uniform
+# ``(dry_run, send)`` signature (calendar flows default ``runner`` to the real
+# subprocess). The reactive ``debrief-capture`` mode is handled separately -- it
+# takes user-supplied notes, not the uniform signature.
 _MODE_FLOWS: dict[str, str] = {
     "brief": "run_daily_brief",
     "prebrief": "run_pre_brief_scan",
     "slip": "run_slip_recovery",
     "friday": "run_friday_proposal",
+    "create": "run_create_blocks",
 }
+DEBRIEF_CAPTURE_MODE = "debrief-capture"
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="proactive_brief.py", description=__doc__)
-    parser.add_argument("--mode", choices=sorted(_MODE_FLOWS), required=True,
-                        help="which proactive flow to run")
+    parser.add_argument("--mode", choices=sorted([*_MODE_FLOWS, DEBRIEF_CAPTURE_MODE]),
+                        required=True, help="which proactive flow to run")
     parser.add_argument("--dry-run", action="store_true",
                         help="report what would be pushed without sending or writing state")
+    parser.add_argument("--event-key", help="debrief-capture: the event whose loop to close")
+    parser.add_argument("--notes", help="debrief-capture: the user's commitment notes (or 'skip')")
     args = parser.parse_args(argv)
     try:
-        # Every flow takes the same (dry_run, send) signature; the cron announces
-        # the collected payloads to its explicit delivery.to. slip is a calendar
-        # flow that collects no Telegram text, so its announced output is empty.
+        # The reactive debrief-capture path closes a loop from user notes; it does
+        # not push text via the cron announce, so it is handled before the uniform
+        # send-collector flows.
+        if args.mode == DEBRIEF_CAPTURE_MODE:
+            if not args.event_key or args.notes is None:
+                parser.error("--event-key and --notes are required for debrief-capture")
+            result = run_debrief_capture(args.event_key, args.notes)
+            print(f"DEBRIEF_CAPTURE: captured={result['captured']} "
+                  f"tasks={len(result['task_ids'])}")
+            return 0
+        # Every cron flow takes the same (dry_run, send) signature; the cron
+        # announces the collected payloads to its explicit delivery.to.
         payloads: list[str] = []
         send = None if args.dry_run else (lambda _target, text: payloads.append(text))
         flow = globals()[_MODE_FLOWS[args.mode]]
