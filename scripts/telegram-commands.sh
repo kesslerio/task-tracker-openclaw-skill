@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Telegram slash command wrapper for task-tracker skill
-# Usage: telegram-commands.sh {daily|weekly|done24h|done7d|audit|undo|
-#                              done|reschedule|snooze|body-double|cancel-session|nag-check}
+# Usage: telegram-commands.sh {daily|weekly|done|reschedule|snooze|body-double|cancel-session|
+#                              done24h|done7d|ledger|approve|nag-check|audit|undo}
 #
 # U1 NO-RAW-ERROR-LEAK boundary: every python3 invocation goes through
 # run_with_envelope, which captures stdout AND stderr. On a non-zero exit the
@@ -13,8 +13,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # The reserved envelope notice phrase. error_envelope._friendly_line() emits this
 # exact substring on any handled failure; it is NOT a bare ⚠️ glyph (which
-# tasks.py reuses for unrelated messages), so it is a safe failure sentinel for
-# the done24h/done7d grep filter.
+# tasks.py reuses for unrelated messages), so callers may key off it as a safe
+# failure sentinel rather than the exit status.
 ENVELOPE_NOTICE="is unavailable right now. Logged for review."
 
 # run_with_envelope LABEL CMD [ARGS...]
@@ -71,32 +71,24 @@ case "$1" in
     run_with_envelope "weekly_review" python3 "$SCRIPT_DIR/weekly_review.py"
     ;;
   done24h)
-    # Note: Currently shows all done tasks (time filtering not implemented)
-    echo "✅ **Recently Completed**"
-    echo ""
-    # A wrapped script exits 0 even when it FAILS (run_main prints its friendly
-    # line and exits 0 so the relay never forwards a raw error), so the exit
-    # status alone cannot distinguish failure. Key off the envelope's full,
-    # reserved notice phrase ($ENVELOPE_NOTICE) -- NOT a bare ⚠️ glyph, which
-    # tasks.py also uses for unrelated messages. On the notice, surface it
-    # verbatim; otherwise filter to the completed-tasks view.
-    out="$(run_with_envelope "tasks" python3 "$SCRIPT_DIR/tasks.py" list --priority high)"
-    if [[ "$out" == *"$ENVELOPE_NOTICE"* ]]; then
-      echo "$out"
-    else
-      printf '%s\n' "$out" | grep -A100 "✅ Done" | head -20
-    fi
+    # U5: replaces the broken done24h. Harvests the last 24h of shipped work
+    # (merged PRs + sent mail), matches it against the active board, and prints a
+    # brag-doc draft. Reactive: the agent relays the draft to the originating
+    # topic, and an explicit /approve marks a matched task done.
+    run_with_envelope "ledger_harvest" python3 "$SCRIPT_DIR/harvest_ledger.py" harvest --window 24h
     ;;
-  done7d)
-    # Note: Currently shows all done tasks (time filtering not implemented)
-    echo "✅ **Completed This Week**"
-    echo ""
-    out="$(run_with_envelope "tasks" python3 "$SCRIPT_DIR/tasks.py" list --priority high)"
-    if [[ "$out" == *"$ENVELOPE_NOTICE"* ]]; then
-      echo "$out"
-    else
-      printf '%s\n' "$out" | grep -A100 "✅ Done" | head -50
-    fi
+  done7d|ledger)
+    # U5: replaces the broken done7d. Harvests the current ISO week and proves
+    # the Done-topic delivery target before the draft is pushed.
+    run_with_envelope "ledger_harvest" python3 "$SCRIPT_DIR/harvest_ledger.py" harvest --window week
+    ;;
+  approve)
+    # U5: approve one matched ledger task (`approve <task_id> <inbound_topic_id>`).
+    # Reactive: the relay passes the inbound topic id, and harvest_ledger.py's
+    # topic guard rejects it unless it equals the Done topic -- origin proof is not
+    # correctness proof.
+    run_with_envelope "ledger_harvest" python3 "$SCRIPT_DIR/harvest_ledger.py" \
+      approve "$2" --topic-id "$3"
     ;;
   audit)
     # U2: list recent autonomous acts, or detail one with `audit act_<id>`.
@@ -125,14 +117,14 @@ case "$1" in
     run_with_envelope "nag_check" python3 "$SCRIPT_DIR/nag_check.py" "$@"
     ;;
   *)
-    echo "Usage: $0 {daily|weekly|done24h|done7d|audit|undo|done|reschedule|snooze|body-double|cancel-session|nag-check}"
+    echo "Usage: $0 {daily|weekly|done|reschedule|snooze|body-double|cancel-session|done24h|done7d|ledger|approve|nag-check|audit|undo}"
     exit 1
     ;;
 esac
 
 # A handled ritual ALWAYS exits 0: the friendly notice is the user-facing output
 # and a non-zero exit would let the cron relay substitute static fallback text
-# for it. run_with_envelope's return code is only an INTERNAL signal (used by the
-# done24h/done7d branches), never the script's exit status. The unknown-command
-# `*)` branch above exits 1 before reaching here.
+# for it. run_with_envelope's return code is only an INTERNAL signal a caller may
+# branch on, never the script's exit status. The unknown-command `*)` branch
+# above exits 1 before reaching here.
 exit 0
