@@ -13,6 +13,7 @@ Configuration via environment variables:
 import os
 import re
 import calendar
+import tempfile
 from datetime import datetime, timedelta, date
 from pathlib import Path
 import sys
@@ -35,6 +36,63 @@ ARCHIVE_DIR = Path(os.getenv(
     'TASK_TRACKER_ARCHIVE_DIR',
     Path.home() / "clawd" / "memory" / "work"
 ))
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    """Write content atomically: temp file in the same dir + os.replace.
+
+    Promoted from parking_lot.py so every board/state writer can share one
+    crash-safe write mechanism. A partial/interrupted write never leaves the
+    destination truncated -- the temp file is renamed only after a complete
+    write, and os.replace is atomic on the same filesystem.
+
+    Mode handling: when the destination already exists its mode is preserved.
+    For a FRESH file (no existing mode) the temp file is left at an explicit
+    ``0o600`` -- never the inherited mkstemp default that could widen secret
+    state (autonomy log / nag state) on first write.
+
+    The write goes through a file object so a short write loops to completion
+    rather than silently truncating, and after the rename the PARENT DIRECTORY
+    is fsync'd so the rename itself survives a crash (the directory entry, not
+    just the file data, is durable).
+    """
+    path = Path(path)
+    existing_mode = None
+    try:
+        existing_mode = os.stat(path).st_mode
+    except FileNotFoundError:
+        pass
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'wb') as handle:
+            fd = -1  # ownership transferred to the file object
+            handle.write(content.encode('utf-8'))
+            handle.flush()
+            os.fsync(handle.fileno())
+        if existing_mode is not None:
+            os.chmod(tmp, existing_mode & 0o777)
+        else:
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    # Durability of the rename itself: fsync the parent directory. Best-effort --
+    # some filesystems/dirs reject O_RDONLY fsync; that is not fatal to the write.
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 
 
 def get_current_quarter() -> str:

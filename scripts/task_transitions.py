@@ -14,7 +14,7 @@ from log_done import log_task_completed
 from task_lines import remove_task_line, replace_task_line
 from task_records import active_records, load_records
 from task_ledger import append_event, ledger_path, new_event
-from utils import next_recurrence_date
+from utils import next_recurrence_date, _atomic_write
 
 INLINE_FIELD_RE = re.compile(r"\s+[A-Za-z_][A-Za-z0-9_-]*::")
 RECURRENCE_RE = re.compile(r"\brecur::\s*(?!(?:\s|[A-Za-z_][A-Za-z0-9_-]*::))([^\n]+?)(?=\s+[A-Za-z_][A-Za-z0-9_-]*::|\s*[🗓️📅]|$)")
@@ -54,10 +54,13 @@ def _snapshot_regular(path: Path) -> tuple[bool, str] | None:
 
 
 def _restore_snapshots(snapshots: dict[Path, tuple[bool, str]]) -> None:
+    # The rollback must be at least as crash-safe as the forward path it restores:
+    # route every restore through _atomic_write (temp+replace+fsync) so a crash
+    # mid-restore cannot leave a board half-rewritten with the snapshot content.
     for path, (existed, content) in snapshots.items():
         if existed:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding="utf-8")
+            _atomic_write(path, content)
         elif path.exists():
             path.unlink()
 
@@ -209,7 +212,7 @@ def complete_by_id(
             }
 
         write_stage = "board-write"
-        tasks_file.write_text(new_content, encoding="utf-8")
+        _atomic_write(tasks_file, new_content)
         write_stage = "ledger-append"
         append_event(event, path=ledger_path(tasks_file))
         for extra_event in extra_events:

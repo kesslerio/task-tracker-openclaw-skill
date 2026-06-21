@@ -54,6 +54,7 @@ from utils import (
     get_current_quarter,
     ARCHIVE_DIR,
     get_objective_progress,
+    _atomic_write,
 )
 
 TASK_PRIMITIVES_SCHEMA_VERSION = "v1"
@@ -258,7 +259,7 @@ def add_task(args):
         return
 
     new_content = content[:insert_pos] + task_line + '\n' + content[insert_pos:]
-    tasks_file.write_text(new_content)
+    _atomic_write(tasks_file, new_content)
     task_type = "Personal" if args.personal else "Work"
     print(f"✅ Added {task_type} task: {args.title} ({task_id})")
 
