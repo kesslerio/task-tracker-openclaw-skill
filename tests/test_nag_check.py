@@ -405,6 +405,20 @@ def test_dry_run_writes_no_state_and_sends_nothing(harness):
     assert not (state / "nag-state.json").exists()  # no state written
 
 
+def test_dry_run_preview_skips_snoozed_loop_like_a_real_run(harness):
+    """--dry-run is a faithful preview: a snoozed on-board overdue loop is NOT
+    counted as 'would push', matching what the real cron pass would do."""
+    from datetime import timedelta
+    board, state = harness
+    _run(harness)  # open the loop
+    # Snooze it past the nag-check clock (REF + 1 day).
+    until = (REF + timedelta(days=1)).isoformat()
+    nag_state.transition(lambda s: nag_state.apply_snooze(
+        s, "tsk_abc123", snoozed_until=until, block_reason=None))
+    counts = nag_check.run_nag_check(dry_run=True, send=lambda t, x: None)
+    assert counts["open"] == 0  # snoozed -> not previewed as a push
+
+
 def test_dry_run_does_not_resolve_a_preexisting_open_loop(harness):
     """--dry-run must not terminally ack/clear a real open loop or write the ledger
     in the resolve pass (pass 1), even against live state with loops present."""

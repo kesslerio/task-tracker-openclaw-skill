@@ -239,9 +239,15 @@ def _fire_one(task_id, record, section, overdue, counts, *,
     is sent, NO gate act is logged, and state is untouched (closing the 'said
     /done, got nagged again' trust window AND the phantom-gate-act audit hole).
 
-    A dry-run takes no lock and never gates/sends -- it only previews.
+    A dry-run takes no lock and never gates/sends -- it only previews. To stay a
+    FAITHFUL preview it applies the same ack/snooze skip the real fire does, so a
+    snoozed or acked-on-board loop is not over-counted as "would push".
     """
     if dry_run:
+        current = nag_state.read_state().get(task_id)
+        if (isinstance(current, dict) and current.get("ack")) or \
+                nag_state.is_snoozed(current, now=ref):
+            return  # the real run would skip this -- preview must too
         outcome = _push_nag(record, section, overdue, dry_run=True, send=send)
         if outcome["sent"] is False and outcome["reason"] == "dry_run":
             counts["open"] += 1
