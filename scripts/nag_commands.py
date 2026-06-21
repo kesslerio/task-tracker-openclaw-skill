@@ -112,6 +112,24 @@ def _safe_delete(cron_id: str, *, delete: Callable[[str], Any] | None = None) ->
 
 # --- /done + /reschedule: board op THEN synchronous close in the same turn ---
 
+def _recycle_loop(result: dict[str, Any], task_id: str, *, closed_by: str) -> dict[str, Any]:
+    """Clear (recycle) the task's nag loop and annotate ``result`` accordingly.
+
+    Used by the recurring-/done and reschedule paths. The loop is NOT terminally
+    acked -- it is reset so a future overdue crossing re-opens a fresh loop. The
+    ledger event is ``nag_acked`` (the registered close event) but carries
+    ``recycled: true`` in its metadata so an audit consumer can tell a recycle from
+    a terminal ack and is not surprised when the loop re-nags later.
+    """
+    cleared = nag_state.transition(lambda state: nag_state.clear_loop(state, task_id))
+    if cleared is not None:
+        _log("nag_acked", task_id=task_id, nag_loop_id=cleared.get("nag_loop_id"),
+             closed_by=closed_by, recycled=True)
+    result["nag_closed"] = False  # recycled, not terminally closed
+    result["nag_recycled"] = cleared is not None
+    return result
+
+
 def _close_loop_after_board_op(result: dict[str, Any], task_id: str,
                                *, closed_by: str) -> dict[str, Any]:
     """Close the task's nag loop SYNCHRONOUSLY iff the preceding board op succeeded.
@@ -146,12 +164,7 @@ def handle_done(task_id: str, *, personal: bool = False) -> dict[str, Any]:
     if not result.get("ok"):
         return result
     if result.get("recurring"):
-        cleared = nag_state.transition(lambda state: nag_state.clear_loop(state, task_id))
-        if cleared is not None:
-            _log("nag_acked", task_id=task_id, nag_loop_id=cleared.get("nag_loop_id"),
-                 closed_by=nag_state.CLOSED_EXPLICIT_DONE)
-        result["nag_closed"] = cleared is not None
-        return result
+        return _recycle_loop(result, task_id, closed_by=nag_state.CLOSED_EXPLICIT_DONE)
     return _close_loop_after_board_op(result, task_id,
                                       closed_by=nag_state.CLOSED_EXPLICIT_DONE)
 
@@ -172,14 +185,7 @@ def handle_reschedule(task_id: str, new_due: str, *, personal: bool = False) -> 
     result = reschedule_by_id(task_id, new_due, personal=personal, source="user_command")
     if not result.get("ok"):
         return result
-    cleared = nag_state.transition(lambda state: nag_state.clear_loop(state, task_id))
-    if cleared is not None:
-        _log("nag_acked", task_id=task_id, nag_loop_id=cleared.get("nag_loop_id"),
-             closed_by=nag_state.CLOSED_RESCHEDULED)
-    # The loop is recycled, not terminally closed -- a lapse of the new date re-nags.
-    result["nag_closed"] = False
-    result["nag_recycled"] = cleared is not None
-    return result
+    return _recycle_loop(result, task_id, closed_by=nag_state.CLOSED_RESCHEDULED)
 
 
 # --- /snooze (akrasia asymmetry) ------------------------------------------

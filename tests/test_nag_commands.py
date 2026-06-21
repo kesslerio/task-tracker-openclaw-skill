@@ -119,6 +119,20 @@ def test_recurring_done_clears_loop_so_next_recurrence_nags(env, monkeypatch):
     assert len(sent) == 1  # re-nags the next recurrence; never permanently muted
 
 
+def test_recycle_paths_log_nag_acked_with_recycled_metadata(env, monkeypatch):
+    """A recycle (reschedule / recurring done) logs nag_acked with recycled:true so
+    the audit trail distinguishes a reset loop from a terminal ack."""
+    import task_ledger
+    board, state = env
+    _open_loop(state)
+    monkeypatch.setattr(nag_commands, "_now", lambda: REF)
+    nag_commands.handle_reschedule("tsk_abc123", "2026-06-30")
+    acked = [e for e in task_ledger.read_events(state / "events.jsonl")
+             if e["event_type"] == "nag_acked"]
+    assert acked and acked[-1]["metadata"]["recycled"] is True
+    assert acked[-1]["metadata"]["closed_by"] == "rescheduled"
+
+
 def test_failed_done_does_not_close_loop(env):
     """NAG-CLOSES-ONLY-ON-ACK: a /done that does not complete the task (not on the
     board) must NOT clear the nag -- the task is still open."""
