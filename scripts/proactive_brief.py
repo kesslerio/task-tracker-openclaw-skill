@@ -246,29 +246,34 @@ def _create_commitment_task(spec: dict[str, str], *, runner: "ShellRunner | None
     return match.group(1) if match else None
 
 
-def run_debrief_capture(event_key: str, notes: str, *,
+def run_debrief_capture(reference: str, notes: str, *,
                         runner: "ShellRunner | None" = None) -> dict[str, Any]:
     """Capture a user's debrief notes into commitment tasks and close the loop.
 
-    The reactive ``/debrief`` path (spec §2.4): parse the notes into commitments,
-    create each as a task, record the new task ids in ``proactive-state.json``
-    (which sets ``debrief_captured_at`` -> the loop is CLOSED), and emit
-    ``commitment_task_created`` + ``debrief_captured`` ledger events. A "skip" (no
-    commitments) closes the loop via skip instead. Returns ``{captured, task_ids}``.
+    The reactive ``/debrief <reference>`` path (spec §2.4). ``reference`` is what
+    the user typed -- the event SUMMARY the pre-brief advertised, or the raw stored
+    key -- so the OPEN loop is resolved by summary-or-key
+    (``resolve_open_debrief``), and ALL state ops use that loop's actual stored
+    ``event_id``. This closes two holes: the loop is always the one closed (no
+    endless re-prompts from a key mismatch), and a reference with no matching OPEN
+    loop REFUSES -- it never silently creates tasks against a phantom loop and so
+    cannot duplicate commitments on a retry.
 
-    Idempotent: a re-invocation for a loop that is ALREADY closed (captured or
-    skipped) is a no-op -- it never re-parses the notes or re-adds the commitment
-    tasks, so a retry / double-submit cannot duplicate tasks (mirrors the
-    ``pre_brief_due`` guard the cron flows use). Returns
-    ``{captured: False, reason: "already_closed"}`` in that case.
+    On a match: parse the notes into commitments, create each as a task, record the
+    new task ids (sets ``debrief_captured_at`` -> CLOSED), and emit
+    ``commitment_task_created`` + ``debrief_captured``. A "skip" closes via skip.
+    Returns ``{captured, task_ids[, reason]}``.
     """
     state = proactive_state.load_proactive_state()
-    entry = proactive_state.find_pre_brief(state, event_key)
-    if entry is not None and not proactive_state.is_debrief_open(entry):
-        return {"captured": False, "task_ids": [], "reason": "already_closed"}
+    entry = proactive_state.resolve_open_debrief(state, reference)
+    if entry is None:
+        # No OPEN loop for this reference: it was already captured/skipped, or the
+        # reference is unknown. Refuse -- never create tasks against a phantom loop.
+        return {"captured": False, "task_ids": [], "reason": "no_open_debrief"}
+    event_id = entry["event_id"]
 
     if notes.strip().lower() == "skip":
-        proactive_state.skip_debrief(state, event_key)
+        proactive_state.skip_debrief(state, event_id)
         proactive_state.save_proactive_state(state)
         return {"captured": False, "task_ids": []}
 
@@ -280,9 +285,9 @@ def run_debrief_capture(event_key: str, notes: str, *,
         task_ids.append(task_id)
         _log("commitment_task_created", task_id=task_id, title=spec["title"], due=spec.get("due"))
 
-    proactive_state.capture_debrief(state, event_key, task_ids)
+    proactive_state.capture_debrief(state, event_id, task_ids)
     proactive_state.save_proactive_state(state)
-    _log("debrief_captured", event_key=event_key, commitments_task_ids=task_ids)
+    _log("debrief_captured", event_key=event_id, commitments_task_ids=task_ids)
     return {"captured": True, "task_ids": task_ids}
 
 

@@ -272,14 +272,56 @@ def test_debrief_capture_idempotent_on_closed_loop(harness):
     notes = "I will ship by 2026-06-30"
     first = proactive_brief.run_debrief_capture("evt_q3", notes, runner=fake_runner)
     assert first["captured"] is True and first["task_ids"] == ["tsk_commit1"]
-    # second invocation for the now-CLOSED loop adds NOTHING
+    # second invocation for the now-CLOSED loop adds NOTHING (no open loop to match)
     second = proactive_brief.run_debrief_capture("evt_q3", notes, runner=fake_runner)
     assert second["captured"] is False
-    assert second["reason"] == "already_closed"
+    assert second["reason"] == "no_open_debrief"
     assert len(calls) == 1  # the task was added exactly once
     # the first batch's ids are preserved, not overwritten
     reloaded = proactive_state.load_proactive_state()
     assert reloaded["pre_briefs"][0]["commitments_task_ids"] == ["tsk_commit1"]
+
+
+def test_debrief_capture_resolves_by_summary(harness):
+    """autoreview: the user types the event SUMMARY the pre-brief advertised, but
+    the loop is keyed by event_id (summary@start). Capture must still resolve and
+    close the loop by summary."""
+    board, state = harness
+    st = proactive_state.load_proactive_state()
+    # The stored key is summary@start (what event_key() produces for an id-less event).
+    key = "Q3 Review@2026-06-20T09:00:00+00:00"
+    proactive_state.mark_pre_brief_sent(st, key, "Q3 Review", "2026-06-20T09:00:00+00:00")
+    proactive_state.open_debrief(st, key)
+    proactive_state.save_proactive_state(st)
+
+    def fake_runner(cmd):
+        return types.SimpleNamespace(
+            stdout=f"✅ Added work task: {cmd[3]} (tsk_c1)", stderr="", returncode=0)
+
+    # the user types just the summary
+    result = proactive_brief.run_debrief_capture("Q3 Review", "I will ship by 2026-06-30",
+                                                 runner=fake_runner)
+    assert result["captured"] is True
+    reloaded = proactive_state.load_proactive_state()
+    assert proactive_state.is_debrief_open(reloaded["pre_briefs"][0]) is False  # closed
+
+
+def test_debrief_capture_unknown_reference_refuses(harness):
+    """A /debrief for an event with no OPEN loop refuses -- it never creates tasks."""
+    board, state = harness
+    st = proactive_state.load_proactive_state()
+    proactive_state.mark_pre_brief_sent(st, "evt_q3", "Q3 Review", "2026-06-20T09:00:00+00:00")
+    proactive_state.open_debrief(st, "evt_q3")
+    proactive_state.save_proactive_state(st)
+
+    def fail_runner(cmd):
+        raise AssertionError("no task may be created for an unknown reference")
+
+    result = proactive_brief.run_debrief_capture("Some Other Meeting",
+                                                 "I will do X by 2026-06-30", runner=fail_runner)
+    assert result["captured"] is False
+    assert result["reason"] == "no_open_debrief"
+    assert result["task_ids"] == []
 
 
 def test_debrief_skip_closes_loop_no_tasks(harness):

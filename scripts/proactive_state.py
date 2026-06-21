@@ -178,6 +178,31 @@ def mark_pre_brief_sent(state: dict[str, Any], event_id: str, event_summary: str
     return entry
 
 
+def resolve_open_debrief(state: dict[str, Any], reference: str) -> dict[str, Any] | None:
+    """Find the OPEN debrief entry a user's ``/debrief <reference>`` refers to.
+
+    The reactive ``/debrief`` command forwards what the pre-brief told the user --
+    the event SUMMARY -- but the loop is stored under its ``event_id`` key (which,
+    for a calendar event with no id, is ``summary@start``). So a lookup by the bare
+    summary must still find the loop. Resolution order, restricted to OPEN loops so
+    a closed/captured loop is never re-matched:
+
+    1. exact ``event_id`` match (the stored key), then
+    2. exact ``event_summary`` match.
+
+    Returns the entry or None. None means "no open debrief for that reference" and
+    the caller MUST refuse rather than silently create tasks against a phantom loop.
+    """
+    open_entries = [e for e in state.get("pre_briefs", []) if is_debrief_open(e)]
+    for entry in open_entries:
+        if entry.get("event_id") == reference:
+            return entry
+    for entry in open_entries:
+        if entry.get("event_summary") == reference:
+            return entry
+    return None
+
+
 def open_debrief(state: dict[str, Any], event_id: str) -> dict[str, Any] | None:
     """Mark a debrief as requested (open loop) for ``event_id``; returns the entry.
 
