@@ -123,6 +123,17 @@ def nag_snooze_max() -> int:
     return _int_env("NAG_SNOOZE_MAX", 3)
 
 
+def start_session_minutes() -> int:
+    """Default ``/start`` focus-session length in minutes (default 25, floored at 1).
+
+    H7's ``/start <task>`` opens a short focus block (Pomodoro-ish) when the user
+    gives no explicit duration. Floored at 1 so a 0/negative misconfig still yields
+    a real, schedulable session rather than a zero-length one whose check-ins fire
+    immediately.
+    """
+    return max(1, _int_env("START_SESSION_MINUTES", 25))
+
+
 def nag_disposition_after_snoozes() -> int:
     """Snoozes after which the nag STOPS re-asking the same way and asks for a
     disposition instead (default 2, env ``NAG_DISPOSITION_AFTER_SNOOZES``).

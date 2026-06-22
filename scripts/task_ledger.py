@@ -81,6 +81,8 @@ KNOWN_EVENT_TYPES: frozenset[str] = frozenset({
     "body_double_started",
     "body_double_checkin",
     "body_double_ended",
+    # H7 -- /start initiation loop (reuses the body-double session machinery).
+    "start_session_started",
     # U5 -- accomplishment ledger.
     "ledger_harvest_started",
     "ledger_draft_pushed",
