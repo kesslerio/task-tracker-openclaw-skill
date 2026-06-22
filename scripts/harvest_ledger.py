@@ -51,9 +51,11 @@ from typing import Any, Callable
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import autonomy_gate
+import cos_config
 import delivery_target
 import error_envelope
 import harvest_state
+import win_store
 from evidence_matching import extract_done_lines, match_evidence_content
 from task_ledger import append_event, ledger_path, new_event
 from task_transitions import complete_by_id
@@ -116,27 +118,34 @@ def _harvest(
     *,
     trigger: str,
     timeout: int = 15,
-) -> list[dict[str, Any]]:
-    """Run one harvest subprocess and parse it; return ``[]`` on any failure.
+) -> tuple[list[dict[str, Any]], bool]:
+    """Run one harvest subprocess and parse it; return ``(evidence, failed)``.
 
     A missing/broken tool that has failed repeatedly trips the circuit breaker --
     the subprocess is skipped entirely so a daily cron does not loop on it. Any
-    failure is logged through ``error_envelope`` (classified, never echoed) and an
-    empty list is returned; this function NEVER raises.
+    failure (nonzero exit / exception / timeout / a tripped breaker) is logged
+    through ``error_envelope`` (classified, never echoed) and yields
+    ``([], failed=True)``; this function NEVER raises.
+
+    The ``failed`` flag is what distinguishes a SOURCE ERROR (couldn't harvest --
+    the cron path records a health FAILURE) from a legitimately-empty source (ran
+    clean, nothing to report -- a quiet week stays healthy). A tripped breaker is a
+    failure too: the source is unprovenly skipped, NOT confirmed empty. Without this
+    flag a gh/gog subprocess failure silently swallows to ``[]`` and false-greens.
     """
     component = f"{COMPONENT}:{source}"
     if error_envelope.breaker_open(component):
-        return []
+        return [], True
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if result.returncode != 0:
             raise subprocess.CalledProcessError(
                 result.returncode, cmd[0], output=result.stdout, stderr=result.stderr
             )
-        return parse(json.loads(result.stdout))
+        return parse(json.loads(result.stdout)), False
     except _SUBPROCESS_FAILURES as exc:
         error_envelope.log_degraded(component, exc, trigger=trigger, check=source)
-        return []
+        return [], True
 
 
 def _since_date(window: str, since_override: str | None, reference: date | None = None) -> str:
@@ -150,8 +159,11 @@ def _since_date(window: str, since_override: str | None, reference: date | None 
     return (ref - timedelta(days=ref.weekday())).isoformat()
 
 
-def harvest_github(since: str, *, trigger: str) -> list[dict[str, Any]]:
-    """Harvest merged PRs authored by the user since ``since`` (``gh``)."""
+def harvest_github(since: str, *, trigger: str) -> tuple[list[dict[str, Any]], bool]:
+    """Harvest merged PRs authored by the user since ``since`` (``gh``).
+
+    Returns ``(evidence, failed)`` -- ``failed`` is True when the ``gh`` subprocess
+    errored (so a source error is not mistaken for a clean-empty week)."""
 
     def parse(payload: Any) -> list[dict[str, Any]]:
         items = payload if isinstance(payload, list) else payload.get("items", [])
@@ -177,8 +189,11 @@ def harvest_github(since: str, *, trigger: str) -> list[dict[str, Any]]:
     return _harvest("github", cmd, parse, trigger=trigger)
 
 
-def harvest_gmail(since: str, *, trigger: str) -> list[dict[str, Any]]:
-    """Harvest sent-mail subjects since ``since`` (``gog``)."""
+def harvest_gmail(since: str, *, trigger: str) -> tuple[list[dict[str, Any]], bool]:
+    """Harvest sent-mail subjects since ``since`` (``gog``).
+
+    Returns ``(evidence, failed)`` -- ``failed`` is True when the ``gog`` subprocess
+    errored (so a source error is not mistaken for a clean-empty week)."""
 
     def parse(payload: Any) -> list[dict[str, Any]]:
         threads = payload.get("threads", []) if isinstance(payload, dict) else []
@@ -196,14 +211,18 @@ def harvest_gmail(since: str, *, trigger: str) -> list[dict[str, Any]]:
     return _harvest("gmail", cmd, parse, trigger=trigger)
 
 
-def harvest_all(since: str, *, trigger: str) -> tuple[list[dict[str, Any]], int]:
-    """Harvest every (non-deferred) source. Returns ``(evidence, sources_tried)``.
+def harvest_all(since: str, *, trigger: str) -> tuple[list[dict[str, Any]], int, bool]:
+    """Harvest every (non-deferred) source. Returns ``(evidence, sources_tried, source_error)``.
 
     Calendar harvest is DEFERRED to v0.3 (``STANDUP_CALENDARS`` not in container),
-    so only GitHub + Gmail are tried in v0.2.
+    so only GitHub + Gmail are tried in v0.2. ``source_error`` is True when ANY
+    source could not be harvested (subprocess error / tripped breaker), so the cron
+    path can record a health FAILURE rather than mistaking an unharvested source for
+    a quiet week.
     """
-    evidence = harvest_github(since, trigger=trigger) + harvest_gmail(since, trigger=trigger)
-    return evidence, 2
+    gh_evidence, gh_failed = harvest_github(since, trigger=trigger)
+    gmail_evidence, gmail_failed = harvest_gmail(since, trigger=trigger)
+    return gh_evidence + gmail_evidence, 2, gh_failed or gmail_failed
 
 
 # --- matching --------------------------------------------------------------
@@ -301,40 +320,89 @@ def _pending_match_index(matches: list[dict[str, Any]]) -> dict[str, dict[str, A
 # --- draft assembly --------------------------------------------------------
 
 
-def _bucket(matches: list[dict[str, Any]], decision: str) -> list[dict[str, Any]]:
-    return [m for m in matches if m["decision"] == decision]
+# H8 four-bucket digest. The Oracle finding: the auto-harvest over-counts code +
+# comms (PR + email) while missing strategy / hiring / decisions / relationships.
+# So harvested evidence is CLASSIFIED into shipped / advanced / maintenance (it can
+# never produce a "decisions" item -- a PR is not a decision), and the manual /win
+# channel fills the gap, routed by win_store.classify_bucket. Each bucket carries a
+# human heading for the rendered digest.
+_BUCKET_HEADINGS: dict[str, str] = {
+    "shipped": "Shipped",
+    "advanced": "Advanced",
+    "decisions": "Decisions",
+    "maintenance": "Maintenance",
+}
 
 
-def build_draft(matches: list[dict[str, Any]], harvest_window_id: str) -> str:
-    """Assemble the brag-doc draft text (Shipped / For review / Logged).
+def _classify_match_bucket(match: dict[str, Any]) -> str:
+    """Route ONE harvested+matched evidence item into a digest bucket.
 
-    Only the ``/approve <task_id>`` command this unit implements is advertised.
-    The wider ``/reject`` / ``/approve-all`` surface is out of U5's scope, so the
-    draft never instructs the user to type a command that does nothing.
+    * ``shipped`` -- a PR that evidence-links a board task (code that shipped + closes a loop).
+    * ``advanced`` -- a fuzzy ``needs-review`` match (work in flight, not yet confirmed done),
+      and any non-email evidence with no confident task link (it moved something forward).
+    * ``maintenance`` -- email/comms and other upkeep with no task match (the harvest's
+      over-counted comms volume lands here rather than inflating "shipped").
     """
-    lines = [f"Accomplishment Ledger — {harvest_window_id}", ""]
-    shipped = _bucket(matches, "evidence-link")
-    review = _bucket(matches, "needs-review")
-    logged = _bucket(matches, "no-match")
+    decision = match.get("decision")
+    source_type = match.get("source_type")
+    if decision == "evidence-link" and source_type == "pr":
+        return "shipped"
+    if decision == "needs-review":
+        return "advanced"
+    if source_type == "email":
+        return "maintenance"
+    # An evidence-link from a non-PR source (rare) still shipped a closed loop; a
+    # no-match non-email item advanced something without closing a task.
+    return "shipped" if decision == "evidence-link" else "advanced"
 
-    if shipped:
-        lines.append("Shipped:")
-        for m in shipped:
-            lines.append(f"• {m['title']} → closes {m['matched_task_id']}")
-            lines.append(f"  Reply /approve {m['matched_task_id']} to mark done")
-        lines.append("")
-    if review:
-        lines.append("For review (fuzzy match — confirm?):")
-        for m in review:
-            lines.append(
-                f"• {m['title']} → possible match {m['matched_task_id']} (score {m['score']})"
-            )
-            lines.append(f"  Reply /approve {m['matched_task_id']} to confirm")
-        lines.append("")
-    if logged:
-        lines.append("Logged (no task match):")
-        for m in logged:
-            lines.append(f"• {m['title']}")
+
+def bucketise(matches: list[dict[str, Any]], wins: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """Group harvested matches + manual wins into the four named digest buckets.
+
+    Harvested items keep their ``/approve`` provenance (``matched_task_id`` /
+    ``score``); manual wins carry only ``text``. Both share a ``line`` the renderer
+    prints, plus a ``task_id``/``score`` when the item is an approvable match.
+    """
+    buckets: dict[str, list[dict[str, Any]]] = {name: [] for name in _BUCKET_HEADINGS}
+    for m in matches:
+        bucket = _classify_match_bucket(m)
+        buckets[bucket].append({
+            "line": m["title"],
+            "decision": m["decision"],
+            "matched_task_id": m.get("matched_task_id"),
+            "score": m.get("score"),
+        })
+    for win in wins:
+        bucket = win.get("bucket") if win.get("bucket") in buckets else win_store.DEFAULT_BUCKET
+        buckets[bucket].append({"line": win.get("text", ""), "decision": "manual_win",
+                                "matched_task_id": None, "score": None})
+    return buckets
+
+
+def build_draft(matches: list[dict[str, Any]], harvest_window_id: str,
+                wins: list[dict[str, Any]] | None = None) -> str:
+    """Assemble the four-bucket brag-doc digest (Shipped / Advanced / Decisions / Maintenance).
+
+    Harvested evidence is classified into shipped/advanced/maintenance and manual
+    ``/win`` items fold into their classified bucket (decisions/advanced as the
+    harvest cannot). A shipped/advanced item that confidently closes a task still
+    advertises the ``/approve <task_id>`` reply; manual wins and maintenance items
+    are informational. An empty bucket is omitted -- the caller's Friday+content
+    gate decides whether to send at all, so a non-empty digest never renders blank.
+    """
+    buckets = bucketise(matches, wins or [])
+    lines = [f"Accomplishment Ledger — {harvest_window_id}", ""]
+    for name, heading in _BUCKET_HEADINGS.items():
+        items = buckets[name]
+        if not items:
+            continue
+        lines.append(f"{heading}:")
+        for item in items:
+            lines.append(f"• {item['line']}")
+            task_id = item["matched_task_id"]
+            if task_id and item["decision"] in ("evidence-link", "needs-review"):
+                verb = "mark done" if item["decision"] == "evidence-link" else "confirm"
+                lines.append(f"  Reply /approve {task_id} to {verb}")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
@@ -407,16 +475,50 @@ def prove_and_gate_push(
     return {"ok": True, "delivery_target": target, "act_id": gated["act_id"]}
 
 
+# --- the weekly + empty-silent auto-send gate ------------------------------
+
+
+def is_digest_day(now: datetime | None = None) -> bool:
+    """True on the weekly digest day (Friday, in the user's local zone).
+
+    The auto-harvest moved from a daily push to a WEEKLY brag digest: a daily
+    auto-queue is "another thing to service" and the harvest mis-weights what it
+    surfaces, so the proactive send only fires on Friday. ``weekday() == 4`` is
+    Friday. The reactive ``/ledger`` path ignores this -- it works any day.
+    """
+    ref = now or cos_config.local_now()
+    return ref.weekday() == cos_config.ledger_digest_weekday()
+
+
+def _auto_send_allowed(*, auto: bool, has_content: bool, now: datetime | None) -> bool:
+    """Whether the PROACTIVE push may fire: forced/on-demand, OR Friday-with-content.
+
+    The two-part gate the Oracle finding mandates: a daily auto-fire is suppressed
+    unless it is the digest day AND there is something to report. An on-demand
+    (``auto=False``) call bypasses the day gate entirely (it still requires content
+    of its own to have a draft to push). An EMPTY digest sends NOTHING on either
+    path -- no blank "nothing happened" message ever leaves.
+    """
+    if not has_content:
+        return False
+    if not auto:
+        return True
+    return is_digest_day(now)
+
+
 # --- harvest orchestration -------------------------------------------------
 
 
-def run_harvest(window: str, *, since_override: str | None, dry_run: bool, trigger: str) -> dict[str, Any]:
-    """Harvest, dedup, match, and (unless dry-run) prove+gate the draft push.
+def run_harvest(window: str, *, since_override: str | None, dry_run: bool, trigger: str,
+                auto: bool = False, now: datetime | None = None) -> dict[str, Any]:
+    """Harvest, dedup, match, fold in manual wins, and (unless dry-run) push a digest.
 
-    Returns a structured result with the draft text, match buckets, the proven
-    ``delivery_target`` (or a blocked reason), and any ``expired`` task ids the
-    weekly reset surfaced. NEVER raises -- the ``main`` wrapper additionally
-    classifies any unhandled exception into the friendly fallback.
+    ``auto`` marks the SCHEDULED (cron) path: it is gated to Friday-with-content, so
+    a non-Friday auto-run -- or a Friday auto-run with an empty digest -- pushes
+    NOTHING (no blank message). A reactive ``/ledger`` (``auto=False``) works any day
+    and only needs content of its own. Returns the structured result + draft text +
+    the proven ``delivery_target`` (or a blocked reason). NEVER raises -- the
+    ``main`` wrapper classifies any unhandled exception into the friendly fallback.
     """
     harvest_window_id = harvest_state.window_id(window)
     state, expired = harvest_state.load_or_reset(harvest_window_id, window)
@@ -431,36 +533,61 @@ def run_harvest(window: str, *, since_override: str | None, dry_run: bool, trigg
         )
     )
 
-    evidence, sources_tried = harvest_all(since, trigger=trigger)
+    evidence, sources_tried, source_error = harvest_all(since, trigger=trigger)
     # Dedup against this window's seen set BEFORE matching, so a heartbeat re-fire
     # never re-ingests the same PR/email.
     fresh = [item for item in evidence if not harvest_state.is_seen(state, item["evidence_hash"])]
-
-    if not fresh:
-        # No new evidence: either all sources failed/empty, or everything was
-        # already seen. Either way no draft is pushed (guard: all-signals-empty).
-        result = {
-            "ok": True,
-            "draft_pushed": False,
-            "reason": "no_new_evidence",
-            "harvest_window_id": harvest_window_id,
-            "expired": expired,
-            "message": f"Nothing new to report for {harvest_window_id}.",
-        }
-        return result
-
     matches = match_evidence(fresh)
+    # Manual /win captures count as digest content alongside harvested evidence --
+    # they are the strategy/decision items the harvest misses. Selected by the SAME
+    # seen-on-push dedup evidence uses (NOT the weekly ``since`` window): an unseen
+    # win older than this week's Monday must still surface (a win captured after
+    # Friday's push, or before a mid-week reactive push, would otherwise vanish when
+    # ``since`` advances). A delivered win is excluded by being in the seen set.
+    wins = win_store.read_unseen_wins()
+    has_content = bool(matches) or bool(wins)
+
     pending_task_ids = sorted({
         m["matched_task_id"]
         for m in matches
         if m["decision"] in ("evidence-link", "needs-review") and m["matched_task_id"]
     })
-    draft = build_draft(matches, harvest_window_id)
+    draft = build_draft(matches, harvest_window_id, wins)
+
+    # EMPTY-SILENT + WEEKLY gate: the proactive push only fires forced/on-demand, or
+    # on Friday-with-content. A suppressed auto-run consumes NOTHING (no evidence
+    # marked seen) so the items still surface on the next allowed fire.
+    if not _auto_send_allowed(auto=auto, has_content=has_content, now=now):
+        reason = "no_new_evidence" if not has_content else "not_digest_day"
+        return {
+            "ok": True,
+            "draft_pushed": False,
+            "reason": reason,
+            "harvest_window_id": harvest_window_id,
+            "expired": expired,
+            # A source error means "no content" is unproven -- carry the signal so the
+            # cron path records a FAILURE rather than false-greening an empty digest
+            # that may simply have failed to harvest.
+            "source_error": source_error,
+            # Silent on the auto path: no message is surfaced when nothing should send.
+            "message": None if auto else f"Nothing new to report for {harvest_window_id}.",
+        }
 
     push: dict[str, Any] = {"ok": False, "reason": "dry_run"}
     if not dry_run:
-        if state.get("draft_pushed") and state.get("harvest_window_id") == harvest_window_id:
-            # Duplicate-push guard: a draft is already out for this window.
+        # Kind-aware duplicate-push guard. The SCHEDULED Friday digest (``auto``) and
+        # a reactive ``/ledger`` pull track their last-pushed window SEPARATELY, so a
+        # mid-week reactive run never preempts the headline weekly Friday digest (and
+        # a Friday digest never blocks a later reactive pull). Back-compat: a pre-kind
+        # state recorded a single ``draft_pushed`` flag -- treat that as a REACTIVE
+        # push for its window (bias toward letting the Friday auto digest still fire),
+        # so the upgrade never silently suppresses a digest.
+        kind = "auto" if auto else "reactive"
+        pushed_key = f"{kind}_pushed_window"
+        legacy_reactive = (kind == "reactive" and bool(state.get("draft_pushed"))
+                           and state.get("harvest_window_id") == harvest_window_id)
+        if state.get(pushed_key) == harvest_window_id or legacy_reactive:
+            # Duplicate-push guard: a draft of THIS kind is already out for this window.
             return {
                 "ok": True,
                 "draft_pushed": False,
@@ -468,6 +595,7 @@ def run_harvest(window: str, *, since_override: str | None, dry_run: bool, trigg
                 "harvest_window_id": harvest_window_id,
                 "delivery_target": state.get("delivery_target"),
                 "expired": expired,
+                "source_error": source_error,
                 "message": "Ledger draft already sent for this window.",
             }
         push = prove_and_gate_push(
@@ -483,13 +611,31 @@ def run_harvest(window: str, *, since_override: str | None, dry_run: bool, trigg
         # the draft can be re-emitted from the logged ledger_draft_pushed event --
         # proof success, not Telegram receipt, is what marks evidence consumed.)
         if push["ok"]:
-            state["draft_pushed"] = True
+            state[pushed_key] = harvest_window_id
             state["draft_pushed_at"] = datetime.now(timezone.utc).isoformat()
             state["delivery_target"] = push["delivery_target"]
-            state["pending_task_ids"] = pending_task_ids
-            state["pending_matches"] = _pending_match_index(matches)
+            # Kind-aware dedup allows a reactive + a Friday auto push in one window, so
+            # the pending-approval state must be MERGED across same-window pushes, never
+            # overwritten: an id the reactive digest advertised as approvable ("/approve
+            # A") must survive the Friday push (whose fresh matches differ, or are
+            # wins-only -> empty). Carry forward every still-un-approved pending id.
+            approved = set(state.get("approved_task_ids") or [])
+            merged_ids = (set(state.get("pending_task_ids") or []) | set(pending_task_ids)) - approved
+            state["pending_task_ids"] = sorted(merged_ids)
+            state["pending_matches"] = {
+                tid: match for tid, match in {
+                    **(state.get("pending_matches") or {}),
+                    **_pending_match_index(matches),
+                }.items() if tid not in approved
+            }
             harvest_state.mark_seen(state, [item["evidence_hash"] for item in fresh])
             harvest_state.save_state(state, window)
+            # Consume the wins on the SAME success condition as the evidence: a win
+            # is marked seen ONLY when it was included in a digest that actually
+            # PUSHED, so a win captured after this push stays unseen for the next
+            # one, and a delivered win never repeats. (A suppressed/blocked/no-push
+            # run never reaches here, so it consumes no wins -- never silently lost.)
+            win_store.mark_wins_seen([win["id"] for win in wins])
 
     return {
         "ok": True,
@@ -498,11 +644,13 @@ def run_harvest(window: str, *, since_override: str | None, dry_run: bool, trigg
         "since": since,
         "sources_tried": sources_tried,
         "evidence_count": len(fresh),
+        "win_count": len(wins),
         "matches": matches,
         "pending_task_ids": pending_task_ids,
         "draft": draft,
         "delivery_target": push.get("delivery_target") if push["ok"] else None,
         "push_blocked_reason": None if push["ok"] else push.get("reason"),
+        "source_error": source_error,
         "expired": expired,
     }
 
@@ -636,6 +784,87 @@ def approve(task_id: str, *, inbound_topic_id: str | None, match: dict[str, Any]
     return {"ok": True, "task_id": task_id, "title": result.get("title")}
 
 
+# --- /win (frictionless capture) -------------------------------------------
+
+
+def capture_win(text: str) -> dict[str, Any]:
+    """Append one manual win durably and return a structured confirmation.
+
+    FRICTIONLESS: no board cap, no validation gate, no matching -- a real
+    accomplishment is never blocked. Persists through ``win_store`` (a flocked
+    append-only jsonl that survives a crash) and surfaces in the next digest's
+    classified bucket. An empty/whitespace text is the only refusal (there is no
+    win to record).
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return {"ok": False, "reason": "empty", "message": "Tell me what you won, e.g. /win shipped the pricing deck."}
+    record = win_store.append_win(cleaned)
+    return {
+        "ok": True,
+        "bucket": record["bucket"],
+        "text": record["text"],
+        "message": f"🏆 Logged to {record['bucket']}: {record['text']}",
+    }
+
+
+# --- R1 health (cron path only) --------------------------------------------
+
+
+def _ledger_failure_class(result: dict[str, Any]) -> str | None:
+    """Classify the SCHEDULED harvest result into a health failure class, or ``None``.
+
+    The harvest returns ``ok:True`` on EVERY path, so ``ok`` alone is useless as a
+    health signal. A REAL failure is one of:
+
+    * ``source_error`` -- a gh/gog subprocess errored (couldn't harvest), so an
+      "empty" digest is unproven (it may simply have failed to fetch).
+    * ``push_blocked_reason`` -- the digest had content but the push was BLOCKED
+      (env unset / unprovable target / gate rejection), so nothing was delivered.
+    * an explicit ``ok:False`` (a synthetic/legacy degraded result).
+
+    A legitimately-empty week (sources ran clean, nothing to report, no blocked
+    push) is NOT a failure -- a quiet week is healthy. Source-error outranks a
+    blocked push so the most upstream cause is the recorded class.
+    """
+    if result.get("source_error"):
+        return "harvest_source_error"
+    if result.get("push_blocked_reason"):
+        return "push_blocked"
+    if not result.get("ok"):
+        return str(result.get("reason") or "harvest_failed")
+    return None
+
+
+def _record_ledger_health(result: dict[str, Any]) -> None:
+    """Best-effort: record the SCHEDULED harvest's outcome to the health substrate.
+
+    Mirrors ``nag_check._record_nag_health`` -- ``harvest_ledger`` runs under the
+    shell ``run_with_envelope`` (not ``error_envelope.run_main``) and catches its own
+    crash to exit 0, so without recording here a broken weekly harvest would
+    false-green until STALE. Called ONLY from the cron (``--auto``) path, never from
+    a reactive ``/ledger`` run, so the two are not conflated. A real FAILURE (a
+    source subprocess error, or a blocked push that delivered nothing) records a
+    health failure; a legitimately-empty week records success (a quiet week is
+    healthy). Wrapped so a broken/absent ``cos_health`` can never change the harvest
+    outcome.
+    """
+    try:
+        import cos_health  # noqa: PLC0415 -- lazy + wrapped: health is best-effort
+
+        failure_class = _ledger_failure_class(result)
+        if failure_class is None:
+            cos_health.record_success(COMPONENT)
+        else:
+            cos_health.record_failure(
+                COMPONENT,
+                error_class=failure_class,
+                trigger="cron:ledger_harvest",
+            )
+    except Exception:  # noqa: BLE001 -- health recording is best-effort, never fatal
+        pass
+
+
 # --- CLI -------------------------------------------------------------------
 
 
@@ -652,14 +881,44 @@ def _emit(payload: dict[str, Any], *, as_json: bool) -> None:
 
 
 def _run_harvest_cli(args: argparse.Namespace) -> int:
-    trigger = f"{'cron' if args.window == harvest_state.WINDOW_WEEK else 'user_command'}:/ledger"
-    result = run_harvest(
-        args.window,
-        since_override=args.since,
-        dry_run=args.dry_run,
-        trigger=trigger,
-    )
+    # ``--auto`` is the SCHEDULED (cron) fire: it gates the push to Friday-with-content
+    # AND records ritual health. A reactive ``/ledger`` omits it, so it works any day
+    # and records NO health (no cron-vs-reactive conflation). The trigger keys off the
+    # same flag, not the window (a reactive /ledger also uses --window week).
+    trigger = "cron:ledger_harvest" if args.auto else "user_command:/ledger"
+    record_health = args.auto and not args.dry_run
+    try:
+        result = run_harvest(
+            args.window,
+            since_override=args.since,
+            dry_run=args.dry_run,
+            trigger=trigger,
+            auto=args.auto,
+        )
+    except Exception as exc:  # noqa: BLE001 -- record health on a crash, then re-raise
+        # A HARD crash mid-harvest is the worst silently-broken-cron case: the
+        # _cli_entry no-raw-leak boundary catches it and exits 0, so without
+        # recording here a crashing weekly harvest would false-green until STALE.
+        # Record a FAILURE before re-raising -- but ONLY on the scheduled (--auto)
+        # path, never a reactive /ledger (no cron-vs-reactive conflation). Mirrors
+        # nag_check.main's except -> _record_nag_health(crashed=...).
+        if record_health:
+            _record_ledger_health({"ok": False, "reason": type(exc).__name__})
+        raise
+    if record_health:
+        _record_ledger_health(result)
     _emit(result, as_json=args.json)
+    return 0
+
+
+def _run_win_cli(args: argparse.Namespace) -> int:
+    # Frictionless capture: a handled refusal (empty text) is still exit 0 with a
+    # structured message so the U1 envelope relays it, not a generic tool failure.
+    result = capture_win(" ".join(args.text))
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+    else:
+        print(result["message"])
     return 0
 
 
@@ -684,20 +943,29 @@ def main(argv: list[str] | None = None) -> int:
     harvest.add_argument("--since", help="Override window start (YYYY-MM-DD)")
     harvest.add_argument("--dry-run", action="store_true", help="Harvest + match only; do not push or write state")
     harvest.add_argument("--json", action="store_true", help="Structured JSON output")
+    harvest.add_argument("--auto", action="store_true",
+                         help="Scheduled fire: gate the push to Friday-with-content and record ritual health")
 
     approve_p = sub.add_parser("approve", help="Approve one matched task (topic-guarded)")
     approve_p.add_argument("task_id")
     approve_p.add_argument("--topic-id", dest="topic_id", required=True,
                            help="The inbound Telegram topic id (proven origin)")
 
-    # A bare invocation (no subcommand) is the daily cron path: default to the
-    # weekly harvest with structured JSON output, which the agent then narrates.
+    win_p = sub.add_parser("win", help="Capture a manual win (frictionless; surfaces in the digest)")
+    win_p.add_argument("text", nargs="+", help="The accomplishment text (free-form)")
+    win_p.add_argument("--json", action="store_true", help="Structured JSON output")
+
+    # A bare invocation (no subcommand) is the scheduled cron path: default to the
+    # weekly harvest in --auto mode with structured JSON output, which the agent
+    # then narrates. The reactive /ledger passes ``harvest`` explicitly (no --auto).
     parser.set_defaults(cmd="harvest", window=harvest_state.WINDOW_WEEK,
-                        since=None, dry_run=False, json=True)
+                        since=None, dry_run=False, json=True, auto=True)
 
     args = parser.parse_args(argv)
     if args.cmd == "approve":
         return _run_approve_cli(args)
+    if args.cmd == "win":
+        return _run_win_cli(args)
     return _run_harvest_cli(args)
 
 

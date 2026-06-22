@@ -222,6 +222,22 @@ def debrief_reprompt_interval_minutes() -> int:
     return _int_env("DEBRIEF_REPROMPT_INTERVAL_MINUTES", 120)
 
 
+# --- Accomplishment ledger knobs (U5 / H8) --------------------------------
+
+def ledger_digest_weekday() -> int:
+    """Weekday the weekly brag digest auto-fires on (0=Mon .. 6=Sun, default 4=Fri).
+
+    H8 moves the auto-harvest from a daily push to a WEEKLY digest: a daily
+    auto-queue is "another thing to service" and the harvest mis-weights what it
+    surfaces. The proactive (cron) path only sends on this weekday AND only when the
+    digest has content -- a reactive ``/ledger`` ignores it and works any day.
+    Clamped to 0..6 so a misconfig (e.g. 9) degrades to Friday rather than a weekday
+    that never matches and silently mutes the digest forever.
+    """
+    day = _int_env("LEDGER_DIGEST_WEEKDAY", 4)
+    return day if 0 <= day <= 6 else 4
+
+
 # --- Undo windows (Decision #8) -------------------------------------------
 
 def undo_window_nag_hours() -> int:

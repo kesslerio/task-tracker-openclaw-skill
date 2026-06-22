@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Telegram slash command wrapper for task-tracker skill
 # Usage: telegram-commands.sh {daily|weekly|promote|swap|done|reschedule|snooze|body-double|start|cancel-session|
-#                              done24h|done7d|ledger|approve|nag-check|nag|quiet|unquiet|audit|undo}
+#                              done24h|done7d|ledger|ledger-cron|win|approve|nag-check|nag|quiet|unquiet|audit|undo}
 #
 # U1 NO-RAW-ERROR-LEAK boundary: every python3 invocation goes through
 # run_with_envelope, which captures stdout AND stderr. On a non-zero exit the
@@ -79,8 +79,17 @@ case "$1" in
     ;;
   done7d|ledger)
     # U5: replaces the broken done7d. Harvests the current ISO week and proves
-    # the Done-topic delivery target before the draft is pushed.
+    # the Done-topic delivery target before the draft is pushed. REACTIVE (no
+    # --auto): works any day, sends a "nothing to report" line when empty, and
+    # records NO ledger_harvest health (a user-asked run is not a cron heartbeat).
     run_with_envelope "ledger_harvest" python3 "$SCRIPT_DIR/harvest_ledger.py" harvest --window week
+    ;;
+  ledger-cron)
+    # H8: the SCHEDULED weekly brag digest (the U5 cron points here). --auto engages
+    # the Friday+content gate (silent on non-Friday and when empty) AND records
+    # ledger_harvest health, so a silently-broken weekly harvest shows up in the
+    # manifest instead of false-greening. Every reactive path stays un-auto'd.
+    run_with_envelope "ledger_harvest" python3 "$SCRIPT_DIR/harvest_ledger.py" harvest --window week --auto
     ;;
   approve)
     # U5: approve one matched ledger task (`approve <task_id> <inbound_topic_id>`).
@@ -89,6 +98,14 @@ case "$1" in
     # correctness proof.
     run_with_envelope "ledger_harvest" python3 "$SCRIPT_DIR/harvest_ledger.py" \
       approve "$2" --topic-id "$3"
+    ;;
+  win)
+    # H8: `/win <text>` -- frictionless manual win capture. No board cap, no
+    # validation gate (capture must never block); the win is durably appended and
+    # surfaces in the next weekly brag digest's classified bucket. The free-form
+    # tail is forwarded verbatim. Reactive: the reply lands in the originating topic.
+    shift
+    run_with_envelope "win" python3 "$SCRIPT_DIR/harvest_ledger.py" win "$@"
     ;;
   audit)
     # U2: list recent autonomous acts, or detail one with `audit act_<id>`.
@@ -173,7 +190,7 @@ case "$1" in
     run_with_envelope "manifest" python3 "$SCRIPT_DIR/cos_manifest.py" manifest
     ;;
   *)
-    echo "Usage: $0 {daily|weekly|promote|swap|done|reschedule|snooze|body-double|start|cancel-session|done24h|done7d|ledger|approve|nag-check|nag|quiet|unquiet|health|manifest|audit|undo}"
+    echo "Usage: $0 {daily|weekly|promote|swap|done|reschedule|snooze|body-double|start|cancel-session|done24h|done7d|ledger|ledger-cron|win|approve|nag-check|nag|quiet|unquiet|health|manifest|audit|undo}"
     exit 1
     ;;
 esac

@@ -56,16 +56,19 @@ _DEFAULT_STALE_HOURS = 36
 # ONLY rituals that actually RECORD a health success on a clean run belong here, or a
 # healthy ritual would be permanently false-MISSING. ``standup``/``weekly_review``/
 # ``eod_review`` record via ``error_envelope.run_main`` (success on a 0 return);
-# ``nag_check`` records via ``_record_nag_health`` on the cron fire. ``ledger_harvest``
-# is deliberately NOT registered: ``harvest_ledger.py`` neither uses ``run_main`` nor
-# calls ``cos_health`` and always exits 0, so it has no success path -- registering it
-# would false-MISSING forever. Wiring its health is folded into H8 (the ledger rework);
-# add it here once it records success on a clean harvest + failure on ``ok:false``.
+# ``nag_check`` and ``ledger_harvest`` record via their own ``_record_*_health`` on the
+# cron fire (both run under the shell ``run_with_envelope``, not ``run_main``, and catch
+# their own crash to exit 0, so they MUST record health directly or they false-green
+# until STALE). H8 wired ``ledger_harvest`` health: ``--auto`` records success on a clean
+# weekly harvest and failure on an ``ok:false`` result, ONLY on the cron path (a reactive
+# ``/ledger`` records nothing). Its cadence is now WEEKLY (the digest fires Friday), so a
+# weekly ceiling matches ``weekly_review``.
 _EXPECTED_RITUALS: dict[str, int] = {
-    "standup": 24,            # daily cadence
-    "weekly_review": 24 * 8,  # weekly cadence + a missed run of slack
-    "nag_check": 24,          # fires every ~3h in work hours; daily is a loose ceiling
-    "eod_review": 24,         # end-of-day cadence
+    "standup": 24,             # daily cadence
+    "weekly_review": 24 * 8,   # weekly cadence + a missed run of slack
+    "nag_check": 24,           # fires every ~3h in work hours; daily is a loose ceiling
+    "eod_review": 24,          # end-of-day cadence
+    "ledger_harvest": 24 * 8,  # weekly brag digest (Friday) + a missed run of slack
 }
 
 # Stamp files checked (in order) for the deployed skill version. Best-effort: the
