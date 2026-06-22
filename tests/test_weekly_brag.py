@@ -588,6 +588,25 @@ def _run_cli_auto(monkeypatch, since="2026-01-01", *, sender=None):
     return harvest_ledger._run_harvest_cli(args)
 
 
+def test_auto_cli_stdout_carries_status_not_draft(env, monkeypatch, capsys):
+    """Anti-double-send (O3 HIGH 1): the --auto CLI prints ONLY a compact status line on
+    stdout, NEVER the draft. The auto digest already delivered itself via the
+    receipt-backed outbox, so the cron's blind announce of stdout must carry nothing
+    user-facing -- else it would re-send the digest the script already sent."""
+    _set_productivity_env(monkeypatch)
+    _stub_sources(monkeypatch, gh_payload=PR_PAYLOAD)
+    rc = _run_cli_auto(monkeypatch)  # delivers via the fake receipt-returning sender
+    assert rc == 0  # the CLI returns an exit code; clean success
+    out = capsys.readouterr().out
+    # The draft text is ABSENT from stdout (no re-announce / double-send)...
+    assert "Accomplishment Ledger" not in out
+    assert PR_PAYLOAD[0]["title"] not in out
+    # ...only the operational status keys are present.
+    assert '"draft_pushed": true' in out
+    assert '"harvest_window_id"' in out
+    assert '"delivery_target"' not in out  # the proven target is NOT leaked to stdout
+
+
 def test_cron_source_error_records_failure_and_manifest_degraded(env, monkeypatch):
     """A SOURCE-SUBPROCESS failure on the REAL cron flow (gh exits nonzero) records a
     ledger_harvest FAILURE -- a quiet-empty digest is NOT mistaken for healthy. This

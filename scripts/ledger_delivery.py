@@ -25,6 +25,8 @@ proven target to receipt-back -- so it consumes on PROOF (still through
 
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -36,6 +38,45 @@ from task_ledger import append_event, new_event
 # The kind component of the ledger idem-key: only the scheduled Friday digest is
 # receipt-backed (the reactive pull delivers via the relay to a dynamic topic).
 AUTO_KIND = "auto"
+
+# The NON-draft status keys the auto-path announce may carry (operational only).
+_AUTO_STATUS_KEYS = ("ok", "draft_pushed", "reason", "harvest_window_id",
+                     "evidence_count", "win_count", "push_blocked_reason")
+
+
+def auto_status_line(payload: dict[str, Any]) -> str:
+    """A compact, NON-draft status line for the SCHEDULED (``--auto``) digest stdout.
+
+    The auto digest OWNS its delivery (it already sent the draft via the receipt-backed
+    outbox above), so the cron's blind ``announce`` of stdout must NOT re-announce the
+    draft -- that would double-send. Emits only an operational status (no draft / no
+    delivery_target) so the announce carries nothing user-facing -- the same shape
+    ``checkin_dispatch`` uses for its already-delivered check-in.
+    """
+    return json.dumps({k: payload.get(k) for k in _AUTO_STATUS_KEYS},
+                      sort_keys=True, default=str)
+
+
+@dataclass(frozen=True)
+class DigestPush:
+    """The artifacts of ONE harvest run that are ready to deliver + consume.
+
+    Bundles the harvest ``state`` plus the run's computed ``draft`` / ``fresh``
+    evidence / ``wins`` / ``match_index`` / ``pending_task_ids`` so the delivery+consume
+    seam takes one cohesive payload instead of a dozen positional locals threaded out of
+    ``run_harvest``. ``pushed_key`` is the kind-aware dedup field (``auto_pushed_window``
+    / ``reactive_pushed_window``).
+    """
+
+    state: dict[str, Any]
+    window: str
+    pushed_key: str
+    harvest_window_id: str
+    match_index: dict[str, dict[str, Any]]
+    pending_task_ids: list[str]
+    fresh: list[dict[str, Any]]
+    wins: list[dict[str, Any]]
+    draft: str
 
 
 def deliver_auto_digest(
@@ -75,10 +116,9 @@ def deliver_auto_digest(
     }
 
 
-def log_draft_pushed(
-    proof: dict[str, Any], *, harvest_window_id: str, pending_task_ids: list[str],
-    evidence_count: int, actor: str, source: str,
-    message_id: str | None = None, idem_key: str | None = None,
+def _log_draft_pushed(
+    proof: dict[str, Any], push: DigestPush, *, actor: str, source: str,
+    message_id: str | None, idem_key: str | None,
 ) -> None:
     """Append the ``ledger_draft_pushed`` proof-of-DELIVERY event.
 
@@ -88,10 +128,10 @@ def log_draft_pushed(
     digest WAS delivered, never merely proven (the O3 HIGH 1 invariant).
     """
     metadata: dict[str, Any] = {
-        "harvest_window_id": harvest_window_id,
+        "harvest_window_id": push.harvest_window_id,
         "delivery_target": proof["delivery_target"],
-        "pending_task_ids": pending_task_ids,
-        "evidence_count": evidence_count,
+        "pending_task_ids": push.pending_task_ids,
+        "evidence_count": len(push.fresh),
         "act_id": proof["act_id"],
     }
     if message_id is not None:
@@ -101,11 +141,7 @@ def log_draft_pushed(
     append_event(new_event("ledger_draft_pushed", actor=actor, source=source, metadata=metadata))
 
 
-def consume_pushed_state(
-    proof: dict[str, Any], *, state: dict[str, Any], window: str, pushed_key: str,
-    harvest_window_id: str, match_index: dict[str, dict[str, Any]],
-    pending_task_ids: list[str], fresh: list[dict[str, Any]], wins: list[dict[str, Any]],
-) -> None:
+def _consume(proof: dict[str, Any], push: DigestPush) -> None:
     """Consume the digest's state: set the pushed-window, merge pending-approval ids,
     mark evidence + wins seen, and persist. Called ONLY after the digest is confirmed
     DELIVERED -- a RECEIPT on the auto path, PROOF on the reactive (relay) path.
@@ -117,28 +153,26 @@ def consume_pushed_state(
     marked seen on the SAME success condition so a win/PR captured after this push stays
     unseen for the next one and a delivered item never repeats.
     """
-    state[pushed_key] = harvest_window_id
+    state = push.state
+    state[push.pushed_key] = push.harvest_window_id
     state["draft_pushed_at"] = datetime.now(timezone.utc).isoformat()
     state["delivery_target"] = proof["delivery_target"]
     approved = set(state.get("approved_task_ids") or [])
-    merged_ids = (set(state.get("pending_task_ids") or []) | set(pending_task_ids)) - approved
+    merged_ids = (set(state.get("pending_task_ids") or []) | set(push.pending_task_ids)) - approved
     state["pending_task_ids"] = sorted(merged_ids)
     state["pending_matches"] = {
         tid: match for tid, match in {
             **(state.get("pending_matches") or {}),
-            **match_index,
+            **push.match_index,
         }.items() if tid not in approved
     }
-    harvest_state.mark_seen(state, [item["evidence_hash"] for item in fresh])
-    harvest_state.save_state(state, window)
-    win_store.mark_wins_seen([win["id"] for win in wins])
+    harvest_state.mark_seen(state, [item["evidence_hash"] for item in push.fresh])
+    harvest_state.save_state(state, push.window)
+    win_store.mark_wins_seen([win["id"] for win in push.wins])
 
 
 def push_and_consume(
-    proof: dict[str, Any], *, state: dict[str, Any], window: str, pushed_key: str,
-    harvest_window_id: str, match_index: dict[str, dict[str, Any]],
-    pending_task_ids: list[str], fresh: list[dict[str, Any]], wins: list[dict[str, Any]],
-    draft: str, auto: bool, actor: str, source: str,
+    proof: dict[str, Any], push: DigestPush, *, auto: bool, actor: str, source: str,
     sender: Callable[[dict[str, Any], str], dict[str, Any]] | None,
 ) -> dict[str, Any]:
     """Deliver the digest and consume state ONLY on a confirmed delivery.
@@ -164,8 +198,8 @@ def push_and_consume(
     idem_key: str | None = None
     if auto:
         # AUTO digest: the script owns the send. Consume ONLY on a real receipt.
-        delivered = deliver_auto_digest(proof["delivery_target"], draft,
-                                        harvest_window_id, sender=sender)
+        delivered = deliver_auto_digest(proof["delivery_target"], push.draft,
+                                        push.harvest_window_id, sender=sender)
         if not delivered["ok"]:
             # Transport failed: consume NOTHING, set no pushed-window. The reason flows
             # to push_blocked_reason so the cron path records a FAILURE (no false-green).
@@ -173,12 +207,7 @@ def push_and_consume(
         message_id, idem_key = delivered.get("message_id"), delivered.get("idem_key")
     # Delivered (auto: a receipt; reactive: the relay handoff). Log the
     # proof-of-delivery push event and consume evidence + wins.
-    log_draft_pushed(proof, harvest_window_id=harvest_window_id,
-                     pending_task_ids=pending_task_ids, evidence_count=len(fresh),
-                     actor=actor, source=source, message_id=message_id, idem_key=idem_key)
-    consume_pushed_state(
-        proof, state=state, window=window, pushed_key=pushed_key,
-        harvest_window_id=harvest_window_id, match_index=match_index,
-        pending_task_ids=pending_task_ids, fresh=fresh, wins=wins,
-    )
+    _log_draft_pushed(proof, push, actor=actor, source=source,
+                      message_id=message_id, idem_key=idem_key)
+    _consume(proof, push)
     return {"ok": True, "delivery_target": proof["delivery_target"]}

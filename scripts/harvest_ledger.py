@@ -622,10 +622,14 @@ def run_harvest(window: str, *, since_override: str | None, dry_run: bool, trigg
         # (it owns the receipt-backed send); the REACTIVE pull consumes on proof (the
         # relay delivers to the dynamic originating topic). See push_and_consume.
         push = ledger_delivery.push_and_consume(
-            proof, state=state, window=window, pushed_key=pushed_key,
-            harvest_window_id=harvest_window_id, match_index=_pending_match_index(matches),
-            pending_task_ids=pending_task_ids, fresh=fresh, wins=wins,
-            draft=draft, auto=auto, actor=ACTOR, source=LEDGER_SOURCE, sender=sender,
+            proof,
+            ledger_delivery.DigestPush(
+                state=state, window=window, pushed_key=pushed_key,
+                harvest_window_id=harvest_window_id,
+                match_index=_pending_match_index(matches),
+                pending_task_ids=pending_task_ids, fresh=fresh, wins=wins, draft=draft,
+            ),
+            auto=auto, actor=ACTOR, source=LEDGER_SOURCE, sender=sender,
         )
 
     return {
@@ -859,30 +863,13 @@ def _record_ledger_health(result: dict[str, Any]) -> None:
 # --- CLI -------------------------------------------------------------------
 
 
-# The non-draft status keys the auto-path announce may carry (operational only).
-_AUTO_STATUS_KEYS = ("ok", "draft_pushed", "reason", "harvest_window_id",
-                     "evidence_count", "win_count", "push_blocked_reason")
-
-
-def _auto_status_line(payload: dict[str, Any]) -> str:
-    """A compact, NON-draft status line for the SCHEDULED (``--auto``) digest.
-
-    The auto digest OWNS its delivery (it already sent the draft via the receipt-backed
-    outbox), so the cron's blind ``announce`` of stdout must NOT re-announce the draft
-    -- that would double-send. Emits only an operational status so the announce carries
-    nothing user-facing (mirrors ``checkin_dispatch``'s small status line).
-    """
-    status = {k: payload.get(k) for k in _AUTO_STATUS_KEYS}
-    return json.dumps(status, sort_keys=True, default=str)
-
-
 def _emit(payload: dict[str, Any], *, as_json: bool, auto: bool = False) -> None:
     # SCHEDULED (--auto): the digest already delivered itself (receipt-backed outbox),
     # so stdout carries ONLY a compact status line (no draft) -- the cron's blind
     # announce then delivers nothing and CANNOT double-send. The REACTIVE path still
     # emits the draft for the agent relay to deliver.
     if auto:
-        print(_auto_status_line(payload))
+        print(ledger_delivery.auto_status_line(payload))
         return
     if as_json:
         print(json.dumps(payload, indent=2, sort_keys=True, default=str))
