@@ -44,6 +44,7 @@ from task_transitions import block_unsafe_query, complete_by_id, print_result
 from task_records import (
     active_records,
     record_to_task_dict,
+    task_records,
 )
 from utils import (
     detect_format,
@@ -184,20 +185,24 @@ def _add_destination_is_active(priority: str | None, content: str) -> bool:
 def _log_wip_cap_enforced(title: str, summary, routing: str | None) -> None:
     """Append a ``wip_cap_enforced`` ledger event (best-effort).
 
-    Both the blocked-add and the ``--force-parking`` paths are user-initiated CLI
-    commands, so both are ``source="user_command"`` -- the routing decision is
-    carried in ``proposed_routing`` metadata, not by mislabeling the actor source.
+    H6: an over-cap add is captured to the parking lot (the cap gates promotion,
+    not capture). The add is a user-initiated CLI command, so ``source="user_command"``
+    -- the routing decision rides in ``proposed_routing`` metadata, not by
+    mislabeling the actor source.
     """
     try:
         from task_ledger import append_event, new_event
 
-        metadata = {
-            "task_title": title,
-            "current_count": summary.active_count,
-            "estimated_minutes": summary.estimated_minutes,
-            "capacity_minutes": summary.capacity_minutes,
-            "hard_cap": summary.hard_cap,
-        }
+        metadata = {"task_title": title}
+        if summary is not None:
+            metadata.update(
+                {
+                    "current_count": summary.active_count,
+                    "estimated_minutes": summary.estimated_minutes,
+                    "capacity_minutes": summary.capacity_minutes,
+                    "hard_cap": summary.hard_cap,
+                }
+            )
         if routing:
             metadata["proposed_routing"] = routing
         append_event(
@@ -212,77 +217,53 @@ def _log_wip_cap_enforced(title: str, summary, routing: str | None) -> None:
         pass
 
 
-def add_task(args):
-    """Add a new task."""
-    tasks_file, format = get_tasks_file(args.personal)
+def _build_active_task_line(title: str, *, due: str | None = None,
+                            area: str | None = None, owner: str | None = None,
+                            task_id: str | None = None,
+                            estimate: str | None = None) -> tuple[str, str]:
+    """Build a canonical active-board task line. Returns (task_line, task_id).
 
-    if not tasks_file.exists():
-        print(f"❌ Tasks file not found: {tasks_file}")
-        return
+    The single home for the active task-line shape so ``add_task`` (capture) and
+    the H6 ``promote``/``swap`` paths emit byte-identical lines -- a promoted task
+    must look exactly like a directly-added one, never a parking-lot variant.
 
-    content = tasks_file.read_text()
+    ``estimate`` is optional; when supplied it emits the SAME ``estimate:: <val>``
+    token ``parse_tasks`` reads for the capacity cap, so a promoted task restores
+    the original estimate and ``focus_core`` counts it at its real load rather than
+    the unestimated default. The under-cap add path passes no estimate (the CLI has
+    no ``--estimate`` arg), so its behavior is unchanged -- no stray token.
+    """
+    task_id = task_id or f"tsk_{uuid.uuid4().hex[:16]}"
+    task_line = f'- [ ] **{title}**'
+    if due:
+        task_line += f' 🗓️{due}'
+    task_line += f' task_id::{task_id}'
+    if area:
+        task_line += f' area:: {area}'
+    if estimate:
+        task_line += f' estimate:: {estimate}'
+    default_owner = os.getenv('TASK_TRACKER_DEFAULT_OWNER', 'me')
+    if owner and owner not in ('me', default_owner):
+        task_line += f' owner:: {owner}'
+    return task_line, task_id
 
-    # Layer-2 active-inventory cap (Contract 6 / Decision #7): a WRITE-TIME gate.
-    # The decision is computed once in focus_core (the canonical capacity layer)
-    # AFTER reading the file and BEFORE any board write, so a blocked add leaves
-    # the board byte-identical. The cap is date-INDEPENDENT (it governs total
-    # active load, not today's plan), so a skipped morning ritual never silences
-    # it. It NEVER force-evicts; an over-cap add is nudged to the parking lot, and
-    # --force-parking routes it there instead of blocking.
-    #
-    # Scope: the cap governs the WORK board only (the knobs are sized for the work
-    # inventory), matching standup / standup-summary -- a personal add is never
-    # gated. And it only fires for adds destined for an ACTIVE section:
-    # --priority low routes to the inactive Backlog (excluded from active_records),
-    # so it adds zero active load and must not be blocked.
-    from focus_core import evaluate_add
 
-    destination_active = (not args.personal) and _add_destination_is_active(args.priority, content)
-    gate = evaluate_add(
-        content,
-        format,
-        args.title,
-        destination_active=destination_active,
-        personal=args.personal,
-    )
-    if not gate.allowed:
-        if getattr(args, "force_parking", False):
-            from parking_lot import add_item
+def _insert_active_task(content: str, priority: str | None, area: str | None,
+                        task_line: str) -> str | None:
+    """Splice ``task_line`` into the active section for ``priority``.
 
-            # add_item returns an error STRING (parking lot full / no section)
-            # instead of raising. A failed route must NOT exit 0 or log a
-            # successful routing -- otherwise a piping agent believes the task
-            # was captured when it was dropped. Only log + succeed on a real add.
-            result = add_item(tasks_file, args.title, dept=args.area, priority="low")
-            print(result)
-            if result.startswith("❌"):
-                sys.exit(2)
-            _log_wip_cap_enforced(args.title, gate.summary, routing="parking_lot")
-            return
-        print(gate.denial_message)
-        _log_wip_cap_enforced(args.title, gate.summary, routing=None)
-        sys.exit(2)
-
-    # Build task entry with emoji date format
+    Mirrors ``add_task``'s section-resolution fallbacks (legacy priority anchor ->
+    All Tasks dept -> first dept header). Returns the new board content, or None
+    when no insertion anchor exists. Shared by capture, promote and swap so all
+    three insert into the same place.
+    """
     priority_patterns = {
         'high': r'^##\s+🔴(?:\s|$)',
         'medium': r'^##\s+🟡(?:\s|$)',
         'low': r'^##\s+⚪(?:\s|$)',
     }
-    priority_pattern = priority_patterns.get(args.priority, r'^##\s+🟡(?:\s|$)')
-    
-    # Build task line
-    task_id = f"tsk_{uuid.uuid4().hex[:16]}"
-    task_line = f'- [ ] **{args.title}**'
-    if args.due:
-        task_line += f' 🗓️{args.due}'
-    task_line += f' task_id::{task_id}'
-    if args.area:
-        task_line += f' area:: {args.area}'
-    default_owner = os.getenv('TASK_TRACKER_DEFAULT_OWNER', 'me')
-    if args.owner and args.owner not in ('me', default_owner):
-        task_line += f' owner:: {args.owner}'
-    
+    priority_pattern = priority_patterns.get(priority, r'^##\s+🟡(?:\s|$)')
+
     def _next_h2_pos(text: str, start_pos: int) -> int:
         match = re.search(r'^##\s+', text[start_pos:], re.MULTILINE)
         if not match:
@@ -325,8 +306,8 @@ def add_task(args):
             all_tasks_body = content[all_tasks_header_end:all_tasks_section_end]
 
             dept_match = None
-            if args.area:
-                area_re = re.escape(args.area.strip())
+            if area:
+                area_re = re.escape(area.strip())
                 dept_match = re.search(rf'^###.*\b{area_re}\b.*$', all_tasks_body, re.MULTILINE | re.IGNORECASE)
             if not dept_match:
                 dept_match = re.search(r'^###\s+.+$', all_tasks_body, re.MULTILINE)
@@ -351,13 +332,441 @@ def add_task(args):
                 insert_pos = _advance_after_header(content, dept_header_end)
 
     if insert_pos is None:
+        return None
+    return content[:insert_pos] + task_line + '\n' + content[insert_pos:]
+
+
+def add_task(args):
+    """Add a new task."""
+    tasks_file, format = get_tasks_file(args.personal)
+
+    if not tasks_file.exists():
+        print(f"❌ Tasks file not found: {tasks_file}")
+        return
+
+    content = tasks_file.read_text()
+
+    # Layer-2 active-inventory cap (Contract 6 / Decision #7 + H6): a WRITE-TIME
+    # gate. The decision is computed once in focus_core (the canonical capacity
+    # layer) AFTER reading the file and BEFORE any board write. H6: capture NEVER
+    # blocks -- when the active set is full the new task is ALWAYS captured to the
+    # parking lot (the inbox) and the add SUCCEEDS, so a commitment is never pushed
+    # out of the system into the user's head. The cap now gates PROMOTION onto the
+    # active board (see promote/swap), not capture. The cap is date-INDEPENDENT (it
+    # governs total active load, not today's plan), so a skipped morning ritual
+    # never silences it; it NEVER force-evicts.
+    #
+    # Scope: the cap governs the WORK board only (the knobs are sized for the work
+    # inventory), matching standup / standup-summary -- a personal add is never
+    # gated. And it only fires for adds destined for an ACTIVE section:
+    # --priority low routes to the inactive Backlog (excluded from active_records),
+    # so it adds zero active load and lands on the board normally.
+    from focus_core import evaluate_add
+
+    destination_active = (not args.personal) and _add_destination_is_active(args.priority, content)
+    gate = evaluate_add(
+        content,
+        format,
+        args.title,
+        destination_active=destination_active,
+        personal=args.personal,
+    )
+    if not gate.allowed:
+        # H6 Fix 1: over-cap => capture to the parking lot and SUCCEED. This is now
+        # the DEFAULT (no flag required); --force-parking is kept as a harmless
+        # alias since the over-cap path already routes to parking. Only a real
+        # capture FAILURE (add_item returns an "❌" string -- lot full / no
+        # section) is surfaced as a non-zero exit, so a task that truly cannot be
+        # saved is never reported as captured.
+        from parking_lot import add_item
+
+        # Thread --due / --owner through so a captured task does not silently lose
+        # its due date or owner ("saved, not lost"). They ride on the parked line
+        # and /promote re-derives them onto the restored active line (H6 Fix 2).
+        # The default owner ("me") is suppressed -- the same round-trip rule as
+        # _build_active_task_line -- so a normal capture carries no stray owner.
+        default_owner = os.getenv('TASK_TRACKER_DEFAULT_OWNER', 'me')
+        capture_owner = args.owner if args.owner and args.owner not in ('me', default_owner) else None
+        result = add_item(
+            tasks_file, args.title, dept=args.area, priority="low",
+            due=args.due, owner=capture_owner,
+        )
+        if result.startswith("❌"):
+            print(result)
+            sys.exit(2)
+        summary = gate.summary
+        cap_h = (summary.capacity_minutes // 60) if summary else 0
+        active_n = summary.active_count if summary else 0
+        print(
+            f"📥 Captured to the parking lot — you're at capacity "
+            f"({active_n} committed / ~{cap_h}h). It's saved, not lost.\n"
+            f"Promote it with /promote <id> when there's room, or "
+            f"/swap <out_id> <id> to make room now."
+        )
+        _log_wip_cap_enforced(args.title, gate.summary, routing="parking_lot")
+        return
+
+    task_line, task_id = _build_active_task_line(
+        args.title, due=args.due, area=args.area, owner=args.owner
+    )
+    new_content = _insert_active_task(content, args.priority, args.area, task_line)
+    if new_content is None:
+        priority_patterns = {
+            'high': r'^##\s+🔴(?:\s|$)',
+            'medium': r'^##\s+🟡(?:\s|$)',
+            'low': r'^##\s+⚪(?:\s|$)',
+        }
+        priority_pattern = priority_patterns.get(args.priority, r'^##\s+🟡(?:\s|$)')
         print(f"⚠️ Could not find section matching '{priority_pattern}'. Add manually.")
         return
 
-    new_content = content[:insert_pos] + task_line + '\n' + content[insert_pos:]
     _atomic_write(tasks_file, new_content)
     task_type = "Personal" if args.personal else "Work"
     print(f"✅ Added {task_type} task: {args.title} ({task_id})")
+
+
+def _log_promotion_event(event_type: str, *, title: str, summary, extra: dict | None = None) -> None:
+    """Append a ``task_promoted`` / ``task_swapped`` ledger event (best-effort).
+
+    A promote/swap is a user CLI command, so ``source="user_command"``. The
+    capacity snapshot at the time of the move rides in metadata so an auditor can
+    see the committed load the promotion landed against.
+    """
+    try:
+        from task_ledger import append_event, new_event
+
+        metadata = {"task_title": title}
+        if summary is not None:
+            metadata.update(
+                {
+                    "current_count": summary.active_count,
+                    "estimated_minutes": summary.estimated_minutes,
+                    "capacity_minutes": summary.capacity_minutes,
+                    "hard_cap": summary.hard_cap,
+                }
+            )
+        if extra:
+            metadata.update(extra)
+        append_event(
+            new_event(
+                event_type,
+                actor="niemand-work",
+                source="user_command",
+                metadata=metadata,
+            )
+        )
+    except Exception:
+        pass
+
+
+def _find_parked_item(content: str, item_id: int):
+    """Return the parked item dict for ``item_id``, or None.
+
+    Parses the Parking Lot via the same helpers the parking-lot CLI uses, so the
+    promote/swap notion of "parked item N" matches ``parking-lot list`` exactly.
+    """
+    from parking_lot import _find_parking_lot_bounds, _parse_items
+
+    lines = content.split('\n')
+    start, end = _find_parking_lot_bounds(lines)
+    if start == -1:
+        return None
+    items = _parse_items(lines, start, end)
+    return next((it for it in items if it['id'] == item_id), None)
+
+
+def _promote_parked_onto_board(tasks_file, fmt: str, item_id: int, *, personal: bool):
+    """Capacity-gated move of a parked item onto the active board.
+
+    Returns a result dict ``{ok, message, [exit_code], [title], [summary]}``. The
+    move adds the active line FIRST, then removes the parked line, so a crash
+    between the two writes leaves the task DOUBLE-placed (recoverable) rather than
+    LOST. The capacity gate re-runs ``evaluate_add`` for the to-be-promoted task;
+    a full committed set refuses without moving anything.
+    """
+    from focus_core import evaluate_add
+    from parking_lot import drop_item
+
+    content = tasks_file.read_text()
+    parked = _find_parked_item(content, item_id)
+    if parked is None:
+        return {"ok": False, "message": f"❌ Item #{item_id} not found in Parking Lot.", "exit_code": 2}
+
+    title = parked['title']
+    area = parked.get('department')
+    # Re-derive due/owner/estimate from the self-describing parked line so the
+    # restored active line carries them (H6 Fix 2: a captured task's due date /
+    # owner / estimate are "saved, not lost", not silently dropped on promote).
+    # Without the estimate the re-promoted task would count at the unestimated
+    # default (2h) instead of its real load -- a capacity under-count.
+    due = parked.get('due')
+    owner = parked.get('owner')
+    estimate = parked.get('estimate')
+    # Preserve the parked task's canonical id through the promote so it round-trips
+    # (capture -> promote, swap-out -> promote-in keep one stable identity).
+    id_match = re.search(
+        r'(?:task_id|id)::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])', parked.get('raw_line') or ''
+    )
+    carried_id = id_match.group(1) if id_match else None
+
+    # Promotion gate: re-run the canonical capacity check for THIS task. A personal
+    # board is never work-cap gated (matching add_task's scope decision).
+    destination_active = not personal
+    gate = evaluate_add(content, fmt, title, destination_active=destination_active, personal=personal)
+    if not gate.allowed:
+        summary = gate.summary
+        cap_h = (summary.capacity_minutes // 60) if summary else 0
+        active_n = summary.active_count if summary else 0
+        return {
+            "ok": False,
+            "message": (
+                f"Committed set is full ({active_n} / ~{cap_h}h). "
+                f"/swap <out_id> {item_id} to make room, or /done something first."
+            ),
+            "exit_code": 2,
+        }
+
+    # Add to the active board FIRST (so a crash double-places, never loses).
+    task_line, _ = _build_active_task_line(
+        title, due=due, area=area, owner=owner, task_id=carried_id, estimate=estimate
+    )
+    new_content = _insert_active_task(content, "medium", area, task_line)
+    if new_content is None:
+        return {"ok": False, "message": "⚠️ Could not find a section to promote into.", "exit_code": 2}
+    _atomic_write(tasks_file, new_content)
+
+    # Then remove from the parking lot. drop_item re-reads the file, so it sees the
+    # active task we just added but removes by the parking-lot item id.
+    drop_result = drop_item(tasks_file, item_id)
+    if drop_result.startswith("❌"):
+        # Active add succeeded but the parking removal failed: the task is on the
+        # board (not lost). Surface the partial state honestly.
+        return {
+            "ok": False,
+            "message": (
+                f"⚠️ Promoted '{title}' to the active board, but could not remove the "
+                f"parked copy ({drop_result}). Drop parking item #{item_id} manually."
+            ),
+            "exit_code": 2,
+        }
+    return {"ok": True, "title": title, "summary": gate.summary, "message": f"✅ Promoted '{title}' to the active board."}
+
+
+def promote_task(args):
+    """H6 Fix 2: promote a parked task onto the active board, capacity-gated."""
+    tasks_file, fmt = get_tasks_file(args.personal)
+    if not tasks_file.exists():
+        print(f"❌ Tasks file not found: {tasks_file}")
+        sys.exit(2)
+
+    result = _promote_parked_onto_board(tasks_file, fmt, args.id, personal=args.personal)
+    print(result["message"])
+    if not result["ok"]:
+        sys.exit(result.get("exit_code", 2))
+    _log_promotion_event("task_promoted", title=result["title"], summary=result.get("summary"))
+
+
+def _park_active_task(tasks_file, fmt: str, out_id: str, *, personal: bool):
+    """Move an active board task (by canonical id) INTO the parking lot.
+
+    Returns ``{ok, message, [exit_code], [title]}``. Parks-out by adding the task
+    to the parking lot FIRST, then removing the active line, so a crash between
+    writes double-places (recoverable) rather than loses. Refuses cleanly if
+    ``out_id`` is not an active task on the board.
+    """
+    from parking_lot import add_item
+    from task_lines import remove_task_line
+
+    content = tasks_file.read_text()
+    records = task_records(content, personal=personal, fmt=fmt)
+    target = next(
+        (r for r in active_records(records) if r.canonical_id == out_id and not r.is_objective),
+        None,
+    )
+    if target is None:
+        return {
+            "ok": False,
+            "message": f"❌ '{out_id}' is not an active task on the board.",
+            "exit_code": 2,
+        }
+
+    # Add to the parking lot FIRST (so a crash double-places, never loses). Preserve
+    # the task's canonical id so the parked copy keeps its identity, and carry the
+    # due date / owner / estimate onto the parked line so a swap-out is also "saved,
+    # not lost" and a later promote-in restores them (H6 Fix 2). The estimate matters
+    # for capacity: without it a re-promoted task under-counts at the unestimated
+    # default. ``estimate`` is read from the SAME parsed active record as due/owner.
+    add_result = add_item(
+        tasks_file, target.title, dept=target.department or target.area,
+        priority="low", task_id=target.canonical_id,
+        due=target.due, owner=target.owner, estimate=target.estimate,
+    )
+    if add_result.startswith("❌"):
+        return {"ok": False, "message": add_result, "exit_code": 2}
+
+    # Then remove the active line. The parking add may have shifted line numbers
+    # (e.g. a parking lot above the active line), so re-derive the active record
+    # from the POST-ADD content by canonical id rather than trusting the stale
+    # line number. The parked copy carries the same id, so exclude it by section.
+    content_after_add = tasks_file.read_text()
+    records_after = task_records(content_after_add, personal=personal, fmt=fmt)
+    active_after = next(
+        (r for r in active_records(records_after) if r.canonical_id == out_id and not r.is_objective),
+        None,
+    )
+    if active_after is None:
+        return {
+            "ok": False,
+            "message": (
+                f"⚠️ Parked '{target.title}' but could not relocate the active copy "
+                f"to remove it. Remove it manually."
+            ),
+            "exit_code": 2,
+        }
+    updated = remove_task_line(content_after_add, active_after.raw_line, active_after.line_number)
+    if updated is None:
+        return {
+            "ok": False,
+            "message": (
+                f"⚠️ Parked '{target.title}' but could not remove the active copy. "
+                f"Remove it manually."
+            ),
+            "exit_code": 2,
+        }
+    _atomic_write(tasks_file, updated)
+    # Resolve the parking-lot item id of the just-parked copy (matched by its
+    # preserved canonical id) so a swap can roll the park-out BACK if needed.
+    parked_id = _parked_item_id_for(updated, out_id)
+    return {
+        "ok": True,
+        "title": target.title,
+        "parked_id": parked_id,
+        "message": f"✅ Parked '{target.title}'.",
+    }
+
+
+def _parked_item_id_for(content: str, canonical_id: str) -> int | None:
+    """Return the parking-lot item id whose line carries ``canonical_id``, or None."""
+    from parking_lot import _find_parking_lot_bounds, _parse_items
+
+    lines = content.split('\n')
+    start, end = _find_parking_lot_bounds(lines)
+    if start == -1:
+        return None
+    for item in _parse_items(lines, start, end):
+        raw = item.get('raw_line') or ''
+        if re.search(rf'(?:task_id|id)::\s*{re.escape(canonical_id)}\b', raw):
+            return item['id']
+    return None
+
+
+def swap_tasks(args):
+    """H6 Fix 3: park out_id (active->parking) AND promote in_id (parking->active).
+
+    All-or-nothing: the FULL post-swap capacity is pre-flighted in memory BEFORE
+    any write, so an unequal swap (where the parked-out task frees less than the
+    promoted-in task needs) is REFUSED cleanly with the board left byte-identical
+    -- never a partial move (out parked, in NOT promoted). Only once the projected
+    state is proven to fit does the park-out (which frees a slot so the
+    promote-in's gate passes) run, followed by the promote-in. A bad out/in id
+    also refuses before any write.
+    """
+    tasks_file, fmt = get_tasks_file(args.personal)
+    if not tasks_file.exists():
+        print(f"❌ Tasks file not found: {tasks_file}")
+        sys.exit(2)
+
+    # Validate BOTH ends before mutating anything: a bad out/in id must not leave a
+    # partial move. out_id must be an active task; in_id must be a parked item.
+    content = tasks_file.read_text()
+    records = task_records(content, personal=args.personal, fmt=fmt)
+    out_target = next(
+        (r for r in active_records(records) if r.canonical_id == args.out_id and not r.is_objective),
+        None,
+    )
+    if out_target is None:
+        print(f"❌ '{args.out_id}' is not an active task on the board. Nothing moved.")
+        sys.exit(2)
+    in_target = _find_parked_item(content, args.in_id)
+    if in_target is None:
+        print(f"❌ Parking item #{args.in_id} not found. Nothing moved.")
+        sys.exit(2)
+
+    # Pre-flight the promote-in insertion against the CURRENT board (a dry-run, no
+    # write). If the parked task has nowhere to land, refuse BEFORE the park-out
+    # write so the swap never leaves a partial board (out parked, nothing in).
+    if _insert_active_task(content, "medium", in_target.get('department'), "- [ ] probe") is None:
+        print("❌ No active section to promote into. Nothing moved.")
+        sys.exit(2)
+
+    # Pre-flight the FULL post-swap CAPACITY in memory (no write): would the board
+    # fit AFTER out_id is removed AND in_id is promoted in? Project the state by
+    # removing out_id's active line and SPLICING IN the in-task's real active line
+    # (carrying its preserved estimate), then summarise that projected board with
+    # the canonical capacity layer and check over_cap. The cap's COUNTING is
+    # unchanged -- this only asks the existing summarizer about a projected state.
+    # Using the in-task's REAL estimate (not the unestimated default) keeps an
+    # estimated parked-out task from being silently promoted back over capacity.
+    # If it would NOT fit, refuse cleanly and leave the board BYTE-IDENTICAL.
+    if not args.personal:
+        from focus_core import summarize_capacity
+
+        projected = remove_task_line(content, out_target.raw_line, out_target.line_number)
+        if projected is not None:
+            probe_line, _ = _build_active_task_line(
+                in_target["title"], due=in_target.get("due"),
+                area=in_target.get("department"), owner=in_target.get("owner"),
+                estimate=in_target.get("estimate"),
+            )
+            projected_with_in = _insert_active_task(
+                projected, "medium", in_target.get("department"), probe_line
+            )
+            over_cap = False
+            if projected_with_in is not None:
+                try:
+                    over_cap = summarize_capacity(
+                        task_records(projected_with_in, personal=args.personal, fmt=fmt)
+                    ).over_cap
+                except Exception:
+                    over_cap = False
+            if over_cap:
+                print(
+                    f"❌ Swap won't fit: '{in_target['title']}' needs more room than "
+                    f"'{out_target.title}' frees. /done another task first, or pick a "
+                    f"smaller task. Nothing moved."
+                )
+                sys.exit(2)
+
+    # Park out FIRST -- this frees a committed slot so the promotion gate passes.
+    park_result = _park_active_task(tasks_file, fmt, args.out_id, personal=args.personal)
+    if not park_result["ok"]:
+        print(park_result["message"])
+        sys.exit(park_result.get("exit_code", 2))
+
+    promote_result = _promote_parked_onto_board(tasks_file, fmt, args.in_id, personal=args.personal)
+    if not promote_result["ok"]:
+        # Belt-and-suspenders: the capacity pre-flight already proved the post-swap
+        # state fits, so this should not fire. If it somehow does, roll the park-out
+        # BACK by promoting the parked-out task onto the active board so the swap
+        # never leaves a partial board (out parked, nothing in).
+        parked_id = park_result.get("parked_id")
+        rollback = (
+            _promote_parked_onto_board(tasks_file, fmt, parked_id, personal=args.personal)
+            if parked_id is not None
+            else None
+        )
+        if rollback is None or not rollback.get("ok"):
+            print(park_result["message"])
+        print(promote_result["message"])
+        sys.exit(promote_result.get("exit_code", 2))
+
+    print(f"✅ Swapped: parked '{park_result['title']}', promoted '{promote_result['title']}'.")
+    _log_promotion_event(
+        "task_swapped",
+        title=promote_result["title"],
+        summary=promote_result.get("summary"),
+        extra={"parked_out": park_result["title"], "out_id": args.out_id, "in_id": args.in_id},
+    )
 
 
 def done_task(args):
@@ -1494,10 +1903,27 @@ def main():
     add_parser.add_argument(
         '--force-parking',
         action='store_true',
-        help='When the active-inventory cap is reached, route to the parking lot instead of blocking',
+        help='Deprecated alias: over-cap adds already route to the parking lot by default (H6)',
     )
     add_parser.set_defaults(func=add_task)
-    
+
+    # Promote command (H6): move a parked task onto the active board, capacity-gated.
+    promote_parser = subparsers.add_parser(
+        'promote',
+        help='Promote a parked task onto the active board (capacity-gated)',
+    )
+    promote_parser.add_argument('id', type=int, help='Parking-lot item id (from parking-lot list)')
+    promote_parser.set_defaults(func=promote_task)
+
+    # Swap command (H6): park an active task and promote a parked one in its place.
+    swap_parser = subparsers.add_parser(
+        'swap',
+        help='Park an active task and promote a parked task into the freed slot',
+    )
+    swap_parser.add_argument('out_id', help='Canonical task_id of the active task to park out')
+    swap_parser.add_argument('in_id', type=int, help='Parking-lot item id to promote in')
+    swap_parser.set_defaults(func=swap_tasks)
+
     # Done command
     done_parser = subparsers.add_parser('done', help='Mark task as done by canonical task_id')
     done_parser.add_argument('query', help='Canonical task_id')

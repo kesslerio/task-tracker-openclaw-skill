@@ -65,6 +65,9 @@ KNOWN_EVENT_TYPES: frozenset[str] = frozenset({
     "focus_approved",
     "focus_vetoed",
     "wip_cap_enforced",
+    # H6 -- capture never blocks: promotion gate + swap.
+    "task_promoted",
+    "task_swapped",
     "disposition",
     "disposition_skipped",
     "capacity_overcommit",
