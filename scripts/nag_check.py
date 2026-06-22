@@ -60,6 +60,7 @@ import error_envelope
 import nag_delivery
 import nag_state
 import outbox
+import task_ledger
 from task_ledger import append_event, new_event
 from task_records import active_records, load_records
 
@@ -183,6 +184,29 @@ def _log(event_type: str, *, task_id: str | None = None, **metadata: Any) -> Non
     )
 
 
+def _nag_sent_already_logged(idem_key: str) -> bool:
+    """Has a ``nag_sent`` carrying ``idem_key`` already been appended to the ledger?
+
+    The split-brain REPAIR (Fix B) catches the ledger up to a delivered fact -- but the
+    only state it needs to repair is whatever is MISSING. The ledger (events.jsonl) is
+    append-only and written by a different path than nag-state.json, so the two can
+    drift independently: a fire can append nag_opened+nag_sent and then lose
+    nag-state.json later, leaving the ledger already-caught-up. Without this guard the
+    repair would emit a SECOND nag_sent for the same delivered idem_key, double-counting
+    one delivery (nag_sent counts DELIVERED nags). Keyed on the idem_key the genuine
+    delivery stamped, this makes the repair's ledger emit idempotent against a surviving
+    ledger. A read failure degrades to False (re-emit) -- a duplicate audit line is
+    recoverable; a silently-missing one is the gap the repair exists to close.
+    """
+    try:
+        events = task_ledger.read_events()
+    except Exception:  # noqa: BLE001 -- a ledger read must never fail the repair
+        return False
+    return any(e.get("event_type") == "nag_sent"
+               and (e.get("metadata") or {}).get("idem_key") == idem_key
+               for e in events)
+
+
 def _nag_text(record, section: str, overdue: int) -> str:
     """Fallback wording for a nag push. Deterministic here; the cron prompt
     LLM-varies the phrasing per fire to reduce habituation (spec §2.1) -- this is
@@ -229,7 +253,14 @@ def _authorise_nag(record, section: str, overdue: int, *, dry_run: bool
 
     authorised = nag_delivery.authorise_target(gated["act_id"], gated["delivery_target"])
     if not authorised["ok"]:
-        return {"ok": False, "reason": authorised["reason"], "stage": "assert"}
+        # The gate FIRED (it logged an ``executed`` act under this act_id) but the
+        # gate<->message seam asserted out, so nothing was delivered. Carry the act_id
+        # (Fix C) so the caller can emit a nag_gate_act_undelivered reconciliation
+        # event -- a gated-but-asserted-out nag must not leave an executed act with NO
+        # reconciliation. The PROVE-stage blocks above carry no act_id because gate()
+        # never fired there (target not proven), so they need no reconciliation.
+        return {"ok": False, "reason": authorised["reason"], "stage": "assert",
+                "act_id": gated["act_id"]}
     return {"ok": True, "act_id": gated["act_id"],
             "delivery_target": gated["delivery_target"], "text": text}
 
@@ -301,16 +332,24 @@ def run_nag_check(*, dry_run: bool = False, limit: int | None = None,
                if _firable(snapshot.get(c[0]), ref=ref)]
     to_fire = firable if limit is None else firable[:max(0, limit)]
     counts["deferred"] = len(firable) - len(to_fire)
-    for task_id, record, section, overdue in to_fire:
+    # Fix D: the "+K more" pointer rides the LAST fired nag's gated, receipted send
+    # instead of a separate ungated push. It is computed here (deferred count is known)
+    # and appended ONLY to the final task's text. If nothing fires, no pointer. A
+    # dry-run never delivers, so it appends no pointer (the preview is unchanged).
+    pointer = (_more_pointer_line(counts["deferred"])
+               if counts["deferred"] > 0 and to_fire and not dry_run else None)
+    for index, (task_id, record, section, overdue) in enumerate(to_fire):
+        suffix = pointer if index == len(to_fire) - 1 else None
         _fire_one(task_id, record, section, overdue, counts,
-                  ref=ref, dry_run=dry_run, sender=sender)
+                  ref=ref, dry_run=dry_run, sender=sender, more_pointer=suffix)
 
     return counts
 
 
 def _fire_one(task_id, record, section, overdue, counts, *,
               ref: datetime, dry_run: bool,
-              sender: Callable[[dict[str, Any], str], dict[str, Any]] | None) -> None:
+              sender: Callable[[dict[str, Any], str], dict[str, Any]] | None,
+              more_pointer: str | None = None) -> None:
     """Fire (or skip) ONE task's nag, deciding ack/snooze UNDER the lock.
 
     The whole decision -- re-check ack/snooze, prove+gate+assert, the
@@ -338,11 +377,12 @@ def _fire_one(task_id, record, section, overdue, counts, *,
 
     result = nag_state.transition(
         lambda live: _fire_locked(live, task_id, record, section, overdue,
-                                  ref=ref, sender=sender))
+                                  ref=ref, sender=sender, more_pointer=more_pointer))
     _apply_fire_result(result, task_id, section, counts)
 
 
-def _fire_locked(live, task_id, record, section, overdue, *, ref, sender):
+def _fire_locked(live, task_id, record, section, overdue, *, ref, sender,
+                 more_pointer=None):
     """The under-lock fire decision for ONE task (runs inside nag_state.transition).
 
     Returns a small result dict the caller turns into ledger events + counts. The
@@ -392,12 +432,44 @@ def _fire_locked(live, task_id, record, section, overdue, *, ref, sender):
     # never called and NO phantom ``executed`` act is logged for an undelivered fire.
     # deliver_once re-checks under its own flock, so this peek is an optimisation, not
     # the authority -- the rare post-peek TOCTOU is still caught + reconciled below.
-    if outbox.is_recorded(idem_key):
-        return {"status": "already_delivered"}
+    receipt = outbox.get_receipt(idem_key)
+    if receipt is not None:
+        # The message WAS delivered this cycle (a committed outbox receipt proves it).
+        # Two sub-cases:
+        #   * the loop is ALREADY a genuine open nag loop for this task -> the normal
+        #     same-cycle retry: state+ledger already reflect the delivery, so no-op.
+        #   * the loop is NOT a genuine open loop (e.g. the FIRST fire wrote the outbox
+        #     receipt but the process died before nag_state persisted the loop, then
+        #     nag-state.json was lost) -> REPAIR split-brain: open the loop from the
+        #     receipt's stored target and emit the missing nag_sent carrying the stored
+        #     message_id + idem_key, so state+ledger catch up to the delivered fact.
+        # The repair is idempotent: once it opens the loop, a later same-cycle run sees
+        # a genuine open loop and no-ops -- no double-open, no double nag_sent. It does
+        # NOT gate() (no new send happened), so it carries no act_id and emits no
+        # autonomy act -- it only reconciles state/ledger to a delivery that already
+        # occurred.
+        if nag_state.is_open(current) and nag_state.is_genuine_nag(current):
+            return {"status": "already_delivered"}
+        stored_target = receipt.get("target")
+        opened = nag_state.open_loop(
+            live, task_id, task_title=record.title,
+            threshold_crossed=overdue, threshold_type=section,
+            delivery_target=stored_target, nag_loop_id=nag_state.new_nag_loop_id(),
+        )
+        entry = nag_state.record_sent(live, task_id)
+        return {"status": "repaired", "entry": entry,
+                "delivery_target": stored_target, "overdue": overdue,
+                "message_id": receipt.get("message_id"), "idem_key": idem_key,
+                "nag_loop_id": opened.get("nag_loop_id")}
 
     authorised = _authorise_nag(record, section, overdue, dry_run=False)
     if not authorised["ok"]:
-        return {"status": "blocked", "reason": authorised["reason"]}
+        # Carry the act_id + stage through (Fix C): an ASSERT-stage block means gate()
+        # already fired (executed act logged) but the seam asserted out, so the caller
+        # must reconcile that executed-but-undelivered act. A PROVE-stage block carries
+        # no act_id (gate never fired) and needs no reconciliation.
+        return {"status": "blocked", "reason": authorised["reason"],
+                "stage": authorised.get("stage"), "act_id": authorised.get("act_id")}
     # _authorise_nag's gate() has now logged an ``executed`` act under this act_id. If
     # delivery does NOT happen below, the caller reconciles that act in the ledger.
     act_id = authorised["act_id"]
@@ -419,8 +491,13 @@ def _fire_locked(live, task_id, record, section, overdue, *, ref, sender):
                    else nag_state.new_nag_loop_id())
 
     target = authorised["delivery_target"]
+    # Fix D: fold the "+K more" pointer into THIS nag's text (only the last fired nag
+    # carries a non-None suffix) so it rides the one gated, receipted, idempotent send
+    # -- no separate ungated pointer push. Appended here so the pointer is part of the
+    # exact bytes deliver_once sends and records under the idem-key.
+    text = authorised["text"] + (f"\n\n{more_pointer}" if more_pointer else "")
     try:
-        receipt = outbox.deliver_once(target, authorised["text"], idem_key, sender=sender)
+        receipt = outbox.deliver_once(target, text, idem_key, sender=sender)
     except Exception as exc:  # noqa: BLE001 -- a send failure is a per-task block,
         # not a run crash: leave the loop OPEN (state untouched), log it, move on.
         # The gate already logged an executed act; carry act_id so the caller can
@@ -474,6 +551,14 @@ def _apply_fire_result(result, task_id, section, counts) -> None:
     if status == "blocked":
         _log("nag_delivery_blocked", task_id=task_id, reason=result["reason"],
              section=section)
+        # Fix C: an ASSERT-stage block carries the gate act_id -- the gate FIRED
+        # (executed act logged) but the seam asserted out, so the gated-but-undelivered
+        # act needs a reconciliation event, exactly like the delivery_failed path. A
+        # PROVE-stage block (env-missing / work-group) carries NO act_id (gate never
+        # fired) and emits only the nag_delivery_blocked above -- nothing to reconcile.
+        if result.get("act_id"):
+            _log("nag_gate_act_undelivered", task_id=task_id, act_id=result["act_id"],
+                 reason=result["reason"], stage=result.get("stage", "assert"))
         counts["blocked"] += 1
         return
     if status == "delivery_failed":
@@ -492,6 +577,30 @@ def _apply_fire_result(result, task_id, section, counts) -> None:
             _log("nag_gate_act_undelivered", task_id=task_id, act_id=result["act_id"],
                  reason=result["reason"], stage="send")
         counts["blocked"] += 1
+        return
+    if status == "repaired":
+        # Split-brain repair (Fix B): a prior fire DELIVERED (committed outbox receipt)
+        # but crashed before persisting the loop. This fire found the receipt at the peek
+        # and reopened the loop -- WITHOUT calling the sender (no double-send) and WITHOUT
+        # gate() (no new autonomy act). Catch the LEDGER up to the delivered fact too,
+        # but only if it is actually missing: events.jsonl is append-only and drifts
+        # independently of nag-state.json, so the genuine fire may have already logged
+        # nag_opened+nag_sent for this idem_key before state was lost. Emitting again
+        # would double-count one delivery (nag_sent counts DELIVERED nags), so the ledger
+        # emit is GUARDED on the idem_key already being absent. The state repair (loop
+        # reopened) always stands; only the audit emit is conditional. Counts reflect the
+        # delivered nag once regardless, since the cron run did process one delivery.
+        entry, target = result["entry"], result["delivery_target"]
+        if not _nag_sent_already_logged(result["idem_key"]):
+            _log("nag_opened", task_id=task_id, nag_loop_id=entry.get("nag_loop_id"),
+                 overdue_days=result["overdue"], threshold_type=section,
+                 delivery_target=target, repaired=True)
+            _log("nag_sent", task_id=task_id, nag_loop_id=entry.get("nag_loop_id"),
+                 nag_count=entry.get("nag_count"), delivery_target=target,
+                 message_id=result.get("message_id"), idem_key=result.get("idem_key"),
+                 repaired=True)
+        counts["open"] += 1
+        counts["sent"] += 1
         return
     entry, target = result["entry"], result["delivery_target"]
     if result["opened"]:
@@ -554,26 +663,16 @@ def _print_full_list() -> None:
     print(f"{len(crossed)} overdue task{plural} total.")
 
 
-def _deliver_more_pointer(deferred: int) -> None:
-    """Deliver the "+K more … /nag all" pointer to the PROVEN target (best-effort).
+def _more_pointer_line(deferred: int) -> str:
+    """The "+K more … /nag all" pointer line (wording frozen).
 
-    Post-H3 the script sends directly, so the pointer can no longer ride stdout; it
-    is delivered as one extra message through the same proven productivity target the
-    nags went to. It is intentionally NOT idempotent (it carries no nag_loop_id and a
-    missed/duplicate pointer is harmless) and intentionally NOT gated as a nag_sent
-    act. Any delivery failure is logged and swallowed -- a failed pointer must never
-    fail the run or leave a nag loop in a bad state.
+    Fix D folds this pointer INTO the LAST fired nag's gated, receipted, idempotent
+    send rather than pushing it as a separate ungated message: it is appended to that
+    nag's text so it rides the one proven, dedup-keyed delivery. The wording is
+    unchanged from the prior standalone pointer.
     """
-    proof = nag_delivery.resolve_target()
-    if not proof["ok"]:
-        return
     plural = "s" if deferred != 1 else ""
-    text = f"+{deferred} more overdue task{plural} — reply /nag all to see them."
-    try:
-        outbox.openclaw_sender(proof["delivery_target"], text)
-    except Exception as exc:  # noqa: BLE001 -- a failed pointer is non-fatal
-        _log("nag_delivery_blocked", reason=type(exc).__name__, stage="more_pointer",
-             message=str(exc))
+    return f"+{deferred} more overdue task{plural} — reply /nag all to see them."
 
 
 def _record_nag_health(*, blocked: int = 0, crashed: str | None = None) -> None:
@@ -625,15 +724,11 @@ def main(argv: list[str] | None = None) -> int:
         limit = None if args.all_nags else cos_config.nag_display_limit()
         sender = None if args.dry_run else outbox.openclaw_sender
         counts = run_nag_check(dry_run=args.dry_run, limit=limit, sender=sender)
-        # The "+K more" pointer must still REACH the user, but stdout is no longer the
-        # delivery channel -- so it is delivered as one extra message through the SAME
-        # proven target, only when some nags actually fired and the cap held others
-        # back (never on an idle cycle: nothing fired => no pointer). It is not put
-        # through the idempotent outbox: it is a per-cycle ephemeral pointer with no
-        # nag_loop_id, not a deduped nag, and a missed pointer is harmless. A delivery
-        # failure here must not crash the run, so it is logged and swallowed.
-        if not args.dry_run and counts["sent"] > 0 and counts["deferred"] > 0:
-            _deliver_more_pointer(counts["deferred"])
+        # Fix D: the "+K more" pointer is now FOLDED into the last fired nag's gated,
+        # receipted send inside run_nag_check (it rides one proven, idempotent delivery
+        # instead of a separate ungated push). main() no longer sends it -- when nags
+        # fired and the cap held others back, the pointer already went out on the last
+        # nag; an idle cycle fires nothing and carries no pointer.
         footer = (f"NAG_CHECK_DONE: {counts['open']} open loops, {counts['sent']} sent, "
                   f"{counts['closed']} closed, {counts['blocked']} blocked, "
                   f"{counts['deferred']} deferred")

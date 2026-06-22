@@ -138,14 +138,16 @@ def nag_display_limit() -> int:
 
 
 def nag_send_timeout_seconds() -> int:
-    """Hard bound on a single ``openclaw message send`` (default 20s, floored at 1).
+    """Hard bound on a single ``openclaw message send`` (default 10s, floored at 1).
 
     H3 makes the nag send in-process, UNDER the nag-state lock; an unbounded hang
     would wedge the cron run AND reactive ``/done`` (which takes the same lock). A
     timeout turns a hung gateway into a clean delivery FAILURE that leaves the loop
-    open and releases the lock, instead of blocking forever.
+    open and releases the lock, instead of blocking forever. R2 halves the default
+    (20 -> 10) so a hung gateway makes reactive ``/done`` wait at most ~10s for the
+    lock, not 20.
     """
-    return max(1, _int_env("NAG_SEND_TIMEOUT_SECONDS", 20))
+    return max(1, _int_env("NAG_SEND_TIMEOUT_SECONDS", 10))
 
 
 def outbox_retention_days() -> int:

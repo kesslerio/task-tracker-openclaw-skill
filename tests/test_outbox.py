@@ -130,6 +130,76 @@ def test_is_recorded_true_after_delivery_false_for_unseen_key(state):
     assert outbox.is_recorded(outbox.make_idem_key("nag", "tsk_other", "2026-06-22-11")) is False
 
 
+# --- R2 Fix A: a corrupt-ts entry can never fail a committed delivery -------
+
+def test_deliver_once_garbage_ts_entry_does_not_raise_or_lose_send(state):
+    """R2 Fix A: a pre-existing entry with a NON-STRING ts (an int -- a corrupt or
+    hand-edited entry) makes ``datetime.fromisoformat`` raise TypeError inside the
+    prune that runs AFTER the receipt is committed and the message SENT. Pre-fix that
+    TypeError propagated out of deliver_once, the caller marked delivery_failed, and
+    the SAME message re-sent next run (a double-send). Now: the send happens ONCE, the
+    new receipt is durably recorded, and deliver_once does NOT raise."""
+    state.mkdir(parents=True, exist_ok=True)
+    # Seed the outbox with a garbage-ts entry that the prune walk will hit.
+    (state / "outbox.json").write_text(json.dumps({
+        "nag:garbage:2026-06-01-11": {"message_id": "x", "target": TARGET, "ts": 12345},
+    }))
+    calls = []
+
+    def sender(target, text):
+        calls.append(text)
+        return {"message_id": FAKE_ID}
+
+    key = outbox.make_idem_key("nag", "newtask", "2026-06-22-11")
+    # The send + record must NOT raise despite the garbage-ts neighbour.
+    receipt = outbox.deliver_once(TARGET, "fresh", key, sender=sender)
+    assert calls == ["fresh"]  # sent exactly once -- not lost, not re-sent
+    assert receipt["idempotent"] is False and receipt["message_id"] == FAKE_ID
+    # The receipt is durably recorded (the at-most-once fact survives the prune).
+    assert _outbox(state)[key]["message_id"] == FAKE_ID
+
+    # And a same-key re-fire dedupes off that recorded receipt -- no double-send.
+    calls2 = []
+    second = outbox.deliver_once(TARGET, "fresh", key,
+                                 sender=lambda t, x: calls2.append(x) or {"message_id": "z"})
+    assert calls2 == []  # the sender was NOT called again
+    assert second["idempotent"] is True
+
+
+def test_deliver_once_prune_failure_still_leaves_the_receipt(state, monkeypatch):
+    """R2 Fix A: even if pruning itself raises (any reason), the just-written receipt
+    MUST survive and deliver_once MUST NOT raise -- a delivered message always leaves a
+    recorded receipt so it is never re-sent."""
+    state.mkdir(parents=True, exist_ok=True)
+
+    def boom_prune(_state):
+        raise RuntimeError("prune blew up")
+
+    monkeypatch.setattr(outbox, "_prune_outbox", boom_prune)
+    key = outbox.make_idem_key("nag", "t", "2026-06-22-11")
+    receipt = outbox.deliver_once(TARGET, "hi", key,
+                                  sender=lambda t, x: {"message_id": FAKE_ID})
+    assert receipt["idempotent"] is False
+    assert _outbox(state)[key]["message_id"] == FAKE_ID  # receipt committed despite prune fail
+
+
+# --- R2 Fix B: get_receipt returns the stored receipt for split-brain repair --
+
+def test_get_receipt_returns_stored_receipt_or_none(state):
+    """get_receipt returns the committed {message_id, target, ts} for a delivered key
+    (the durable fact a caller repairs split-brain state/ledger from), or None for an
+    unseen key."""
+    key = outbox.make_idem_key("nag", "tsk_x", "2026-06-22-11")
+    assert outbox.get_receipt(key) is None  # never delivered
+    outbox.deliver_once(TARGET, "hi", key, sender=lambda t, x: {"message_id": FAKE_ID})
+    receipt = outbox.get_receipt(key)
+    assert receipt is not None
+    assert receipt["message_id"] == FAKE_ID
+    assert receipt["target"] == TARGET
+    assert "ts" in receipt
+    assert outbox.get_receipt(outbox.make_idem_key("nag", "other", "2026-06-22-11")) is None
+
+
 # --- openclaw_sender parsing -----------------------------------------------
 
 def _fake_run(stdout="", returncode=0, stderr=""):
@@ -236,6 +306,19 @@ def test_openclaw_sender_passes_a_positive_timeout(monkeypatch):
     monkeypatch.setattr(outbox.subprocess, "run", _run)
     outbox.openclaw_sender(TARGET, "x")
     assert isinstance(captured["timeout"], (int, float)) and captured["timeout"] >= 1
+
+
+def test_nag_send_timeout_default_is_ten(monkeypatch):
+    """R2 Fix E: the send runs under the nag-state lock that reactive /done also takes,
+    so a hung gateway makes /done wait the full timeout. The default is HALVED 20 -> 10
+    to cut the worst-case wait; the env override + the floor still hold."""
+    import cos_config  # noqa: PLC0415
+    monkeypatch.delenv("NAG_SEND_TIMEOUT_SECONDS", raising=False)
+    assert cos_config.nag_send_timeout_seconds() == 10  # default halved to 10
+    monkeypatch.setenv("NAG_SEND_TIMEOUT_SECONDS", "30")
+    assert cos_config.nag_send_timeout_seconds() == 30  # env override honoured
+    monkeypatch.setenv("NAG_SEND_TIMEOUT_SECONDS", "0")
+    assert cos_config.nag_send_timeout_seconds() == 1  # floor preserved
 
 
 def test_openclaw_sender_raises_on_timeout(monkeypatch):
