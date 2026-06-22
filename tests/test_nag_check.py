@@ -34,6 +34,22 @@ PRODUCTIVITY = "-4242424242"
 WORK_GROUP = "-5252525252"
 REF = datetime(2026, 6, 19, tzinfo=timezone.utc)
 
+# Fake gateway message id the FAKE sender returns -- never a real send. Valid id
+# shape but does not match the public-hygiene -100[0-9]{8,} grep.
+FAKE_MESSAGE_ID = "-4242424242"
+
+
+def fake_sender(record=None, *, message_id=FAKE_MESSAGE_ID):
+    """A deliver_once-shaped fake sender: records (target, text) and returns a canned
+    ``{"message_id": ...}`` receipt. NEVER calls real openclaw."""
+    calls = record if record is not None else []
+
+    def _send(target, text):
+        calls.append((target, text))
+        return {"message_id": message_id}
+
+    return _send
+
 BOARD = """# Work
 
 ## 🟡 Q2
@@ -69,7 +85,7 @@ def _run(harness):
     independent of prior runs.
     """
     sent: list[tuple] = []
-    counts = nag_check.run_nag_check(send=lambda target, text: sent.append((target, text)))
+    counts = nag_check.run_nag_check(sender=fake_sender(sent))
     return counts, sent
 
 
@@ -122,18 +138,117 @@ def test_t2_nag_refires_without_ack(harness):
     assert len(sent_events) == 2
 
 
-# --- Production transport: main() emits the nag text for the cron announce ----
+# --- H3: receipt-backed, idempotent delivery -------------------------------
 
-def test_main_emits_nag_text_to_stdout_footer_to_stderr(harness, capsys):
-    """The production CLI path (main) emits the proven nag text on STDOUT (what the
-    cron announces) and the operational footer on STDERR (not delivered), so an
-    idle cycle announces nothing and the surface is not spammed with a status line."""
+def test_h3_nag_sent_event_carries_message_id_and_idem_key(harness):
+    """After a nag fires, the nag_sent ledger event records the gateway message-id
+    RECEIPT and the idem_key -- proving delivery (not mere intent) and to which key."""
     board, state = harness
+    sent = []
+    nag_check.run_nag_check(sender=fake_sender(sent, message_id="1915"))
+    sent_events = [e for e in _events(state) if e["event_type"] == "nag_sent"]
+    assert len(sent_events) == 1
+    meta = sent_events[0]["metadata"]
+    assert meta["message_id"] == "1915"  # the captured receipt
+    assert meta["idem_key"].startswith("nag:tsk_abc123:")
+    assert meta["idem_key"].endswith(":2026-06-19-00")  # period = the run's REF cycle (date+hour)
+
+
+def test_h3_sender_receives_the_proven_gated_target(harness):
+    """The fake sender is handed the PROVEN gated target (chat_id + topic), not a
+    discarded/default one -- the proven target is the thing that actually sends."""
+    board, state = harness
+    sent = []
+    nag_check.run_nag_check(sender=fake_sender(sent))
+    assert len(sent) == 1
+    target, text = sent[0]
+    assert target == {"chat_id": PRODUCTIVITY, "topic_id": "2",
+                      "agent_id": "niemand-work", "channel": "telegram"}
+    assert "tsk_abc123" in text
+
+
+def test_h3_same_cycle_retry_sender_called_once(harness):
+    """Idempotency at the nag level: two fires of the SAME loop within the SAME cron
+    cycle (same ref instant -- a retry) call the sender EXACTLY once (the outbox
+    idem-key dedupes the duplicate delivery), even though the loop legitimately
+    re-fires (nag_count climbs, loop stays open)."""
+    board, state = harness
+    sent = []
+    sender = fake_sender(sent)
+    nag_check.run_nag_check(sender=sender)
+    nag_check.run_nag_check(sender=sender)  # same REF -> same cycle -> a retry
+    assert len(sent) == 1  # the real send happened ONCE -- no duplicate to the user
+    nag = _state(state)["tsk_abc123"]
+    assert nag["nag_count"] == 2 and nag["ack"] is False  # loop still re-fires + open
+
+
+def test_h3_different_cycle_same_day_redelivers(harness, monkeypatch):
+    """The re-nag cadence is PRESERVED: the SAME loop at a DIFFERENT scheduled cycle
+    (a later hour, same day) is a NEW delivery -- only a same-cycle retry dedupes.
+    H3 must not silently collapse the 11/14/17 nags into one/day (that is H5's job)."""
+    from datetime import timedelta
+    board, state = harness
+    sent = []
+    sender = fake_sender(sent)
+    nag_check.run_nag_check(sender=sender)  # cycle 1 (REF hour)
+    monkeypatch.setattr(nag_check, "_today", lambda: REF + timedelta(hours=3))  # next cycle, same day
+    nag_check.run_nag_check(sender=sender)
+    assert len(sent) == 2  # each scheduled cycle delivers -- the re-nag cadence stands
+
+
+def test_h3_sender_failure_leaves_loop_open_and_logs_block(harness):
+    """A sender that RAISES is a delivery FAILURE: the loop is NOT closed, NO phantom
+    nag_sent is recorded, and a delivery-failure (nag_delivery_blocked) is logged."""
+    board, state = harness
+
+    def boom(target, text):
+        raise nag_check.outbox.OpenclawSendError("gateway unreachable")
+
+    counts = nag_check.run_nag_check(sender=boom)
+    assert counts["sent"] == 0 and counts["blocked"] == 1
+    # No nag loop was persisted as sent -- it stays OPEN (or absent, never acked).
+    on_disk = _state(state)
+    assert "tsk_abc123" not in on_disk or on_disk["tsk_abc123"]["ack"] is False
+    sent_events = [e for e in _events(state) if e["event_type"] == "nag_sent"]
+    assert sent_events == []  # no phantom "sent"
+    blocked = [e for e in _events(state) if e["event_type"] == "nag_delivery_blocked"]
+    assert blocked and blocked[-1]["metadata"]["stage"] == "send"
+
+
+def test_h3_failed_send_then_clean_retry_delivers(harness):
+    """After a transport failure leaves the loop open, the NEXT cycle delivers
+    cleanly (the failed send recorded no idem-key, so the retry is not deduped)."""
+    board, state = harness
+
+    def boom(target, text):
+        raise nag_check.outbox.OpenclawSendError("transient")
+
+    nag_check.run_nag_check(sender=boom)  # fails, loop left open
+    sent = []
+    counts = nag_check.run_nag_check(sender=fake_sender(sent))  # same day, retry
+    assert counts["sent"] == 1 and len(sent) == 1  # retry delivered
+    assert _state(state)["tsk_abc123"]["ack"] is False
+
+
+# --- Production transport: main() DELIVERS via the sender, stdout stays empty -----
+
+def test_main_delivers_via_sender_and_stdout_is_empty(harness, capsys, monkeypatch):
+    """H3: the script OWNS the send. main() delivers the proven nag text through the
+    sender (here a FAKE that records the delivery), leaving STDOUT EMPTY so the cron's
+    blind --announce of stdout cannot double-send. The operational footer is on STDERR."""
+    board, state = harness
+    delivered = []
+    monkeypatch.setattr(nag_check.outbox, "openclaw_sender", fake_sender(delivered))
     rc = nag_check.main([])
     captured = capsys.readouterr()
     assert rc == 0
-    assert "tsk_abc123" in captured.out  # nag payload is in the announced stdout
-    assert "Overdue task still open" in captured.out
+    # The nag text went to the SENDER, not stdout.
+    assert len(delivered) == 1
+    target, text = delivered[0]
+    assert "tsk_abc123" in text and "Overdue task still open" in text
+    assert target == {"chat_id": PRODUCTIVITY, "topic_id": "2",
+                      "agent_id": "niemand-work", "channel": "telegram"}
+    assert captured.out.strip() == ""  # stdout empty: --announce of it is a no-op
     assert "NAG_CHECK_DONE" not in captured.out  # footer NOT in the announced output
     assert "NAG_CHECK_DONE: 1 open loops, 1 sent" in captured.err  # footer on stderr
 
@@ -180,7 +295,7 @@ def test_background_no_longer_overdue_recycles_not_acks(harness, monkeypatch):
     monkeypatch.setattr(nag_check, "_today",
                         lambda: datetime(2026, 7, 10, tzinfo=timezone.utc))
     sent = []
-    nag_check.run_nag_check(send=lambda t, x: sent.append((t, x)))
+    nag_check.run_nag_check(sender=fake_sender(sent))
     assert len(sent) == 1  # re-nags -- never permanently muted
 
 
@@ -212,7 +327,7 @@ def test_t4_env_missing_blocks_push_and_leaves_loop_open(tmp_path, monkeypatch):
     monkeypatch.setattr(nag_check, "_today", lambda: REF)
 
     sent = []
-    counts = nag_check.run_nag_check(send=lambda t, x: sent.append((t, x)))
+    counts = nag_check.run_nag_check(sender=fake_sender(sent))
 
     assert sent == []  # zero Telegram messages
     assert counts["blocked"] == 1 and counts["sent"] == 0
@@ -232,7 +347,7 @@ def test_t4_open_loop_stays_open_when_env_drops_mid_life(harness, monkeypatch):
     assert _state(state)["tsk_abc123"]["ack"] is False
     monkeypatch.delenv("TELEGRAM_CHAT_ID_PRODUCTIVITY", raising=False)
     sent2 = []
-    nag_check.run_nag_check(send=lambda t, x: sent2.append((t, x)))
+    nag_check.run_nag_check(sender=fake_sender(sent2))
     assert sent2 == []
     assert _state(state)["tsk_abc123"]["ack"] is False  # still open
 
@@ -247,12 +362,31 @@ def test_t4_work_group_target_blocks_push(tmp_path, monkeypatch):
     _set_env(monkeypatch, board, state, productivity=WORK_GROUP)
     monkeypatch.setattr(nag_check, "_today", lambda: REF)
     sent = []
-    counts = nag_check.run_nag_check(send=lambda t, x: sent.append((t, x)))
+    counts = nag_check.run_nag_check(sender=fake_sender(sent))
     assert sent == []
     assert counts["blocked"] == 1
     blocked = [e for e in task_ledger.read_events(state / "events.jsonl")
                if e["event_type"] == "nag_delivery_blocked"]
     assert blocked and blocked[0]["metadata"]["reason"] == "work_group"
+
+
+def test_t4_seam_mismatch_blocks_before_send(harness, monkeypatch):
+    """The gate<->message seam (assert_send_target) is the last guard BEFORE delivery:
+    a target-mismatch must block, the fake sender is NEVER called, and the loop stays
+    OPEN. We force the seam to fail to exercise the assert stage in isolation."""
+    import nag_delivery  # noqa: PLC0415
+    board, state = harness
+    monkeypatch.setattr(nag_delivery, "authorise_target",
+                        lambda act_id, target: {"ok": False, "reason": "target-mismatch",
+                                                "stage": "assert"})
+    sent = []
+    counts = nag_check.run_nag_check(sender=fake_sender(sent))
+    assert sent == []  # the seam blocked BEFORE any send
+    assert counts["sent"] == 0 and counts["blocked"] == 1
+    on_disk = _state(state)
+    assert "tsk_abc123" not in on_disk or on_disk["tsk_abc123"]["ack"] is False
+    blocked = [e for e in _events(state) if e["event_type"] == "nag_delivery_blocked"]
+    assert blocked and blocked[-1]["metadata"]["reason"] == "target-mismatch"
 
 
 # --- T9 / NO-RAW-ERROR-LEAK + crash leaves loop open -----------------------
@@ -280,23 +414,30 @@ def test_crash_mid_run_leaves_open_loop_open(harness, monkeypatch):
     _run(harness)  # loop is open
     assert _state(state)["tsk_abc123"]["ack"] is False
 
-    # Inject a crash inside the push so the run aborts mid-cycle. Restore ONLY the
-    # push (not the env/board monkeypatches) so the recovery run stays isolated.
-    real_push = nag_check._push_nag
+    # Inject a crash inside the prove/authorise step so the run aborts mid-cycle.
+    # Restore ONLY authorise (not the env/board monkeypatches) so the recovery run
+    # stays isolated. A raised authorise (unlike a controlled sender failure) is an
+    # uncaught fault: it propagates out, transition() persists nothing, loop stays open.
+    real_authorise = nag_check._authorise_nag
 
     def boom(*a, **k):
         raise RuntimeError("mid-run crash")
 
-    monkeypatch.setattr(nag_check, "_push_nag", boom)
+    monkeypatch.setattr(nag_check, "_authorise_nag", boom)
     with pytest.raises(RuntimeError):
-        nag_check.run_nag_check(send=lambda t, x: None)
+        nag_check.run_nag_check(sender=fake_sender())
     # State on disk is unchanged -- the loop is still open.
     assert _state(state)["tsk_abc123"]["ack"] is False
 
-    # Recovery: a clean run re-fires the still-open loop.
-    monkeypatch.setattr(nag_check, "_push_nag", real_push)
+    # Recovery: a clean run re-fires the still-open loop. We advance the clock a day
+    # so the receipt idem-key (keyed on the run's reference day) is fresh and the
+    # recovery genuinely re-delivers -- proving the crashed loop was processed, not
+    # lost (on the SAME day the idempotent outbox would suppress the duplicate send).
+    monkeypatch.setattr(nag_check, "_authorise_nag", real_authorise)
+    monkeypatch.setattr(nag_check, "_today",
+                        lambda: datetime(2026, 6, 20, tzinfo=timezone.utc))
     sent2 = []
-    nag_check.run_nag_check(send=lambda t, x: sent2.append((t, x)))
+    nag_check.run_nag_check(sender=fake_sender(sent2))
     assert len(sent2) == 1
     assert _state(state)["tsk_abc123"]["ack"] is False
 
@@ -318,7 +459,7 @@ def test_acked_loop_under_lock_sends_nothing_and_is_not_reopened(harness):
     log_before = len(autonomy_gate.read_autonomy_log())
 
     sent = []
-    counts = nag_check.run_nag_check(send=lambda t, x: sent.append((t, x)))
+    counts = nag_check.run_nag_check(sender=fake_sender(sent))
     assert sent == []  # no message after /done
     assert counts["sent"] == 0
     nag = _state(state)["tsk_abc123"]
@@ -345,7 +486,7 @@ def test_body_double_only_entry_not_acked_by_cron(tmp_path, monkeypatch):
     session = {"session_id": "bd_1", "cron_ids": ["c"], "started_at": "x", "ended_at": None}
     nag_state.transition(lambda s: nag_state.add_body_double_session(s, "tsk_future", session))
 
-    counts = nag_check.run_nag_check(send=lambda t, x: None)
+    counts = nag_check.run_nag_check(sender=fake_sender())
     assert counts["closed"] == 0  # the stub is NOT a nag loop to close
     nag = _state(state)["tsk_future"]
     assert nag["ack"] is False  # not spuriously acked
@@ -361,7 +502,7 @@ def test_t10_acked_loop_not_reactivated_in_background(harness):
     nag_state.transition(lambda s: nag_state.close_loop(s, "tsk_abc123",
                                                         closed_by="explicit_done"))
     sent2 = []
-    counts = nag_check.run_nag_check(send=lambda t, x: sent2.append((t, x)))
+    counts = nag_check.run_nag_check(sender=fake_sender(sent2))
     assert sent2 == []  # acked loop stays silent
     assert counts["sent"] == 0
     assert _state(state)["tsk_abc123"]["ack"] is True
@@ -379,7 +520,7 @@ def test_q1_task_nags_at_one_day_overdue(tmp_path, monkeypatch):
     _set_env(monkeypatch, board, state)
     monkeypatch.setattr(nag_check, "_today", lambda: REF)  # 1 day overdue
     sent = []
-    counts = nag_check.run_nag_check(send=lambda t, x: sent.append((t, x)))
+    counts = nag_check.run_nag_check(sender=fake_sender(sent))
     assert counts["sent"] == 1  # Q1 nags at 1 day, off the scalar overdue_days
 
 
@@ -393,7 +534,7 @@ def test_q2_task_overdue_four_days_nags(tmp_path, monkeypatch):
     monkeypatch.setattr(nag_check, "_today",
                         lambda: datetime(2026, 6, 19, tzinfo=timezone.utc))  # 4d
     sent = []
-    nag_check.run_nag_check(send=lambda t, x: sent.append((t, x)))
+    nag_check.run_nag_check(sender=fake_sender(sent))
     assert len(sent) == 1
 
 
@@ -407,7 +548,7 @@ def test_q3_task_overdue_four_days_does_not_nag(tmp_path, monkeypatch):
     _set_env(monkeypatch, board, state)
     monkeypatch.setattr(nag_check, "_today", lambda: REF)  # 4 days overdue
     sent = []
-    counts = nag_check.run_nag_check(send=lambda t, x: sent.append((t, x)))
+    counts = nag_check.run_nag_check(sender=fake_sender(sent))
     assert sent == [] and counts["sent"] == 0  # q3 needs 7 days
 
 
@@ -417,7 +558,7 @@ def test_dry_run_writes_no_state_and_sends_nothing(harness):
     board, state = harness
     sent: list[tuple] = []
     counts = nag_check.run_nag_check(dry_run=True,
-                                     send=lambda t, x: sent.append((t, x)))
+                                     sender=fake_sender(sent))
     assert sent == []
     assert counts["open"] == 1  # would open one
     assert not (state / "nag-state.json").exists()  # no state written
@@ -433,7 +574,7 @@ def test_dry_run_preview_skips_snoozed_loop_like_a_real_run(harness):
     until = (REF + timedelta(days=1)).isoformat()
     nag_state.transition(lambda s: nag_state.apply_snooze(
         s, "tsk_abc123", snoozed_until=until, block_reason=None))
-    counts = nag_check.run_nag_check(dry_run=True, send=lambda t, x: None)
+    counts = nag_check.run_nag_check(dry_run=True)
     assert counts["open"] == 0  # snoozed -> not previewed as a push
 
 
@@ -448,7 +589,7 @@ def test_dry_run_does_not_resolve_a_preexisting_open_loop(harness):
     state_before = (state / "nag-state.json").read_text()
     events_before = len(task_ledger.read_events(state / "events.jsonl"))
 
-    counts = nag_check.run_nag_check(dry_run=True, send=lambda t, x: None)
+    counts = nag_check.run_nag_check(dry_run=True)
     assert counts["closed"] == 1  # previewed, but...
     assert (state / "nag-state.json").read_text() == state_before  # ...state unchanged
     assert len(task_ledger.read_events(state / "events.jsonl")) == events_before
@@ -472,7 +613,7 @@ def test_body_double_stub_promoted_to_genuine_nag_opens_loop(tmp_path, monkeypat
     assert _state(state)["tsk_abc123"]["nag_count"] == 0  # a stub
 
     sent = []
-    nag_check.run_nag_check(send=lambda t, x: sent.append((t, x)))
+    nag_check.run_nag_check(sender=fake_sender(sent))
     assert len(sent) == 1
     nag = _state(state)["tsk_abc123"]
     assert nag["nag_count"] == 1
@@ -488,7 +629,7 @@ def test_dry_run_does_not_append_to_autonomy_audit_log(harness):
     the target. Otherwise it manufactures a phantom undoable nag never sent."""
     import autonomy_gate  # noqa: PLC0415 -- local import keeps the harness imports lean
     board, state = harness
-    nag_check.run_nag_check(dry_run=True, send=lambda t, x: None)
+    nag_check.run_nag_check(dry_run=True)
     assert read_autonomy_log_for(state, autonomy_gate) == []
     assert not (state / "autonomy-log.jsonl").exists()
 
@@ -528,9 +669,9 @@ def test_cap_fires_only_top_n_most_overdue(multi):
     ones open no loop and push nothing this cycle."""
     board, state = multi
     sent = []
-    counts = nag_check.run_nag_check(limit=3, send=lambda t, x: sent.append(x))
+    counts = nag_check.run_nag_check(limit=3, sender=fake_sender(sent))
     assert counts["sent"] == 3 and counts["deferred"] == 2
-    fired_ids = " ".join(sent)
+    fired_ids = " ".join(text for _target, text in sent)
     for worst in ("tsk_a", "tsk_b", "tsk_c"):
         assert worst in fired_ids
     for deferred in ("tsk_d", "tsk_e"):
@@ -545,35 +686,48 @@ def test_no_limit_fires_everything(multi):
     Preserves the pre-cap contract for direct run_nag_check callers."""
     board, state = multi
     sent = []
-    counts = nag_check.run_nag_check(send=lambda t, x: sent.append(x))
+    counts = nag_check.run_nag_check(sender=fake_sender(sent))
     assert counts["sent"] == 5 and counts["deferred"] == 0
 
 
-def test_main_caps_and_appends_more_pointer(multi, capsys):
-    """The cron CLI path caps at NAG_DISPLAY_LIMIT (3) and rides a '+2 more … /nag all'
-    pointer on the announced stdout; the operational footer carries the deferred count."""
+def test_main_caps_and_delivers_more_pointer(multi, capsys, monkeypatch):
+    """The cron CLI path caps at NAG_DISPLAY_LIMIT (3). Post-H3 the 3 nags AND the
+    '+2 more … /nag all' pointer are DELIVERED through the sender (stdout stays
+    empty); the operational footer on stderr carries the deferred count."""
     board, state = multi
+    delivered = []
+    monkeypatch.setattr(nag_check.outbox, "openclaw_sender", fake_sender(delivered))
     rc = nag_check.main([])  # limit defaults to nag_display_limit() == 3
     captured = capsys.readouterr()
     out, err = captured.out, captured.err
     assert rc == 0
-    assert "tsk_a" in out and "tsk_b" in out and "tsk_c" in out
-    assert "tsk_d" not in out and "tsk_e" not in out
-    assert "+2 more overdue" in out and "/nag all" in out
+    blob = " ".join(text for _target, text in delivered)
+    # The 3 worst nags + the pointer were DELIVERED; the deferred 2 were not.
+    assert "tsk_a" in blob and "tsk_b" in blob and "tsk_c" in blob
+    assert "tsk_d" not in blob and "tsk_e" not in blob
+    assert "+2 more overdue" in blob and "/nag all" in blob
+    assert len(delivered) == 4  # 3 nags + 1 pointer message
+    assert out.strip() == ""  # nothing on stdout: the send is the channel now
     # NAG_CHECK_DONE footer (stderr, not announced) reports the deferred count.
     assert "3 sent" in err and "2 deferred" in err
 
 
-def test_main_all_flag_fires_everything_no_pointer(multi, capsys):
-    """`--all` removes the cap: every overdue fires and there is NO '+more' pointer."""
+def test_main_all_flag_fires_everything_no_pointer(multi, capsys, monkeypatch):
+    """`--all` removes the cap: every overdue is DELIVERED and there is NO '+more'
+    pointer (nothing deferred). Stdout stays empty -- the sender is the channel."""
     board, state = multi
+    delivered = []
+    monkeypatch.setattr(nag_check.outbox, "openclaw_sender", fake_sender(delivered))
     rc = nag_check.main(["--all"])
     captured = capsys.readouterr()
     out, err = captured.out, captured.err
     assert rc == 0
+    blob = " ".join(text for _target, text in delivered)
     for tid in ("tsk_a", "tsk_b", "tsk_c", "tsk_d", "tsk_e"):
-        assert tid in out
-    assert "more overdue" not in out
+        assert tid in blob
+    assert len(delivered) == 5  # all 5 nags, NO pointer message
+    assert "more overdue" not in blob
+    assert out.strip() == ""
     assert "5 sent" in err and "0 deferred" in err
 
 
@@ -606,7 +760,7 @@ def test_snoozed_leaders_do_not_starve_lower_tasks(multi):
     from datetime import timedelta
     board, state = multi
     # Cycle 1: top-3 (a, b, c) fire and open loops.
-    nag_check.run_nag_check(limit=3, send=lambda t, x: None)
+    nag_check.run_nag_check(limit=3, sender=fake_sender())
     # The user snoozes all three leaders (ADHD breathing room) past the clock.
     until = (REF + timedelta(days=11)).isoformat()
     for tid in ("tsk_a", "tsk_b", "tsk_c"):
@@ -614,8 +768,8 @@ def test_snoozed_leaders_do_not_starve_lower_tasks(multi):
             s, tid, snoozed_until=until, block_reason=None))
     # Cycle 2: the snoozed leaders must NOT hold cap slots -- d and e fire instead.
     sent = []
-    counts = nag_check.run_nag_check(limit=3, send=lambda t, x: sent.append(x))
-    fired = " ".join(sent)
+    counts = nag_check.run_nag_check(limit=3, sender=fake_sender(sent))
+    fired = " ".join(text for _target, text in sent)
     assert "tsk_d" in fired and "tsk_e" in fired
     for snoozed in ("tsk_a", "tsk_b", "tsk_c"):
         assert snoozed not in fired  # paused leaders did not consume slots

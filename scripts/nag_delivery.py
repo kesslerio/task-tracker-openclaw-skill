@@ -15,21 +15,20 @@ is identical and tested once:
        seam: the gated target is the SOLE permitted destination.  A buggy caller
        that gates topic:2 and sends topic:6 is blocked here, not delivered.
 
-The actual Telegram transport is the cron ``delivery.to`` field / the reactive
-session reply -- this module proves the target and authorises it; the caller does
-the I/O only after ``ok`` is True.  ``send`` is injectable so tests can assert
-"sent vs blocked" without a live gateway.
+This module proves the target and AUTHORISES it (``authorise_target`` asserts the
+seam); the caller performs the I/O only after ``ok`` is True. As of H3 the actual
+Telegram transport is owned by the script, not the cron: the caller delivers the
+authorised target through ``outbox.deliver_once`` (receipt-captured + idempotent),
+so the proven target is the thing that actually sends -- closing the pre-H3 seam
+where the proof validated a target the blind cron ``--announce`` never used.
 
-Transport-binding boundary (by design): the production ``send`` collects the
-proven nag text for the cron to announce; the bytes themselves leave via the
-gateway cron descriptor's ``delivery.to``, which is templated from the SAME env
-vars this module proves against (``TELEGRAM_CHAT_ID_PRODUCTIVITY`` +
-``OPENCLAW_TOPIC_PRODUCTIVITY_STANDUP``). The proof therefore gates WHETHER text is
-emitted (an unset / work-group env blocks emission, so nothing is announced) and
-binds the in-process seam; it cannot reach into the out-of-process gateway
-descriptor to re-assert its ``delivery.to`` at fire time. Keeping both surfaces
-sourced from one env pair is the binding -- the cron descriptor's ``delivery.to``
-MUST stay env-templated, never a literal, so the two never diverge.
+Binding boundary (by design): the proof gates WHETHER a nag is delivered (an unset
+/ work-group env blocks BEFORE any send, so nothing leaves) and binds the in-process
+gate<->message seam. The bytes then leave through ``outbox.openclaw_sender``, which
+sends to the EXACT proven ``chat_id`` + ``topic_id`` -- the same env pair
+(``TELEGRAM_CHAT_ID_PRODUCTIVITY`` + ``OPENCLAW_TOPIC_PRODUCTIVITY_STANDUP``) the
+proof reads. There is no out-of-process descriptor to diverge from anymore: the
+sender's destination IS the proven target.
 
 When the proof or seam fails, the caller MUST treat it as ``nag_delivery_blocked``
 and leave the nag OPEN -- the env var being unset never clears a loop.
@@ -38,7 +37,7 @@ and leave the nag OPEN -- the env var being unset never clears a loop.
 from __future__ import annotations
 
 import os
-from typing import Any, Callable
+from typing import Any
 
 from autonomy_gate import assert_send_target, gate
 from delivery_target import prove_delivery_target
@@ -101,29 +100,25 @@ def prove_and_gate(
     return {"ok": True, "act_id": gated["act_id"], "delivery_target": target}
 
 
-def authorised_send(
+def authorise_target(
     act_id: str,
     delivery_target: dict[str, Any],
-    text: str,
-    *,
-    send: Callable[[dict[str, Any], str], Any],
 ) -> dict[str, Any]:
-    """Assert the gate<->message seam, then send ONLY to the gated target.
+    """Assert the gate<->message seam: confirm ``delivery_target`` is the SOLE
+    permitted destination for ``act_id``, returning it authorised for delivery.
 
     ``assert_send_target`` is the Decision #1 seam: it confirms ``delivery_target``
-    is the exact target ``act_id`` was gated for. The transport ``send`` is invoked
-    only after that passes; a mismatch returns ``{"ok": False, "reason":
-    "target-mismatch"}`` and NOTHING is sent.
+    is the exact target ``act_id`` was gated for. A mismatch returns ``{"ok": False,
+    "reason": "target-mismatch"}`` and the caller must NOT send.
 
-    ``send`` is REQUIRED (not optional): a missing transport is a delivery FAILURE,
-    not a silent success. Otherwise the production path would gate + log ``nag_sent``
-    while delivering nothing -- the nag would be inert but recorded as sent. The
-    caller is responsible for passing a real transport (or, for the cron, a
-    collector whose payloads main() emits for the gateway ``delivery.to`` announce).
+    H3 boundary: this asserts the seam but does NOT itself perform the transport.
+    The caller delivers through ``outbox.deliver_once`` only after this returns
+    ``ok`` -- so the send is receipt-captured and idempotent, while the gate<->message
+    binding is still proven here BEFORE any byte leaves. Splitting assert from send
+    keeps the proof identical and the actual delivery owned by the receipt layer.
     """
     check = assert_send_target(act_id, delivery_target)
     if not check["ok"]:
         return {"ok": False, "reason": check["reason"], "stage": "assert",
                 "message": check.get("message")}
-    send(delivery_target, text)
     return {"ok": True, "delivery_target": delivery_target}
