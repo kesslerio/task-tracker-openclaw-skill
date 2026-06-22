@@ -116,6 +116,7 @@ def open_loop(
     threshold_crossed: int,
     threshold_type: str,
     delivery_target: dict[str, Any],
+    nag_loop_id: str | None = None,
 ) -> dict[str, Any]:
     """Create a FRESH open nag loop for ``task_id`` in ``state`` (in place).
 
@@ -129,6 +130,11 @@ def open_loop(
     proven target (the caller proves it first). It is stored so a re-fire can be
     checked against the live env (target_mismatch guard).
 
+    ``nag_loop_id`` may be supplied so the caller can bind the loop's id BEFORE the
+    send (H3: the receipt idem-key is keyed on it, so the id used to dedupe the
+    delivery and the id persisted on the loop must be the same value). When omitted
+    a fresh id is minted, preserving the pre-H3 contract.
+
     An existing entry is archived into ``archived_nag_loops`` only if it was a real
     prior nag loop -- one that FIRED (``nag_count > 0``) or reached a terminal ack.
     A body-double-only stub (``nag_count == 0``, never acked) is promoted in place
@@ -137,7 +143,7 @@ def open_loop(
     fresh loop never drops a live session.
     """
     existing = state.get(task_id)
-    entry = default_nag_entry(new_nag_loop_id(), delivery_target=delivery_target)
+    entry = default_nag_entry(nag_loop_id or new_nag_loop_id(), delivery_target=delivery_target)
     if isinstance(existing, dict):
         entry["archived_nag_loops"] = list(existing.get("archived_nag_loops") or [])
         was_real_loop = int(existing.get("nag_count") or 0) > 0 or bool(existing.get("ack"))

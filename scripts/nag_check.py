@@ -17,9 +17,24 @@ fire it:
    Tasks past the cap defer (the push shows a "+K more" pointer; ``/nag all`` lists
    them in full). The close/recycle resolve pass always runs over every loop.
 3. Every push goes through the delivery seam (``prove_delivery_target`` ->
-   ``gate`` -> ``assert_send_target``).  An unset env => ``nag_delivery_blocked``
-   with ``reason: env_missing`` and the nag STAYS OPEN -- it is never silently
-   cleared.
+   ``gate`` -> ``assert_send_target``) and is then DELIVERED + RECEIPTED by
+   ``outbox.deliver_once`` (idempotent, message-id captured). The script OWNS the
+   send (H3): the proven target is the thing that actually sends, the gateway
+   message-id is recorded on the ``nag_sent`` event, and a re-fire of the same loop
+   on the same day is deduped by the outbox idem-key -- so stdout is no longer the
+   delivery channel and the cron ``--announce`` of stdout cannot double-send. An
+   unset env => ``nag_delivery_blocked`` with ``reason: env_missing`` and the nag
+   STAYS OPEN; a transport FAILURE (the sender raises) likewise leaves the loop OPEN
+   and records NO ``nag_sent`` -- it is never silently cleared or phantom-sent.
+
+CADENCE COUPLING (HARD DEPENDENCY): the outbox idem-key period is the local date +
+HOUR (``%Y-%m-%d-%H``), so the same-fire dedup window assumes >= 1h spacing between
+scheduled fires. This holds for the 11/14/17 cadence (each lands in a distinct clock
+hour). If the schedule is EVER tightened to sub-hourly (two fires in one hour), the
+second would silently dedupe to the same key -- a DROPPED nag with NO log. A
+sub-hourly schedule MUST coarsen or re-key the period (e.g. include the minute)
+before tightening. The invariant is restated at the idem-key site in ``_fire_locked``;
+keep both halves in sync.
 
 Hard invariants enforced here:
 
@@ -44,6 +59,7 @@ import cos_config
 import error_envelope
 import nag_delivery
 import nag_state
+import outbox
 from task_ledger import append_event, new_event
 from task_records import active_records, load_records
 
@@ -181,12 +197,16 @@ def _nag_text(record, section: str, overdue: int) -> str:
     )
 
 
-def _push_nag(record, section: str, overdue: int, *, dry_run: bool,
-              send: Callable[[dict[str, Any], str], Any] | None) -> dict[str, Any]:
-    """Prove+gate+assert+send one nag push.  Returns the outcome dict.
+def _authorise_nag(record, section: str, overdue: int, *, dry_run: bool
+                   ) -> dict[str, Any]:
+    """Prove+gate+assert ONE nag, returning the authorised target + text.
 
-    On a delivery block (env missing / work group / seam mismatch) NOTHING is
-    sent and the caller logs ``nag_delivery_blocked`` + leaves the loop OPEN.
+    This is the proof chain that MUST pass before any byte leaves: an env-missing /
+    work-group / seam-mismatch result returns ``{"ok": False, ...}`` and the caller
+    logs ``nag_delivery_blocked`` + leaves the loop OPEN. The actual delivery is NOT
+    done here -- it is the caller's ``outbox.deliver_once`` (receipt-captured +
+    idempotent), invoked only on ``ok``. Splitting authorise from send is the H3
+    change: the proven target is the thing that actually sends.
 
     DRY-RUN: only PROVES the target (Contract 2) -- it does NOT call ``gate()``,
     which would append an ``executed`` act to the append-only autonomy audit log
@@ -197,26 +217,25 @@ def _push_nag(record, section: str, overdue: int, *, dry_run: bool,
     if dry_run:
         proof = nag_delivery.resolve_target()
         if not proof["ok"]:
-            return {"sent": False, "reason": proof["reason"], "stage": "prove"}
-        return {"sent": False, "reason": "dry_run",
+            return {"ok": False, "reason": proof["reason"], "stage": "prove"}
+        return {"ok": True, "dry_run": True,
                 "delivery_target": proof["delivery_target"], "text": text}
 
     task_id = record.canonical_id
     gated = nag_delivery.prove_and_gate("nag_sent", task_id=task_id,
                                         metadata={"section": section, "overdue_days": overdue})
     if not gated["ok"]:
-        return {"sent": False, "reason": gated["reason"], "stage": gated.get("stage")}
+        return {"ok": False, "reason": gated["reason"], "stage": gated.get("stage")}
 
-    sent = nag_delivery.authorised_send(gated["act_id"], gated["delivery_target"],
-                                        text, send=send)
-    if not sent["ok"]:
-        return {"sent": False, "reason": sent["reason"], "stage": "assert"}
-    return {"sent": True, "act_id": gated["act_id"],
+    authorised = nag_delivery.authorise_target(gated["act_id"], gated["delivery_target"])
+    if not authorised["ok"]:
+        return {"ok": False, "reason": authorised["reason"], "stage": "assert"}
+    return {"ok": True, "act_id": gated["act_id"],
             "delivery_target": gated["delivery_target"], "text": text}
 
 
 def run_nag_check(*, dry_run: bool = False, limit: int | None = None,
-                  send: Callable[[dict[str, Any], str], Any] | None = None
+                  sender: Callable[[dict[str, Any], str], dict[str, Any]] | None = None
                   ) -> dict[str, int]:
     """One nag-check pass.  Returns counts ``{open, sent, closed, blocked, deferred}``.
 
@@ -230,14 +249,15 @@ def run_nag_check(*, dry_run: bool = False, limit: int | None = None,
     turns into the "+K more" pointer and ``/nag all`` shows in full. The resolve
     pass (close/recycle) always runs over every loop, uncapped.
 
-    ``send`` is the transport every nag is delivered through; it is REQUIRED for a
-    real run (a missing transport would gate + log nag_sent while delivering
-    nothing). A dry-run never sends, so it may be omitted there. ``main`` wires a
-    collector transport whose payloads it emits for the cron ``delivery.to``
-    announce; tests inject a recording stub.
+    ``sender`` is the receipt-returning transport every nag is delivered through via
+    ``outbox.deliver_once`` -- ``sender(delivery_target, text) -> {"message_id": str}``
+    (or raises on a transport failure). It is REQUIRED for a real run (a missing
+    sender would gate + log nag_sent while delivering nothing). A dry-run never
+    sends, so it may be omitted there. ``main`` wires ``outbox.openclaw_sender`` (the
+    REAL Telegram send); tests inject a fake returning canned message ids.
     """
-    if not dry_run and send is None:
-        raise ValueError("run_nag_check requires a send transport for a real run.")
+    if not dry_run and sender is None:
+        raise ValueError("run_nag_check requires a sender transport for a real run.")
     ref = _today()
     _tasks_file, _content, records = load_records(personal=False)
     active = {r.canonical_id: r for r in active_records(records) if r.canonical_id}
@@ -283,21 +303,22 @@ def run_nag_check(*, dry_run: bool = False, limit: int | None = None,
     counts["deferred"] = len(firable) - len(to_fire)
     for task_id, record, section, overdue in to_fire:
         _fire_one(task_id, record, section, overdue, counts,
-                  ref=ref, dry_run=dry_run, send=send)
+                  ref=ref, dry_run=dry_run, sender=sender)
 
     return counts
 
 
 def _fire_one(task_id, record, section, overdue, counts, *,
               ref: datetime, dry_run: bool,
-              send: Callable[[dict[str, Any], str], Any] | None) -> None:
+              sender: Callable[[dict[str, Any], str], dict[str, Any]] | None) -> None:
     """Fire (or skip) ONE task's nag, deciding ack/snooze UNDER the lock.
 
-    The whole decision -- re-check ack/snooze, prove+gate, send, persist -- happens
-    inside ONE locked transition so a reactive ``/done`` that acks the loop can
-    never be raced: if the loop is acked/snoozed when the lock is held, NO message
-    is sent, NO gate act is logged, and state is untouched (closing the 'said
-    /done, got nagged again' trust window AND the phantom-gate-act audit hole).
+    The whole decision -- re-check ack/snooze, prove+gate+assert, the
+    receipt-captured send, persist -- happens inside ONE locked transition so a
+    reactive ``/done`` that acks the loop can never be raced: if the loop is
+    acked/snoozed when the lock is held, NO message is sent, NO gate act is logged,
+    and state is untouched (closing the 'said /done, got nagged again' trust window
+    AND the phantom-gate-act audit hole).
 
     A dry-run takes no lock and never gates/sends -- it only previews. To stay a
     FAITHFUL preview it applies the same ack/snooze skip the real fire does, so a
@@ -308,8 +329,8 @@ def _fire_one(task_id, record, section, overdue, counts, *,
         if (isinstance(current, dict) and current.get("ack")) or \
                 nag_state.is_snoozed(current, now=ref):
             return  # the real run would skip this -- preview must too
-        outcome = _push_nag(record, section, overdue, dry_run=True, send=send)
-        if outcome["sent"] is False and outcome["reason"] == "dry_run":
+        outcome = _authorise_nag(record, section, overdue, dry_run=True)
+        if outcome["ok"]:
             counts["open"] += 1
         else:
             counts["blocked"] += 1
@@ -317,25 +338,69 @@ def _fire_one(task_id, record, section, overdue, counts, *,
 
     result = nag_state.transition(
         lambda live: _fire_locked(live, task_id, record, section, overdue,
-                                  ref=ref, send=send))
+                                  ref=ref, sender=sender))
     _apply_fire_result(result, task_id, section, counts)
 
 
-def _fire_locked(live, task_id, record, section, overdue, *, ref, send):
+def _fire_locked(live, task_id, record, section, overdue, *, ref, sender):
     """The under-lock fire decision for ONE task (runs inside nag_state.transition).
 
     Returns a small result dict the caller turns into ledger events + counts. The
-    gate+send happen here, AFTER the ack/snooze re-check, so a raced-out fire never
-    sends a message or logs a gate act.
+    whole chain -- ack/snooze re-check, outbox peek, prove+gate+assert, the
+    receipt-captured send, and the state persist -- happens UNDER the lock, so a
+    reactive ``/done`` that acks the loop before this takes the lock means NO message
+    is sent and NO gate act is logged. The send goes through ``outbox.deliver_once``
+    (idempotent + receipt), keyed on (task_id, period), so a re-fire of the SAME loop
+    in the SAME cycle never double-sends even across retries.
+
+    Ordering (audit-honest): peek -> [skip | gate->assert->deliver] -> reconcile.
+    The idem-key is computed FIRST and the outbox PEEKED before any gate() call. A
+    key already recorded this cycle short-circuits to ``already_delivered`` WITHOUT
+    proving/gating/asserting, so a same-cycle idempotent retry logs NO phantom
+    ``executed`` autonomy-gate act -- mirroring how the acked/snoozed SKIP path above
+    also avoids gate(). Only an unrecorded key proceeds to ``_authorise_nag``
+    (prove->gate->assert, which logs the executed act) and then ``deliver_once``,
+    whose own under-flock recorded-key check stays the AUTHORITATIVE dedup for the
+    rare TOCTOU where another fire records between this peek and that flock.
+
+    State is mutated ONLY AFTER a proven, delivered send. A delivery failure (the
+    sender raises) returns ``delivery_failed`` having mutated ``live`` not at all, so
+    ``nag_state.transition`` persists nothing -- the loop stays exactly as it was
+    (OPEN), never a phantom "sent"; the result carries the gate ``act_id`` so the
+    caller can reconcile the now-undelivered executed act in the ledger. A post-gate
+    ``idempotent`` short-circuit (the rare TOCTOU race) returns ``already_delivered``
+    likewise carrying the ``act_id`` to reconcile, having mutated nothing: no message
+    was delivered, so nag_count is not bumped and no second receipt is written.
+    nag_count counts DELIVERED nags.
     """
     current = live.get(task_id)
     if (isinstance(current, dict) and current.get("ack")) or \
             nag_state.is_snoozed(current, now=ref):
         return {"status": "skipped"}  # raced with a close/snooze -- do nothing
 
-    outcome = _push_nag(record, section, overdue, dry_run=False, send=send)
-    if not outcome["sent"]:
-        return {"status": "blocked", "reason": outcome["reason"]}
+    # CADENCE COUPLING (P3): the period is local date + HOUR, so the dedup window
+    # assumes >= 1h spacing between scheduled fires (the 11/14/17 cadence -- each
+    # lands in a distinct clock hour). If the schedule is ever tightened to
+    # sub-hourly (two fires in one hour), the second would silently dedupe here to
+    # the same key -- a DROPPED nag with no log. A sub-hourly schedule MUST coarsen
+    # or re-key this period (e.g. include the minute) before tightening. See the
+    # module docstring; do NOT change the granularity without changing both halves.
+    idem_key = outbox.make_idem_key("nag", task_id, ref.strftime("%Y-%m-%d-%H"))
+
+    # PEEK BEFORE GATE: if this cycle's delivery is already recorded, this is a
+    # same-cycle idempotent retry. Short-circuit BEFORE _authorise_nag so gate() is
+    # never called and NO phantom ``executed`` act is logged for an undelivered fire.
+    # deliver_once re-checks under its own flock, so this peek is an optimisation, not
+    # the authority -- the rare post-peek TOCTOU is still caught + reconciled below.
+    if outbox.is_recorded(idem_key):
+        return {"status": "already_delivered"}
+
+    authorised = _authorise_nag(record, section, overdue, dry_run=False)
+    if not authorised["ok"]:
+        return {"status": "blocked", "reason": authorised["reason"]}
+    # _authorise_nag's gate() has now logged an ``executed`` act under this act_id. If
+    # delivery does NOT happen below, the caller reconciles that act in the ledger.
+    act_id = authorised["act_id"]
 
     # Open a fresh loop unless there is ALREADY a genuine open nag loop (one that
     # has fired). An absent entry, an acked one, or a body-double-only STUB
@@ -343,15 +408,47 @@ def _fire_locked(live, task_id, record, section, overdue, *, ref, send):
     # threshold/delivery_target metadata and emits nag_opened -- rather than
     # silently promoting a stub to a firing loop with delivery_target:null.
     opened = not (nag_state.is_open(current) and nag_state.is_genuine_nag(current))
+    # The loop id is for the loop STATE + ledger only -- an existing genuine loop
+    # reuses its id (a re-fire is the SAME logical nag), a fresh loop mints one that
+    # open_loop will then persist. It is DELIBERATELY NOT part of the idem-key: a
+    # fresh loop mints a RANDOM id BEFORE the loop is persisted, so keying on it means
+    # a process death between the outbox write and the state persist mints a new id
+    # next run -> a new key -> a missed dedup -> a double-send. The idem-key keys only
+    # on DURABLE identity instead (task_id + period, computed above).
+    nag_loop_id = (current.get("nag_loop_id") if not opened and isinstance(current, dict)
+                   else nag_state.new_nag_loop_id())
+
+    target = authorised["delivery_target"]
+    try:
+        receipt = outbox.deliver_once(target, authorised["text"], idem_key, sender=sender)
+    except Exception as exc:  # noqa: BLE001 -- a send failure is a per-task block,
+        # not a run crash: leave the loop OPEN (state untouched), log it, move on.
+        # The gate already logged an executed act; carry act_id so the caller can
+        # emit nag_gate_act_undelivered and keep the audit trail reconcilable.
+        return {"status": "delivery_failed", "reason": type(exc).__name__,
+                "message": str(exc), "act_id": act_id}
+
+    # A post-gate idempotent short-circuit (the rare TOCTOU: another fire recorded
+    # the key between our peek and deliver_once's flock) means deliver_once did NOT
+    # call the sender: the message was already delivered THIS cycle, so this duplicate
+    # fire must not inflate nag_count or write a phantom second receipt. nag_count
+    # counts DELIVERED nags; this fire is a no-op -- no open_loop, no record_sent, no
+    # nag_sent. State is left untouched (transition persists nothing new). But gate()
+    # already logged an executed act, so carry act_id so the caller reconciles it.
+    if receipt.get("idempotent"):
+        return {"status": "already_delivered", "act_id": act_id,
+                "reason": "idempotent_after_gate"}
+
     if opened:
         nag_state.open_loop(
             live, task_id, task_title=record.title,
             threshold_crossed=overdue, threshold_type=section,
-            delivery_target=outcome["delivery_target"],
+            delivery_target=target, nag_loop_id=nag_loop_id,
         )
     entry = nag_state.record_sent(live, task_id)
     return {"status": "sent", "entry": entry, "opened": opened,
-            "delivery_target": outcome["delivery_target"], "overdue": overdue}
+            "delivery_target": target, "overdue": overdue,
+            "message_id": receipt.get("message_id"), "idem_key": idem_key}
 
 
 def _apply_fire_result(result, task_id, section, counts) -> None:
@@ -359,9 +456,41 @@ def _apply_fire_result(result, task_id, section, counts) -> None:
     status = result["status"]
     if status == "skipped":
         return
+    if status == "already_delivered":
+        # A same-cycle retry: deliver_once short-circuited on the recorded receipt
+        # WITHOUT calling the sender, so no message went out this fire. The genuine
+        # delivery already logged its one nag_sent; logging again would write a
+        # phantom second receipt for a single delivery and inflate the delivered
+        # count. So the nag_sent ledger is untouched -- only an observability counter
+        # ticks. EXCEPT in the rare post-gate TOCTOU case (an act_id is present): the
+        # peek missed the dup, so _authorise_nag's gate() DID log an executed act for
+        # a fire that delivered nothing. Reconcile that act so the audit trail stays
+        # honest -- every gated-but-undelivered fire is reconcilable from the ledger.
+        counts["idempotent"] = counts.get("idempotent", 0) + 1
+        if result.get("act_id"):
+            _log("nag_gate_act_undelivered", task_id=task_id,
+                 act_id=result["act_id"], reason=result.get("reason", "idempotent_after_gate"))
+        return
     if status == "blocked":
         _log("nag_delivery_blocked", task_id=task_id, reason=result["reason"],
              section=section)
+        counts["blocked"] += 1
+        return
+    if status == "delivery_failed":
+        # The proof + seam passed but the transport itself failed (sender raised).
+        # State was NOT mutated, so the loop stays OPEN and no nag_sent is recorded
+        # -- never a phantom "sent". Logged as a delivery block so the operator sees
+        # the failure and the next cycle retries.
+        _log("nag_delivery_blocked", task_id=task_id, reason=result["reason"],
+             section=section, stage="send", message=result.get("message"))
+        # gate() already logged an executed act for this fire, but nothing was
+        # delivered. Reconcile that act in the append-only ledger (we do NOT touch
+        # autonomy_gate's authoritative executed record -- the FIRST record stays the
+        # truth) so /undo + audit counting can tie this executed act to its
+        # non-delivery and not overstate what was pushed.
+        if result.get("act_id"):
+            _log("nag_gate_act_undelivered", task_id=task_id, act_id=result["act_id"],
+                 reason=result["reason"], stage="send")
         counts["blocked"] += 1
         return
     entry, target = result["entry"], result["delivery_target"]
@@ -370,8 +499,13 @@ def _apply_fire_result(result, task_id, section, counts) -> None:
              overdue_days=result["overdue"], threshold_type=section,
              delivery_target=target)
         counts["open"] += 1
+    # The nag_sent event now carries the gateway message-id RECEIPT and the
+    # idem-key: the audit record proves the message was delivered (not merely
+    # intended) and to which destination, and ties it to the idempotency key that
+    # stops a duplicate on a re-fire.
     _log("nag_sent", task_id=task_id, nag_loop_id=entry.get("nag_loop_id"),
-         nag_count=entry.get("nag_count"), delivery_target=target)
+         nag_count=entry.get("nag_count"), delivery_target=target,
+         message_id=result.get("message_id"), idem_key=result.get("idem_key"))
     counts["sent"] += 1
 
 
@@ -420,6 +554,28 @@ def _print_full_list() -> None:
     print(f"{len(crossed)} overdue task{plural} total.")
 
 
+def _deliver_more_pointer(deferred: int) -> None:
+    """Deliver the "+K more … /nag all" pointer to the PROVEN target (best-effort).
+
+    Post-H3 the script sends directly, so the pointer can no longer ride stdout; it
+    is delivered as one extra message through the same proven productivity target the
+    nags went to. It is intentionally NOT idempotent (it carries no nag_loop_id and a
+    missed/duplicate pointer is harmless) and intentionally NOT gated as a nag_sent
+    act. Any delivery failure is logged and swallowed -- a failed pointer must never
+    fail the run or leave a nag loop in a bad state.
+    """
+    proof = nag_delivery.resolve_target()
+    if not proof["ok"]:
+        return
+    plural = "s" if deferred != 1 else ""
+    text = f"+{deferred} more overdue task{plural} — reply /nag all to see them."
+    try:
+        outbox.openclaw_sender(proof["delivery_target"], text)
+    except Exception as exc:  # noqa: BLE001 -- a failed pointer is non-fatal
+        _log("nag_delivery_blocked", reason=type(exc).__name__, stage="more_pointer",
+             message=str(exc))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="nag_check.py", description=__doc__)
     parser.add_argument("--dry-run", action="store_true",
@@ -433,33 +589,27 @@ def main(argv: list[str] | None = None) -> int:
         if args.list_only:
             _print_full_list()
             return 0
-        # The cron job announces this script's stdout to its explicit delivery.to
-        # (topic 2). So the transport is a collector: it accumulates each proven,
-        # gated, asserted nag text, and main() PRINTS the collected payloads as the
-        # deliverable output the gateway announce delivers. This is not a silent
-        # no-op -- a nag is only counted as sent once its text is collected for
-        # delivery, and the gate<->message seam still binds every payload to its
-        # proven target before it is collected.
+        # H3: the SCRIPT owns the send. Each proven, gated, asserted nag is delivered
+        # by ``outbox.openclaw_sender`` (the REAL Telegram send), receipt-captured and
+        # idempotent. Because the send happens here -- not via the cron announcing
+        # stdout -- STDOUT stays EMPTY for delivered nags so the cron's blind
+        # ``--announce`` of stdout is a no-op and CANNOT double-send. A dry-run never
+        # sends, so its sender is None and nothing leaves; the operator preview is the
+        # footer on stdout. The operational footer always rides STDERR (captured by
+        # the run_with_envelope boundary, never delivered) so an idle cycle announces
+        # nothing and the ADHD-focused surface is not spammed (spec §2.1 habituation).
         limit = None if args.all_nags else cos_config.nag_display_limit()
-        payloads: list[str] = []
-        counts = run_nag_check(dry_run=args.dry_run, limit=limit,
-                               send=None if args.dry_run else
-                               (lambda _target, text: payloads.append(text)))
-        # STDOUT carries ONLY the deliverable nag text -- it is what the cron
-        # announces to topic 2, so an idle cycle (no overdue task) announces
-        # NOTHING. The operational status footer goes to STDERR (captured by the
-        # run_with_envelope boundary, never delivered) so the ADHD-focused surface
-        # is not spammed with a "0 open loops" line every cycle (spec §2.1
-        # habituation). A dry-run prints to stdout for the operator preview.
-        for text in payloads:
-            print(text)
-            print()  # blank line between nags in the announced output
-        # The "+K more" pointer rides the announce ONLY when some nags were shown
-        # and the cap held others back -- never on an idle cycle (no payloads => no
-        # pointer), so the habituation guard above is preserved.
-        if payloads and counts["deferred"] > 0:
-            plural = "s" if counts["deferred"] != 1 else ""
-            print(f"+{counts['deferred']} more overdue task{plural} — reply /nag all to see them.")
+        sender = None if args.dry_run else outbox.openclaw_sender
+        counts = run_nag_check(dry_run=args.dry_run, limit=limit, sender=sender)
+        # The "+K more" pointer must still REACH the user, but stdout is no longer the
+        # delivery channel -- so it is delivered as one extra message through the SAME
+        # proven target, only when some nags actually fired and the cap held others
+        # back (never on an idle cycle: nothing fired => no pointer). It is not put
+        # through the idempotent outbox: it is a per-cycle ephemeral pointer with no
+        # nag_loop_id, not a deduped nag, and a missed pointer is harmless. A delivery
+        # failure here must not crash the run, so it is logged and swallowed.
+        if not args.dry_run and counts["sent"] > 0 and counts["deferred"] > 0:
+            _deliver_more_pointer(counts["deferred"])
         footer = (f"NAG_CHECK_DONE: {counts['open']} open loops, {counts['sent']} sent, "
                   f"{counts['closed']} closed, {counts['blocked']} blocked, "
                   f"{counts['deferred']} deferred")

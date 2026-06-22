@@ -74,6 +74,7 @@ KNOWN_EVENT_TYPES: frozenset[str] = frozenset({
     "nag_acked",
     "nag_snoozed",
     "nag_delivery_blocked",
+    "nag_gate_act_undelivered",
     "body_double_started",
     "body_double_checkin",
     "body_double_ended",

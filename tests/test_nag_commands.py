@@ -31,6 +31,15 @@ PRODUCTIVITY = "-4242424242"
 WORK_GROUP = "-5252525252"
 REF = datetime(2026, 6, 19, tzinfo=timezone.utc)
 
+
+def _fake_sender(record):
+    """H3 deliver_once-shaped fake sender: records (target, text), returns a canned
+    receipt. Never calls real openclaw."""
+    def _send(target, text):
+        record.append((target, text))
+        return {"message_id": "-4242424242"}
+    return _send
+
 BOARD = """# Work
 
 ## 🟡 Q2
@@ -92,7 +101,7 @@ def test_done_closes_loop_synchronously_same_turn(env):
     assert nag["closed_by"] == "explicit_done"
     # Same-turn close means the NEXT nag-check fire skips this task (no push).
     sent = []
-    nag_check.run_nag_check(send=lambda t, x: sent.append((t, x)))
+    nag_check.run_nag_check(sender=_fake_sender(sent))
     assert sent == []
 
 
@@ -115,7 +124,7 @@ def test_recurring_done_clears_loop_so_next_recurrence_nags(env, monkeypatch):
     monkeypatch.setattr(nag_check, "_today",
                         lambda: datetime(2026, 7, 1, tzinfo=timezone.utc))
     sent = []
-    nag_check.run_nag_check(send=lambda t, x: sent.append((t, x)))
+    nag_check.run_nag_check(sender=_fake_sender(sent))
     assert len(sent) == 1  # re-nags the next recurrence; never permanently muted
 
 
@@ -161,13 +170,13 @@ def test_reschedule_to_future_moves_due_and_recycles_loop(env, monkeypatch):
     assert "tsk_abc123" not in _state(state) or _state(state)["tsk_abc123"].get("ack") is not True
     # The future date is not overdue at REF -> nag-check is quiet for now.
     sent = []
-    nag_check.run_nag_check(send=lambda t, x: sent.append((t, x)))
+    nag_check.run_nag_check(sender=_fake_sender(sent))
     assert sent == []
     # When the new date later lapses, a fresh loop nags (no permanent mute).
     monkeypatch.setattr(nag_check, "_today",
                         lambda: datetime(2026, 7, 10, tzinfo=timezone.utc))
     sent2 = []
-    nag_check.run_nag_check(send=lambda t, x: sent2.append((t, x)))
+    nag_check.run_nag_check(sender=_fake_sender(sent2))
     assert len(sent2) == 1
 
 
@@ -184,7 +193,7 @@ def test_reschedule_to_still_overdue_date_recycles_loop_for_renag(env, monkeypat
     assert result["nag_recycled"] is True
     # The cron then opens a fresh loop (the task is still overdue past threshold).
     sent = []
-    nag_check.run_nag_check(send=lambda t, x: sent.append((t, x)))
+    nag_check.run_nag_check(sender=_fake_sender(sent))
     assert len(sent) == 1
 
 
@@ -211,7 +220,7 @@ def test_snooze_pauses_but_does_not_close(env, monkeypatch):
     assert nag["snoozed_until"] is not None
     # Within the snooze window the next nag-check sends nothing.
     sent = []
-    nag_check.run_nag_check(send=lambda t, x: sent.append((t, x)))
+    nag_check.run_nag_check(sender=_fake_sender(sent))
     assert sent == []
 
 
@@ -264,7 +273,7 @@ def test_t6_snooze_expires_then_nag_refires(env, monkeypatch):
     monkeypatch.setattr(nag_check, "_today",
                         lambda: datetime(2026, 6, 21, tzinfo=timezone.utc))
     sent = []
-    nag_check.run_nag_check(send=lambda t, x: sent.append((t, x)))
+    nag_check.run_nag_check(sender=_fake_sender(sent))
     assert len(sent) == 1  # re-fires after expiry
     assert _state(state)["tsk_abc123"]["snooze_count"] == 1  # still 1; loop re-open
 
