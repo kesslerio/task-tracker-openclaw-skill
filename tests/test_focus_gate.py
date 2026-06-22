@@ -388,6 +388,109 @@ def test_standup_summary_omits_capacity_for_personal_board(tmp_path):
     assert payload["capacity"] is None
 
 
+def _run_tasks(tmp_path, board: Path, *args, env_overrides=None):
+    env = os.environ.copy()
+    env["TASK_TRACKER_WORK_FILE"] = str(board)
+    env["TASK_MGMT_STATE_DIR"] = str(tmp_path / "state")
+    env["TASK_TRACKER_LEDGER_FILE"] = str(tmp_path / "events.jsonl")
+    env["WEEKLY_CAPACITY_HOURS"] = "25"
+    env["UNESTIMATED_TASK_HOURS"] = "2"
+    env["ACTIVE_TASK_HARD_CAP"] = "20"
+    if env_overrides:
+        env.update(env_overrides)
+    return subprocess.run(
+        ["python3", str(SCRIPTS / "tasks.py"), *args],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def test_over_cap_capture_preserves_due_and_owner_in_parked_line(tmp_path):
+    # H6 Fix 2: an over-cap add carrying --due / --owner must NOT silently drop
+    # them. They are stored on the parked line using the same 🗓️<due> / owner::
+    # tokens an active line uses, so the captured task is self-describing.
+    board = tmp_path / "Work Tasks.md"
+    board.write_text(
+        "# Work\n\n"
+        "## 🔴 Q1\n"
+        "- [ ] **T1** estimate:: 13h task_id::tsk_aaaaaaaaaaaaaaaa\n"
+        "## 🟡 Q2\n"
+        "- [ ] **T2** estimate:: 13h task_id::tsk_bbbbbbbbbbbbbbbb\n"
+        "## 🅿️ Parking Lot\n"
+    )
+    proc = _run_add(tmp_path, board, "Important thing", "--due", "2026-07-01", "--owner", "alice")
+    assert proc.returncode == 0
+    text = board.read_text()
+    pl_index = text.index("Parking Lot")
+    parked = text[pl_index:]
+    # The due date and owner ride on the parked line.
+    assert "🗓️2026-07-01" in parked
+    assert "owner:: alice" in parked
+    # The task is parked, not active.
+    assert text.index("Important thing") > pl_index
+
+
+def test_capture_then_promote_restores_due_and_owner(tmp_path):
+    # The round-trip: capture over-cap WITH due+owner, then promote (with room) ->
+    # the restored ACTIVE line carries 🗓️<due> AND owner:: <owner>. "Saved, not
+    # lost" means the due date / owner survive the capture->promote cycle.
+    board = tmp_path / "Work Tasks.md"
+    board.write_text(
+        "# Work\n\n"
+        "## 🔴 Q1\n"
+        "- [ ] **T1** estimate:: 1m task_id::tsk_aaaaaaaaaaaaaaaa\n"
+        "- [ ] **T2** estimate:: 1m task_id::tsk_bbbbbbbbbbbbbbbb\n"
+        "## 🟡 Q2\n"
+        "- [ ] **T3** estimate:: 1m task_id::tsk_cccccccccccccccc\n"
+        "## 🅿️ Parking Lot\n"
+    )
+    # Capture over a hard-cap of 3 (4th add is captured to parking).
+    cap3 = {"ACTIVE_TASK_HARD_CAP": "3", "WEEKLY_CAPACITY_HOURS": "1000"}
+    cap = _run_add(tmp_path, board, "Captured job", "--due", "2026-08-15", "--owner", "bob",
+                   env_overrides=cap3)
+    assert cap.returncode == 0
+    assert board.read_text().index("Captured job") > board.read_text().index("Parking Lot")
+    # Promote with room (relaxed cap) -> active line carries due + owner.
+    promo = _run_tasks(tmp_path, board, "promote", "1",
+                       env_overrides={"ACTIVE_TASK_HARD_CAP": "20", "WEEKLY_CAPACITY_HOURS": "1000"})
+    assert promo.returncode == 0, promo.stdout + promo.stderr
+    text = board.read_text()
+    pl_index = text.index("Parking Lot")
+    active = text[:pl_index]
+    assert "Captured job" in active
+    assert "🗓️2026-08-15" in active
+    assert "owner:: bob" in active
+    # Gone from parking.
+    assert "Captured job" not in text[pl_index:]
+
+
+def test_over_cap_capture_without_due_or_owner_has_no_stray_tokens(tmp_path):
+    # A plain over-cap capture (no --due / --owner) must NOT inject stray 🗓️ or
+    # owner:: tokens -- the default owner ("me") is suppressed, exactly like an
+    # active line.
+    board = tmp_path / "Work Tasks.md"
+    board.write_text(
+        "# Work\n\n"
+        "## 🔴 Q1\n"
+        "- [ ] **T1** estimate:: 13h task_id::tsk_aaaaaaaaaaaaaaaa\n"
+        "## 🟡 Q2\n"
+        "- [ ] **T2** estimate:: 13h task_id::tsk_bbbbbbbbbbbbbbbb\n"
+        "## 🅿️ Parking Lot\n"
+    )
+    proc = _run_add(tmp_path, board, "Plain capture")
+    assert proc.returncode == 0
+    text = board.read_text()
+    pl_index = text.index("Parking Lot")
+    parked_lines = [
+        ln for ln in text[pl_index:].splitlines() if "Plain capture" in ln
+    ]
+    assert len(parked_lines) == 1
+    parked_line = parked_lines[0]
+    assert "🗓️" not in parked_line
+    assert "owner::" not in parked_line
+
+
 def test_standup_capacity_line_flags_overcommit(tmp_path):
     board = tmp_path / "Work Tasks.md"
     board.write_text(

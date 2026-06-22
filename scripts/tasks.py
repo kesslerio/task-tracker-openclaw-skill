@@ -371,7 +371,17 @@ def add_task(args):
         # saved is never reported as captured.
         from parking_lot import add_item
 
-        result = add_item(tasks_file, args.title, dept=args.area, priority="low")
+        # Thread --due / --owner through so a captured task does not silently lose
+        # its due date or owner ("saved, not lost"). They ride on the parked line
+        # and /promote re-derives them onto the restored active line (H6 Fix 2).
+        # The default owner ("me") is suppressed -- the same round-trip rule as
+        # _build_active_task_line -- so a normal capture carries no stray owner.
+        default_owner = os.getenv('TASK_TRACKER_DEFAULT_OWNER', 'me')
+        capture_owner = args.owner if args.owner and args.owner not in ('me', default_owner) else None
+        result = add_item(
+            tasks_file, args.title, dept=args.area, priority="low",
+            due=args.due, owner=capture_owner,
+        )
         if result.startswith("❌"):
             print(result)
             sys.exit(2)
@@ -475,6 +485,17 @@ def _promote_parked_onto_board(tasks_file, fmt: str, item_id: int, *, personal: 
 
     title = parked['title']
     area = parked.get('department')
+    # Re-derive due/owner from the self-describing parked line so the restored
+    # active line carries them (H6 Fix 2: a captured task's due date / owner are
+    # "saved, not lost", not silently dropped on promote).
+    due = parked.get('due')
+    owner = parked.get('owner')
+    # Preserve the parked task's canonical id through the promote so it round-trips
+    # (capture -> promote, swap-out -> promote-in keep one stable identity).
+    id_match = re.search(
+        r'(?:task_id|id)::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])', parked.get('raw_line') or ''
+    )
+    carried_id = id_match.group(1) if id_match else None
 
     # Promotion gate: re-run the canonical capacity check for THIS task. A personal
     # board is never work-cap gated (matching add_task's scope decision).
@@ -494,7 +515,9 @@ def _promote_parked_onto_board(tasks_file, fmt: str, item_id: int, *, personal: 
         }
 
     # Add to the active board FIRST (so a crash double-places, never loses).
-    task_line, _ = _build_active_task_line(title, area=area)
+    task_line, _ = _build_active_task_line(
+        title, due=due, area=area, owner=owner, task_id=carried_id
+    )
     new_content = _insert_active_task(content, "medium", area, task_line)
     if new_content is None:
         return {"ok": False, "message": "⚠️ Could not find a section to promote into.", "exit_code": 2}
@@ -556,10 +579,13 @@ def _park_active_task(tasks_file, fmt: str, out_id: str, *, personal: bool):
         }
 
     # Add to the parking lot FIRST (so a crash double-places, never loses). Preserve
-    # the task's canonical id so the parked copy keeps its identity.
+    # the task's canonical id so the parked copy keeps its identity, and carry the
+    # due date / owner onto the parked line so a swap-out is also "saved, not lost"
+    # and a later promote-in restores them (H6 Fix 2).
     add_result = add_item(
         tasks_file, target.title, dept=target.department or target.area,
         priority="low", task_id=target.canonical_id,
+        due=target.due, owner=target.owner,
     )
     if add_result.startswith("❌"):
         return {"ok": False, "message": add_result, "exit_code": 2}
@@ -594,17 +620,45 @@ def _park_active_task(tasks_file, fmt: str, out_id: str, *, personal: bool):
             "exit_code": 2,
         }
     _atomic_write(tasks_file, updated)
-    return {"ok": True, "title": target.title, "message": f"✅ Parked '{target.title}'."}
+    # Resolve the parking-lot item id of the just-parked copy (matched by its
+    # preserved canonical id) so a swap can roll the park-out BACK if needed.
+    parked_id = _parked_item_id_for(updated, out_id)
+    return {
+        "ok": True,
+        "title": target.title,
+        "parked_id": parked_id,
+        "message": f"✅ Parked '{target.title}'.",
+    }
+
+
+def _parked_item_id_for(content: str, canonical_id: str) -> int | None:
+    """Return the parking-lot item id whose line carries ``canonical_id``, or None."""
+    from parking_lot import _find_parking_lot_bounds, _parse_items
+
+    lines = content.split('\n')
+    start, end = _find_parking_lot_bounds(lines)
+    if start == -1:
+        return None
+    for item in _parse_items(lines, start, end):
+        raw = item.get('raw_line') or ''
+        if re.search(rf'(?:task_id|id)::\s*{re.escape(canonical_id)}\b', raw):
+            return item['id']
+    return None
 
 
 def swap_tasks(args):
     """H6 Fix 3: park out_id (active->parking) AND promote in_id (parking->active).
 
-    Park-out runs FIRST so the committed set is never left over-cap and the
-    promotion gate sees the freed slot. A failure in either half refuses without a
-    partial board: the park-out validates out_id before any write, and an invalid
-    in_id refuses BEFORE the park-out write so nothing moves.
+    All-or-nothing: the FULL post-swap capacity is pre-flighted in memory BEFORE
+    any write, so an unequal swap (where the parked-out task frees less than the
+    promoted-in task needs) is REFUSED cleanly with the board left byte-identical
+    -- never a partial move (out parked, in NOT promoted). Only once the projected
+    state is proven to fit does the park-out (which frees a slot so the
+    promote-in's gate passes) run, followed by the promote-in. A bad out/in id
+    also refuses before any write.
     """
+    from focus_core import evaluate_add
+
     tasks_file, fmt = get_tasks_file(args.personal)
     if not tasks_file.exists():
         print(f"❌ Tasks file not found: {tasks_file}")
@@ -633,6 +687,29 @@ def swap_tasks(args):
         print("❌ No active section to promote into. Nothing moved.")
         sys.exit(2)
 
+    # Pre-flight the FULL post-swap CAPACITY in memory (no write): would promoting
+    # in_id fit AFTER out_id is removed from the committed-active set? Project the
+    # state by removing out_id's active line from the board text, then re-use the
+    # canonical evaluate_add gate against that projected board. The cap's COUNTING
+    # is unchanged -- this only asks the gate about a projected state. If it would
+    # NOT fit (the out task frees less room than the in task needs), refuse cleanly
+    # and leave the board BYTE-IDENTICAL. The promoted-in task is unestimated (the
+    # promote path supplies no estimate), exactly what evaluate_add projects.
+    if not args.personal:
+        projected = remove_task_line(content, out_target.raw_line, out_target.line_number)
+        if projected is not None:
+            projected_gate = evaluate_add(
+                projected, fmt, in_target["title"],
+                destination_active=True, personal=args.personal,
+            )
+            if not projected_gate.allowed:
+                print(
+                    f"❌ Swap won't fit: '{in_target['title']}' needs more room than "
+                    f"'{out_target.title}' frees. /done another task first, or pick a "
+                    f"smaller task. Nothing moved."
+                )
+                sys.exit(2)
+
     # Park out FIRST -- this frees a committed slot so the promotion gate passes.
     park_result = _park_active_task(tasks_file, fmt, args.out_id, personal=args.personal)
     if not park_result["ok"]:
@@ -641,7 +718,18 @@ def swap_tasks(args):
 
     promote_result = _promote_parked_onto_board(tasks_file, fmt, args.in_id, personal=args.personal)
     if not promote_result["ok"]:
-        print(park_result["message"])
+        # Belt-and-suspenders: the capacity pre-flight already proved the post-swap
+        # state fits, so this should not fire. If it somehow does, roll the park-out
+        # BACK by promoting the parked-out task onto the active board so the swap
+        # never leaves a partial board (out parked, nothing in).
+        parked_id = park_result.get("parked_id")
+        rollback = (
+            _promote_parked_onto_board(tasks_file, fmt, parked_id, personal=args.personal)
+            if parked_id is not None
+            else None
+        )
+        if rollback is None or not rollback.get("ok"):
+            print(park_result["message"])
         print(promote_result["message"])
         sys.exit(promote_result.get("exit_code", 2))
 

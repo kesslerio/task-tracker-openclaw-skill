@@ -164,3 +164,71 @@ def test_swap_bad_in_id_refuses_no_partial_move(tmp_path):
     assert board.read_bytes() == before
     assert "Nothing moved" in proc.stdout
     assert not any(e["event_type"] == "task_swapped" for e in _ledger_events(tmp_path))
+
+
+# --- Fix 1: swap is all-or-nothing on CAPACITY (no partial board) ----------
+
+def _unequal_board(tmp_path):
+    # Active load 12h + 12h + 1m ≈ 24.02h against a 25h cap. The "Tiny" task frees
+    # only 1m when parked out, while promoting "Parked idea" (unestimated -> 2h)
+    # needs 2h. After the swap the projected load would be ~26h > 25h, so an
+    # UNEQUAL swap (out frees less than in needs) must NOT fit.
+    board = tmp_path / "Work Tasks.md"
+    board.write_text(
+        "# Work\n\n"
+        "## 🔴 Q1\n"
+        "- [ ] **Big1** estimate:: 12h task_id::tsk_aaaaaaaaaaaaaaaa\n"
+        "## 🟡 Q2\n"
+        "- [ ] **Big2** estimate:: 12h task_id::tsk_bbbbbbbbbbbbbbbb\n"
+        "- [ ] **Tiny** estimate:: 1m task_id::tsk_cccccccccccccccc\n"
+        "## 🅿️ Parking Lot\n"
+        "- [ ] **Parked idea** #Dev task_id::tsk_pppppppppppppppp created::2026-06-01\n"
+    )
+    return board
+
+
+def test_swap_unequal_estimate_wont_fit_refuses_byte_identical(tmp_path):
+    # Pre-flight invariant: an unequal swap where the IN task needs more room than
+    # the OUT task frees is refused BEFORE any write. The board is byte-identical
+    # (out still active, in still parked) and no task_swapped event is logged --
+    # the documented no-partial-move invariant holds.
+    board = _unequal_board(tmp_path)
+    before = board.read_bytes()
+    proc = _run(tmp_path, board, "swap", "tsk_cccccccccccccccc", "1")
+    assert proc.returncode != 0
+    assert board.read_bytes() == before  # no partial board
+    assert "won't fit" in proc.stdout.lower()
+    assert "Nothing moved" in proc.stdout
+    # Out task still active, in task still parked.
+    text = board.read_text()
+    pl_index = text.index("Parking Lot")
+    assert "Tiny" in text[:pl_index]
+    assert "Parked idea" in text[pl_index:]
+    assert not any(e["event_type"] == "task_swapped" for e in _ledger_events(tmp_path))
+
+
+def test_swap_unequal_estimate_that_fits_succeeds(tmp_path):
+    # The complement: an unequal swap that DOES fit (out=Big1 frees 12h, in is
+    # unestimated -> 2h) succeeds, the net committed count is unchanged, and the
+    # parked-out task carries no estimate hint that would block a later re-promote.
+    board = _unequal_board(tmp_path)
+    # Drop the 1m Tiny task so the only active work is Big1 + Big2 (24h). Swapping
+    # Big1 (frees 12h) for Parked idea (2h) projects to 14h <= 25h -> fits.
+    text = board.read_text().replace(
+        "- [ ] **Tiny** estimate:: 1m task_id::tsk_cccccccccccccccc\n", ""
+    )
+    board.write_text(text)
+    proc = _run(tmp_path, board, "swap", "tsk_aaaaaaaaaaaaaaaa", "1")
+    assert proc.returncode == 0
+    assert "Swapped" in proc.stdout
+    text = board.read_text()
+    pl_index = text.index("Parking Lot")
+    active_part = text[:pl_index]
+    parking_part = text[pl_index:]
+    # Big1 parked out; Parked idea promoted in.
+    assert "Big1" not in active_part and "Big1" in parking_part
+    assert "Parked idea" in active_part and "Parked idea" not in parking_part
+    # Net committed count unchanged: Big2 + Parked idea = 2 active tasks.
+    assert active_part.count("- [ ] ") == 2
+    swapped = next(e for e in _ledger_events(tmp_path) if e["event_type"] == "task_swapped")
+    assert swapped["metadata"]["parked_out"] == "Big1"
