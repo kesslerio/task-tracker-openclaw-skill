@@ -228,6 +228,47 @@ def test_active_body_double_session_back_compat_no_ends_at(env):
     assert nag_state.active_body_double_session(entry2, now=REF) is garbage
 
 
+def test_cancel_session_targets_the_live_session_not_a_stale_elapsed_one(env, monkeypatch):
+    """P2: /cancel-session must end the LIVE (non-elapsed) session, not a stale one.
+
+    The continue flow stacks a fresh LIVE block AHEAD of an elapsed-but-not-ended
+    prior block. A SINGLE /cancel-session must end the LIVE block -- cancel ITS
+    crons and clear ITS quiet -- in ONE call. Before the fix, cancel resolved the
+    stale elapsed session (no `now`), reported success, yet left the live block's
+    crons firing and its quiet un-cleared (the user had to cancel twice)."""
+    board, state = env
+    monkeypatch.setattr(nag_commands, "_now", lambda: REF)
+    block1 = nag_commands.handle_start("tsk_abc123", "25m", create_cron=lambda d: "c1")
+    assert block1["ok"] is True
+    # Advance PAST block1's ends_at, then /start again -> block2 (live).
+    monkeypatch.setattr(nag_commands, "_now", lambda: REF + timedelta(hours=1))
+    block2 = nag_commands.handle_start("tsk_abc123", "25m", create_cron=lambda d: "c2")
+    assert block2["ok"] is True
+    assert block2["session_id"] != block1["session_id"]
+    # Both sessions on disk; block1 elapsed, block2 live -- a SINGLE cancel.
+    now2 = REF + timedelta(hours=1)
+    deleted = []
+    result = nag_commands.handle_cancel_session(
+        "tsk_abc123", delete_cron=lambda cid: deleted.append(cid))
+    # The LIVE session (block2) is the one ended -- not the stale block1.
+    assert result["ok"] is True
+    assert result["session_id"] == block2["session_id"]
+    assert result["ended"] is True
+    # block2's crons were cancelled (both check-ins) and ITS quiet cleared, in ONE
+    # call -- no second cancel needed.
+    assert deleted == ["c2", "c2"]
+    assert result["quiet_cleared"] is True
+    assert quiet_state.is_quiet(now2) is False
+    # block2's record is now ended; block1 remains untouched (still non-ended on
+    # disk, just elapsed). The live one was the one we ended.
+    sessions = {s["session_id"]: s for s in _state(state)["tsk_abc123"]["body_double_sessions"]}
+    assert sessions[block2["session_id"]]["ended_at"] is not None
+    assert sessions[block1["session_id"]]["ended_at"] is None
+    # And no live session remains for this task at now2.
+    assert nag_state.active_body_double_session(
+        _state(state)["tsk_abc123"], now=now2) is None
+
+
 def test_start_status_after_elapse_shows_no_active_session(env, monkeypatch):
     """/start status after the block elapsed reports "no active session" -- it must
     not advertise a stale Resume: cue for a block that already ended."""
@@ -313,6 +354,63 @@ def test_cancel_session_ends_and_clears_session_quiet(env):
     # Session ended + quiet cleared.
     assert _session(state) is None
     assert quiet_state.is_quiet(datetime.now(timezone.utc)) is False
+
+
+def test_cancel_session_restores_a_shorter_manual_quiet(env, monkeypatch):
+    """P3: a SHORTER prior manual /quiet is RESTORED on cancel, never swallowed.
+
+    The invariant "ending a focus block must never cut a manual quiet short" must
+    hold for a SHORTER prior quiet too. User /quiet until T+10m, then /start (block
+    to T+25m, which /start extends the quiet to), then cancels at T+5m. Quiet must
+    be RESTORED to the user's original T+10m -- NOT cleared (would un-mute the nag
+    before 10m), NOT left at T+25m (the block is over). The nag stays muted until
+    the user's original T+10m deadline."""
+    board, state = env
+    ref = datetime(2026, 6, 19, 9, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(nag_commands, "_now", lambda: ref)
+    # User sets a SHORTER manual quiet (until T+10m) FIRST.
+    manual_until = ref + timedelta(minutes=10)
+    quiet_state.set_quiet(manual_until)
+    # /start (25-min block to T+25m) EXTENDS the shorter manual quiet to its window
+    # and takes ownership (the existing guard: prior ends earlier than the session).
+    start = nag_commands.handle_start("tsk_abc123", "25m", create_cron=lambda d: "c")
+    assert start["ok"] is True
+    assert start["quiet_set"] is True  # extended the shorter manual quiet, owns it
+    assert start["quiet_until"] == (ref + timedelta(minutes=25)).isoformat()
+    # Cancel EARLY at T+5m.
+    monkeypatch.setattr(nag_commands, "_now", lambda: ref + timedelta(minutes=5))
+    result = nag_commands.handle_cancel_session(
+        "tsk_abc123", delete_cron=lambda cid: None)
+    assert result["ok"] is True
+    assert result["quiet_cleared"] is True  # acted: restored the prior window
+    # Quiet is RESTORED to the user's ORIGINAL T+10m -- not cleared, not T+25m.
+    restored = quiet_state.quiet_until(ref + timedelta(minutes=5))
+    assert restored is not None and restored == manual_until
+    # The nag stays muted at T+5m..T+10m (the user's original window) and is no
+    # longer muted past their original T+10m deadline (the block window is gone).
+    assert quiet_state.is_quiet(ref + timedelta(minutes=8)) is True
+    assert quiet_state.is_quiet(ref + timedelta(minutes=15)) is False
+
+
+def test_cancel_session_clears_quiet_when_prior_quiet_already_passed(env, monkeypatch):
+    """A prior manual quiet whose deadline has ALREADY passed by cancel time is NOT
+    restored -- it would mute nothing -- so cancel CLEARS, as with no prior quiet."""
+    board, state = env
+    ref = datetime(2026, 6, 19, 9, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(nag_commands, "_now", lambda: ref)
+    manual_until = ref + timedelta(minutes=5)  # short prior quiet
+    quiet_state.set_quiet(manual_until)
+    start = nag_commands.handle_start("tsk_abc123", "25m", create_cron=lambda d: "c")
+    assert start["ok"] is True and start["quiet_set"] is True
+    # Cancel AFTER the prior quiet (T+5m) already lapsed -- at T+8m.
+    monkeypatch.setattr(nag_commands, "_now", lambda: ref + timedelta(minutes=8))
+    result = nag_commands.handle_cancel_session(
+        "tsk_abc123", delete_cron=lambda cid: None)
+    assert result["ok"] is True
+    assert result["quiet_cleared"] is True  # acted (it owned the quiet)
+    # The prior window already passed, so there's nothing to restore -> cleared.
+    assert quiet_state.quiet_until(ref + timedelta(minutes=8)) is None
+    assert quiet_state.is_quiet(ref + timedelta(minutes=8)) is False
 
 
 def test_cancel_session_does_not_cut_a_longer_manual_quiet_short(env):
