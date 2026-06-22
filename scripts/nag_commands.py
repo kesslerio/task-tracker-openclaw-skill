@@ -25,9 +25,9 @@ Command summary:
   (H5), and an end-of-session done/continue/blocked/redefine DISPOSITION prompt.
   ``/start`` (no task) / ``/start status`` shows the active session's cue.
 * ``/cancel-session <id>`` -- end the LIVE focus/body-double session + delete its
-  pending crons, and resolve THIS session's quiet (only if it still owns it):
-  RESTORE the user's prior manual ``/quiet`` when shorter, else clear -- a longer
-  manual ``/quiet`` was never overwritten and is left intact.
+  pending crons, and RELEASE only THIS session's quiet lease (R3). A manual
+  ``/quiet`` (its own lease) and any other session's lease are untouched, so a
+  shorter OR longer manual ``/quiet`` survives the block's end with no restore step.
 
 The body-double ephemeral crons use ``deleteAfterRun: true`` so the gateway reaps
 them after they fire -- the agent never issues a ``cron rm`` (orphan risk if a
@@ -282,6 +282,13 @@ def _checkin_cron(session_id: str, task_id: str, elapsed_min: int, fire_at: date
     ``/start`` final check-in carries the done/continue/blocked/redefine disposition
     text instead of the body-double check-in marker. When ``prompt`` is omitted the
     default body-double marker is used, so ``/body-double`` is unchanged.
+
+    LEAST-PRIVILEGE (R3): the check-in is a ``mode: announce`` delivery -- it DELIVERS
+    the prompt text as a Telegram message the user reads and replies to (with /done,
+    /start, /reschedule). It runs no autonomous agent action, so it carries NO
+    ``toolsAllow`` -- and critically NOT ``exec``: the user-authored resumption cue is
+    spliced into the disposition prompt (see ``_disposition_prompt``), and untrusted
+    user text must never reach an exec-capable agent prompt (prompt-injection guard).
     """
     to = f"{delivery_target['chat_id']}:topic:{delivery_target['topic_id']}"
     kind = "session-end" if is_final else "halfway"
@@ -290,7 +297,6 @@ def _checkin_cron(session_id: str, task_id: str, elapsed_min: int, fire_at: date
         "schedule": {"kind": "at", "at": fire_at.isoformat()},
         "agentId": delivery_target["agent_id"],
         "deleteAfterRun": True,
-        "toolsAllow": ["exec"],
         "prompt": prompt or (f"BODY_DOUBLE_CHECKIN session={session_id} task={task_id} "
                              f"elapsed={elapsed_min}m final={is_final}"),
         "delivery": {"mode": "announce", "channel": "telegram", "to": to},
@@ -534,10 +540,10 @@ def handle_start(
 
     * a resumption CUE stored ON the session (so it survives a crash via
       nag-state.json): the user's ``next:`` text, else ``Work on: <task title>``;
-    * a QUIET window for the session duration (``quiet_state.set_quiet``) so the nag
-      is muted while the user focuses -- recorded on the session (``quiet_set``,
-      ``quiet_until``) so ``/cancel-session`` can clear ONLY this session's quiet and
-      never clobber a longer manual ``/quiet``;
+    * a SESSION-OWNED quiet lease for the session duration
+      (``quiet_state.set_lease(session_id, ...)``) so the nag is muted while the user
+      focuses -- ``/cancel-session`` releases ONLY this lease, so it can never clobber
+      a manual ``/quiet`` (its own ``"manual"`` lease) nor another session's lease;
     * an end-of-session check-in whose text is the structured
       done/continue/blocked/redefine DISPOSITION (the final check-in cron's prompt).
 
@@ -570,58 +576,26 @@ def handle_start(
     minutes = started["duration_min"]
     started_at = datetime.fromisoformat(started["session"]["started_at"])
 
-    # Mute the nag for the focus block (H5 reuse). Record on the session that THIS
-    # /start set quiet + the exact deadline, so /cancel-session can clear ONLY this
-    # session's quiet and never cut a manual /quiet short (the guard below).
-    quiet_set = False
+    # Mute the nag for the focus block (H5 reuse) via a SESSION-OWNED quiet lease
+    # (R3): the lease is keyed on this ``session_id``, so it sets ONLY this session's
+    # mute and never overwrites a manual ``/quiet`` (its own ``"manual"`` lease) nor
+    # another concurrent session's lease. ``/cancel-session`` later releases ONLY this
+    # lease, so a shorter OR longer manual quiet survives the block's end for free --
+    # no prior-deadline capture, no restore step (the lease model makes that dead).
     session_deadline = started_at + timedelta(minutes=minutes)
     quiet_until_iso = session_deadline.isoformat()
-    existing_quiet = quiet_state.quiet_until(_now())
-    # Capture the PRIOR quiet deadline (the one that existed BEFORE /start) so cancel
-    # can RESTORE it rather than clear it -- a SHORTER manual quiet (e.g. /quiet
-    # until 10:10) that this /start extends to its own deadline must be put back to
-    # ITS original deadline on cancel, never swallowed (the nag must stay muted until
-    # the user's original 10:10). None when there was no prior quiet.
-    prior_quiet_until = existing_quiet.isoformat() if existing_quiet is not None else None
-    if existing_quiet is None or existing_quiet <= session_deadline:
-        # No manual quiet, or a manual quiet that ends no later than this session --
-        # set the session window. Extending a shorter manual quiet is harmless: on
-        # cancel we RESTORE the captured prior deadline instead of clearing.
-        quiet_state.set_quiet(session_deadline)
-        quiet_set = True
-    nag_state.transition(lambda s: _annotate_quiet(s, task_id, session_id, quiet_set,
-                                                   quiet_until_iso, prior_quiet_until))
+    # Thread ``_now()`` as the prune reference so a still-future peer lease (a manual
+    # /quiet) is never pruned by a clock that differs from the one the deadlines use.
+    quiet_state.set_lease(session_id, session_deadline, now=_now())
 
     _log("start_session_started", task_id=task_id, session_id=session_id,
-         duration_min=minutes, cron_ids=started["cron_ids"], cue=cue,
-         quiet_set=quiet_set)
+         duration_min=minutes, cron_ids=started["cron_ids"], cue=cue)
     return {"ok": True, "task_id": task_id, "session_id": session_id,
             "cron_ids": started["cron_ids"], "duration_min": minutes, "cue": cue,
-            "quiet_set": quiet_set, "quiet_until": quiet_until_iso if quiet_set else None,
+            "quiet_until": quiet_until_iso,
             "ack": (f"Started a {minutes}-min focus block on {task_id}. Nag muted until "
                     f"then. Next action: {cue}. I'll check in at the halfway and end "
                     "points and ask done/continue/blocked/redefine.")}
-
-
-def _annotate_quiet(state: dict[str, Any], task_id: str, session_id: str,
-                    quiet_set: bool, quiet_until_iso: str,
-                    prior_quiet_until: str | None) -> None:
-    """Stamp the quiet bookkeeping onto the just-created session (under lock).
-
-    Stored ON the session so a crash-restart still knows whether this /start owns
-    quiet (``quiet_set``), which deadline must match before touching it
-    (``quiet_until``), and what the user's PRIOR quiet deadline was
-    (``prior_quiet_until``) so cancel can RESTORE a shorter manual quiet rather than
-    clear it -- ending a focus block must never cut a manual quiet short."""
-    entry = state.get(task_id)
-    if not isinstance(entry, dict):
-        return
-    for session in entry.get("body_double_sessions") or []:
-        if isinstance(session, dict) and session.get("session_id") == session_id:
-            session["quiet_set"] = quiet_set
-            session["quiet_until"] = quiet_until_iso
-            session["prior_quiet_until"] = prior_quiet_until
-            return
 
 
 def handle_start_status(*, personal: bool = False) -> dict[str, Any]:
@@ -681,13 +655,12 @@ def handle_cancel_session(
     ones that have NOT yet fired. A delete failure is swallowed (best-effort) so a
     transient gateway hiccup cannot block ending the session in state.
 
-    H7: if THIS session owns the quiet window (``/start``'s auto-mute) -- the live
-    quiet deadline still matches the session's ``quiet_until`` -- resolve it on
-    cancel by RESTORING the user's prior quiet (a shorter manual /quiet that /start
-    extended) when it is still in the future, else clearing. A user who ran a longer
-    ``/quiet 24h`` independently (or after the session started) is untouched (its
-    deadline never matched). Either way, ending a focus block never cuts a manual
-    quiet short -- shorter OR longer.
+    R3: the session owns its OWN quiet lease (keyed on ``session_id``). Cancel just
+    RELEASES that one lease -- a manual ``/quiet`` (its own ``"manual"`` lease) and any
+    other session's lease remain automatically, so ending this block can never cut a
+    manual quiet short (shorter OR longer) and never erase another session's mute. The
+    effective mute falls back to the max over the remaining live leases for free -- no
+    prior-deadline capture, no restore step.
     """
     # Resolve the LIVE (non-elapsed) session by passing ``now``: the auto-expire
     # design leaves an elapsed-but-not-ended prior session on disk (its final
@@ -695,7 +668,7 @@ def handle_cancel_session(
     # /start again" flow stacks a fresh LIVE session AHEAD of that stale one, so
     # without ``now`` this would end the WRONG (stale, already-over) session,
     # report success, and leave the live block's check-in crons firing and its
-    # quiet un-cleared (the user would have to /cancel-session twice).
+    # quiet lease un-released (the user would have to /cancel-session twice).
     existing = nag_state.read_state().get(task_id)
     session = nag_state.active_body_double_session(existing, now=_now())
     if session is None:
@@ -708,70 +681,19 @@ def handle_cancel_session(
     for cron_id in session.get("cron_ids") or []:
         _safe_delete(cron_id, delete=delete)
 
-    quiet_cleared = _clear_session_quiet(session)
+    # Release ONLY this session's quiet lease. The manual lease and any other
+    # session's lease are untouched, so a shorter/longer manual /quiet survives.
+    # Thread ``_now()`` so the prune in release uses the session's clock, not skew.
+    quiet_state.release_lease(session["session_id"], now=_now())
 
     ended = nag_state.transition(
         lambda state: nag_state.end_body_double_session(
             state, task_id, session["session_id"], outcome="cancelled")
     )
     _log("body_double_ended", task_id=task_id, session_id=session["session_id"],
-         outcome="cancelled", quiet_cleared=quiet_cleared)
+         outcome="cancelled")
     return {"ok": True, "task_id": task_id, "session_id": session["session_id"],
-            "outcome": "cancelled", "ended": ended is not None,
-            "quiet_cleared": quiet_cleared}
-
-
-def _clear_session_quiet(session: dict[str, Any]) -> bool:
-    """Resolve this session's quiet on cancel: RESTORE the prior quiet, else clear.
-
-    Invariant: ending a focus block must NEVER cut a manual quiet short (shorter OR
-    longer). Acts only when this session owns the quiet -- ``session["quiet_set"]``
-    is true and the live ``quiet_until`` still equals the session's stored deadline
-    (a LONGER manual /quiet set after start has a different/later deadline and was
-    never overwritten, so it is left intact and this returns False).
-
-    When this session owns the quiet, RESTORE the user's prior deadline
-    (``prior_quiet_until``, the quiet that existed BEFORE /start) when it is still in
-    the future -- so a SHORTER manual quiet (e.g. until 10:10) that /start extended
-    is put back to ITS original deadline, never swallowed. With no prior quiet (or a
-    prior that already passed) the window is CLEARED, as before. A window that
-    already expired/was-cleared independently is a no-op. Returns True when it acted.
-    """
-    if not session.get("quiet_set"):
-        return False
-    stored = session.get("quiet_until")
-    if not stored:
-        return False
-    try:
-        session_deadline = datetime.fromisoformat(str(stored))
-    except (TypeError, ValueError):
-        return False
-    live = quiet_state.quiet_until(_now())
-    if live is None or live != session_deadline:
-        return False
-    prior = _parse_prior_quiet(session.get("prior_quiet_until"))
-    if prior is not None and prior > _now():
-        quiet_state.set_quiet(prior)  # restore the user's shorter manual quiet
-    else:
-        quiet_state.clear_quiet()  # no prior, or it already passed
-    return True
-
-
-def _parse_prior_quiet(raw: str | None) -> datetime | None:
-    """Parse a stored ``prior_quiet_until`` ISO string into a tz-aware UTC datetime.
-
-    A missing/garbage value yields None (treated as no prior quiet -> clear on
-    cancel). A naive timestamp is read as UTC so the future-check compares sanely.
-    """
-    if not raw:
-        return None
-    try:
-        prior = datetime.fromisoformat(str(raw))
-    except (TypeError, ValueError):
-        return None
-    if prior.tzinfo is None:
-        prior = prior.replace(tzinfo=timezone.utc)
-    return prior
+            "outcome": "cancelled", "ended": ended is not None}
 
 
 # --- CLI surface (routed via telegram-commands.sh) -------------------------
