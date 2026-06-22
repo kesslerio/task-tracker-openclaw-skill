@@ -114,6 +114,9 @@ KNOWN_EVENT_TYPES: frozenset[str] = frozenset({
     "body_double_started",
     "body_double_checkin",
     "body_double_ended",
+    # V1 -- deterministic check-in dispatcher (no LLM turn).
+    "checkin_sent",
+    "checkin_delivery_blocked",
     # H7 -- /start initiation loop (reuses the body-double session machinery).
     "start_session_started",
     # U5 -- accomplishment ledger.

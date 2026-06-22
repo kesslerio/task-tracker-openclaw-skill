@@ -49,9 +49,16 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
 from cos_config import nag_send_timeout_seconds, outbox_retention_days, state_dir
 from utils import _atomic_write
 
-# The only outbox key kind today. A frozen set so a typo'd kind is caught at the
-# call site rather than silently producing an un-deduped key.
-_KNOWN_KINDS: frozenset[str] = frozenset({"nag"})
+# The outbox key kinds. A frozen set so a typo'd kind is caught at the call site
+# rather than silently producing an un-deduped key.
+#
+# * ``nag`` -- a nag re-fire, keyed on (task_id, period).
+# * ``checkin`` -- a V1 focus/body-double check-in, keyed on (session_id, phase)
+#   where phase is ``halfway`` | ``end``. The phase (not a clock period) is the
+#   dedupe identity: each check-in is a single logical send for its session phase,
+#   so a deterministic-dispatcher cron RETRY (the command cron re-runs) can never
+#   double-send the same halfway/end nudge.
+_KNOWN_KINDS: frozenset[str] = frozenset({"nag", "checkin"})
 
 
 def _now_iso() -> str:

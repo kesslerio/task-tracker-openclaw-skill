@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shlex
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
@@ -167,10 +168,19 @@ def handle_done(task_id: str, *, personal: bool = False) -> dict[str, Any]:
     loop is CLEARED instead of acked -- an acked entry is terminal and the cron
     skips it, so acking would mute every future recurrence. Clearing lets the next
     overdue crossing open a clean fresh loop.
+
+    V1: a successful ``/done`` also ENDS any live focus/body-double session for the
+    task (and releases its quiet lease + best-effort deletes its pending check-in
+    crons), exactly as ``/cancel-session`` does. The task is finished, so a pending
+    halfway/end check-in must not fire -- the deterministic dispatcher then finds the
+    session ended and sends nothing. A FAILED ``/done`` (task not on the board) ends
+    no session: nothing was completed.
     """
     result = complete_by_id(task_id, personal=personal, source="user_command")
     if not result.get("ok"):
         return result
+    # End any live focus session for the just-completed task so its check-ins no-op.
+    _end_focus_session(task_id, outcome="done")
     if result.get("recurring"):
         return _recycle_loop(result, task_id, closed_by=nag_state.CLOSED_EXPLICIT_DONE)
     return _close_loop_after_board_op(result, task_id,
@@ -268,38 +278,49 @@ _CHECKIN_FRACTIONS = (0.5, 1.0)
 
 
 def _checkin_cron(session_id: str, task_id: str, elapsed_min: int, fire_at: datetime,
-                  delivery_target: dict[str, Any], *, is_final: bool,
-                  label: str = "body-double", prompt: str | None = None) -> dict[str, Any]:
-    """Build ONE ephemeral check-in cron descriptor.
+                  *, is_final: bool, label: str = "body-double",
+                  personal: bool = False) -> dict[str, Any]:
+    """Build ONE ephemeral check-in cron descriptor as a deterministic COMMAND cron.
 
-    Every check-in cron carries an EXPLICIT ``delivery.to`` + ``agentId`` set at
-    session-start time (it can never derive the target at fire time from session
-    history -- Hard Gate #4), and ``deleteAfterRun: true`` so the gateway reaps it
-    after firing (no agent-issued cron rm).
+    V1 (Oracle O3 HIGH-2): the check-in is NOT an LLM agent turn. It carries NO
+    ``agentId`` and NO ``prompt`` -- an isolated cron with ``agentId`` + ``prompt`` is
+    a fresh model-backed turn (``announce`` is only fallback delivery AFTER it), and
+    the user's free-text resumption cue would enter an LLM instruction channel = a
+    prompt-injection surface. Instead the cron runs the DETERMINISTIC dispatcher
+    (``checkin_dispatch.py`` via ``telegram-commands.sh checkin-dispatch``), which
+    at fire time reloads state (skip-if-ended), RE-PROVES the delivery target, renders
+    INERT text, and sends via the receipt-backed outbox. The session identity is
+    passed as ARGV -- never interpolated into any prompt.
 
-    ``label`` names the session kind in the cron name (``body-double`` or ``start``)
-    and ``prompt`` lets the caller override the default check-in prompt -- H7's
-    ``/start`` final check-in carries the done/continue/blocked/redefine disposition
-    text instead of the body-double check-in marker. When ``prompt`` is omitted the
-    default body-double marker is used, so ``/body-double`` is unchanged.
-
-    LEAST-PRIVILEGE (R3): the check-in is a ``mode: announce`` delivery -- it DELIVERS
-    the prompt text as a Telegram message the user reads and replies to (with /done,
-    /start, /reschedule). It runs no autonomous agent action, so it carries NO
-    ``toolsAllow`` -- and critically NOT ``exec``: the user-authored resumption cue is
-    spliced into the disposition prompt (see ``_disposition_prompt``), and untrusted
-    user text must never reach an exec-capable agent prompt (prompt-injection guard).
+    The dispatcher OWNS the send, so there is NO ``delivery: announce`` block (that
+    would double-send): the cron just runs the command. ``deleteAfterRun: true`` so
+    the gateway reaps it after firing (no agent-issued cron rm). ``label`` names the
+    session kind in the cron name (``body-double`` or ``start``).
     """
-    to = f"{delivery_target['chat_id']}:topic:{delivery_target['topic_id']}"
     kind = "session-end" if is_final else "halfway"
+    scripts_dir = cos_config.checkin_scripts_dir()
+    argv_tail = [str(session_id), str(task_id), str(elapsed_min),
+                 "true" if is_final else "false", str(label)]
+    if personal:
+        argv_tail = ["--personal", *argv_tail]
+    # Quote each argv-tail token for the inner ``sh -lc`` so a (validated, but
+    # belt-and-braces) odd token can never break out of the command string.
+    quoted_tail = " ".join(shlex.quote(token) for token in argv_tail)
+    command = (
+        f"cd {shlex.quote(scripts_dir)} && "
+        f"bash telegram-commands.sh checkin-dispatch {quoted_tail} "
+        f"2>/tmp/checkin-{shlex.quote(session_id)}.stderr"
+    )
     return {
         "name": f"{label} {kind} {session_id}",
         "schedule": {"kind": "at", "at": fire_at.isoformat()},
-        "agentId": delivery_target["agent_id"],
         "deleteAfterRun": True,
-        "prompt": prompt or (f"BODY_DOUBLE_CHECKIN session={session_id} task={task_id} "
-                             f"elapsed={elapsed_min}m final={is_final}"),
-        "delivery": {"mode": "announce", "channel": "telegram", "to": to},
+        "payload": {
+            "kind": "command",
+            "argv": ["sh", "-lc", command],
+            "outputMaxBytes": cos_config.checkin_cron_output_max_bytes(),
+            "timeoutSeconds": cos_config.checkin_cron_timeout_seconds(),
+        },
     }
 
 
@@ -362,28 +383,31 @@ def _open_focus_session(
     create_cron: Callable[[dict[str, Any]], str] | None,
     default_minutes: int | None = None,
     cue: str | None = None,
-    final_prompt: Callable[[str], str] | None = None,
     extra_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Shared focus-session core for ``/body-double`` and ``/start`` (DRY).
 
     Validates duration + active board + one-session-per-task, proves the delivery
-    target, schedules the ephemeral check-in cron pair (each with the explicit
-    proven ``delivery.to`` + ``agentId``), and appends the session under the lock
-    (rolling its crons back if a concurrent session won the race). Returns
-    ``{"ok": True, "session_id", "cron_ids", "duration_min", "session"}`` on success
-    or ``{"ok": False, "error": <handler-result>}``.
+    target (a session whose check-in destination cannot be proven NOW must not start
+    headless), schedules the ephemeral DETERMINISTIC check-in cron pair, and appends
+    the session under the lock (rolling its crons back if a concurrent session won the
+    race). Returns ``{"ok": True, "session_id", "cron_ids", "duration_min",
+    "session"}`` on success or ``{"ok": False, "error": <handler-result>}``.
+
+    V1: the check-in crons are deterministic COMMAND crons (no agentId/prompt). The
+    target is proven HERE only to gate whether the session starts; the dispatcher
+    RE-PROVES it at fire time (it never trusts a target baked in at create time). The
+    proven target is still stored on the session for audit.
 
     ``default_minutes`` lets ``/start`` accept an OMITTED duration and fall back to
     the configured default; ``cue`` / ``extra_session`` are stored ON the session so
-    they survive a crash (in nag-state.json); ``final_prompt`` overrides the final
-    check-in cron's prompt (``/start``'s disposition text). ``/body-double`` passes
-    none of these, so its prompts/cue/quiet behaviour is unchanged. NOTE: ``ends_at``
-    is now stamped on EVERY session (both commands), so an elapsed body-double session
-    also auto-expires -- a benign improvement (an orphan body-double whose block is
-    over no longer blocks a new session); a ``/cancel-session`` after a body-double
-    block has elapsed returns ``no-active-session`` (its check-in crons already fired
-    + were reaped, so there is nothing left to cancel) rather than re-closing it.
+    they survive a crash (in nag-state.json). ``/body-double`` passes neither, so its
+    cue/quiet behaviour is unchanged. NOTE: ``ends_at`` is stamped on EVERY session
+    (both commands), so an elapsed body-double session also auto-expires -- a benign
+    improvement (an orphan body-double whose block is over no longer blocks a new
+    session); a ``/cancel-session`` after a body-double block has elapsed returns
+    ``no-active-session`` (its check-in crons already fired + were reaped, so there is
+    nothing left to cancel) rather than re-closing it.
     """
     minutes = parse_duration_minutes(duration)
     if minutes <= 0 and default_minutes is not None and not (duration or "").strip():
@@ -419,11 +443,9 @@ def _open_focus_session(
 
     session_id = f"{id_prefix}{uuid.uuid4().hex[:12]}"
     started_at = _now()
-    final_prompt_text = final_prompt(session_id) if final_prompt is not None else None
     created = _create_checkin_crons(session_id, task_id, minutes, started_at,
-                                    proof["delivery_target"],
                                     create=create_cron or cron_backend.create_cron,
-                                    label=label, final_prompt=final_prompt_text)
+                                    label=label, personal=personal)
     if not created["ok"]:
         return {"ok": False, "error": created["error"]}
 
@@ -467,10 +489,10 @@ def _session_active_error(task_id: str, started_at: str | None = None) -> dict[s
     }}
 
 
-def _create_checkin_crons(session_id, task_id, minutes, started_at, delivery_target,
+def _create_checkin_crons(session_id, task_id, minutes, started_at,
                           *, create: Callable[[dict[str, Any]], str],
                           label: str = "body-double",
-                          final_prompt: str | None = None) -> dict[str, Any]:
+                          personal: bool = False) -> dict[str, Any]:
     """Create the check-in cron pair; roll back partial creation on failure.
 
     Returns ``{"ok": True, "cron_ids": [...]}`` on success, or ``{"ok": False,
@@ -479,9 +501,10 @@ def _create_checkin_crons(session_id, task_id, minutes, started_at, delivery_tar
     half-started session is left behind (the caller must not record a session or
     report "started").
 
-    ``label`` names the cron kind; ``final_prompt`` overrides the FINAL check-in
-    cron's prompt (H7's ``/start`` disposition). Both default to the body-double
-    behaviour so ``/body-double`` is unchanged.
+    V1: each cron is a DETERMINISTIC command descriptor (no agentId/prompt) -- the
+    dispatcher re-proves the target and renders inert text at fire time. ``label``
+    names the cron kind; ``personal`` is threaded onto the dispatch argv. Both
+    default to the body-double behaviour so ``/body-double`` is unchanged.
     """
     cron_ids: list[str] = []
     try:
@@ -490,8 +513,7 @@ def _create_checkin_crons(session_id, task_id, minutes, started_at, delivery_tar
             is_final = fraction == 1.0
             descriptor = _checkin_cron(
                 session_id, task_id, elapsed, started_at + timedelta(minutes=elapsed),
-                delivery_target, is_final=is_final, label=label,
-                prompt=final_prompt if (is_final and final_prompt) else None,
+                is_final=is_final, label=label, personal=personal,
             )
             cron_ids.append(create(descriptor))
     except cron_backend.CronBackendError as exc:
@@ -507,20 +529,10 @@ def _create_checkin_crons(session_id, task_id, minutes, started_at, delivery_tar
 
 # --- /start: the initiation loop (reuses the focus-session machinery) -------
 
-# The end-of-session disposition prompt (H7 step 4). It becomes the FINAL check-in
-# cron's text, so the gateway fires the structured done/continue/blocked/redefine
-# choice at the session end -- directing to the EXISTING commands (no new /continue
-# or /redefine commands: continue == /start again, redefine == a plain reply).
-def _disposition_prompt(session_id: str, task_id: str, cue: str) -> str:
-    return (
-        f"START_SESSION_END session={session_id} task={task_id}\n"
-        f"Focus block done. Resume cue was: {cue!r}.\n"
-        "How did it go? Pick one:\n"
-        f"  done -> /done {task_id}\n"
-        f"  continue -> /start {task_id} (another block)\n"
-        f"  blocked -> /reschedule {task_id} <date>\n"
-        "  redefine -> just reply with the new next action."
-    )
+# V1: the end-of-session disposition (done/continue/blocked/redefine) is no longer a
+# cron PROMPT -- it is rendered as INERT user-facing TEXT by the deterministic
+# dispatcher (``checkin_dispatch._render_checkin_text``) at fire time, from the cue
+# stored on the session. NO code path here puts the cue/task text into an LLM prompt.
 
 
 def handle_start(
@@ -535,8 +547,7 @@ def handle_start(
 
     A task list surfaces tasks but doesn't help you START. ``/start`` reuses the
     body-double focus-session machinery (DRY: ``_open_focus_session`` -- same
-    session record, same ephemeral check-in crons each carrying the explicit proven
-    ``delivery.to`` + ``agentId``) and LAYERS on:
+    session record, same ephemeral deterministic check-in crons) and LAYERS on:
 
     * a resumption CUE stored ON the session (so it survives a crash via
       nag-state.json): the user's ``next:`` text, else ``Work on: <task title>``;
@@ -544,8 +555,9 @@ def handle_start(
       (``quiet_state.set_lease(session_id, ...)``) so the nag is muted while the user
       focuses -- ``/cancel-session`` releases ONLY this lease, so it can never clobber
       a manual ``/quiet`` (its own ``"manual"`` lease) nor another session's lease;
-    * an end-of-session check-in whose text is the structured
-      done/continue/blocked/redefine DISPOSITION (the final check-in cron's prompt).
+    * an end-of-session check-in whose INERT text is the structured
+      done/continue/blocked/redefine DISPOSITION (rendered deterministically by the
+      dispatcher at fire time from the cue -- never an LLM prompt).
 
     A duration default of ``cos_config.start_session_minutes()`` (25, floored at 1)
     applies when the user omits it. ``/body-double`` is untouched.
@@ -566,7 +578,6 @@ def handle_start(
         create_cron=create_cron,
         default_minutes=cos_config.start_session_minutes(),
         cue=cue,
-        final_prompt=lambda sid: _disposition_prompt(sid, task_id, cue),
         extra_session={"kind": "start"},
     )
     if not started["ok"]:
@@ -662,20 +673,42 @@ def handle_cancel_session(
     effective mute falls back to the max over the remaining live leases for free -- no
     prior-deadline capture, no restore step.
     """
-    # Resolve the LIVE (non-elapsed) session by passing ``now``: the auto-expire
-    # design leaves an elapsed-but-not-ended prior session on disk (its final
-    # check-in cron fired and was reaped, nothing marked it ended). A "continue ->
-    # /start again" flow stacks a fresh LIVE session AHEAD of that stale one, so
-    # without ``now`` this would end the WRONG (stale, already-over) session,
-    # report success, and leave the live block's check-in crons firing and its
-    # quiet lease un-released (the user would have to /cancel-session twice).
-    existing = nag_state.read_state().get(task_id)
-    session = nag_state.active_body_double_session(existing, now=_now())
-    if session is None:
+    ended = _end_focus_session(task_id, outcome="cancelled", delete_cron=delete_cron)
+    if ended is None:
         return {"ok": False, "error": {
             "code": "no-active-session",
             "message": "No active body-double session for this task.",
         }}
+    return {"ok": True, "task_id": task_id, "session_id": ended["session_id"],
+            "outcome": "cancelled", "ended": ended["ended"]}
+
+
+def _end_focus_session(
+    task_id: str,
+    *,
+    outcome: str,
+    delete_cron: Callable[[str], Any] | None = None,
+) -> dict[str, Any] | None:
+    """End the LIVE focus/body-double session for ``task_id`` (crons + lease + state).
+
+    Shared by ``/cancel-session`` and ``/done``: resolve the live (non-elapsed)
+    session, best-effort delete its pending check-in crons, RELEASE only ITS quiet
+    lease, and mark it ended with ``outcome``. Returns ``{"session_id", "ended"}`` or
+    None if there is no live session to end (so a ``/done`` on a task with no focus
+    session is a clean no-op). After this runs, the deterministic check-in dispatcher
+    finds the session ended and sends NOTHING -- the post-``/done`` no-op the V1 fix
+    requires.
+
+    Resolving with ``now`` is essential: the auto-expire design leaves an
+    elapsed-but-not-ended prior session on disk; a "continue -> /start again" flow
+    stacks a fresh LIVE session ahead of that stale one, so without ``now`` this would
+    end the WRONG (stale, already-over) session and leave the live block's crons +
+    lease alive.
+    """
+    existing = nag_state.read_state().get(task_id)
+    session = nag_state.active_body_double_session(existing, now=_now())
+    if session is None:
+        return None
 
     delete = delete_cron or cron_backend.delete_cron
     for cron_id in session.get("cron_ids") or []:
@@ -688,12 +721,11 @@ def handle_cancel_session(
 
     ended = nag_state.transition(
         lambda state: nag_state.end_body_double_session(
-            state, task_id, session["session_id"], outcome="cancelled")
+            state, task_id, session["session_id"], outcome=outcome)
     )
     _log("body_double_ended", task_id=task_id, session_id=session["session_id"],
-         outcome="cancelled")
-    return {"ok": True, "task_id": task_id, "session_id": session["session_id"],
-            "outcome": "cancelled", "ended": ended is not None}
+         outcome=outcome)
+    return {"session_id": session["session_id"], "ended": ended is not None}
 
 
 # --- CLI surface (routed via telegram-commands.sh) -------------------------

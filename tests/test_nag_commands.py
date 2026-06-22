@@ -297,7 +297,7 @@ def test_parse_duration_minutes_supports_days_hours_minutes():
 
 # --- /body-double ----------------------------------------------------------
 
-def test_body_double_creates_two_ephemeral_crons_with_explicit_target(env):
+def test_body_double_creates_two_ephemeral_command_crons(env):
     board, state = env
     created = []
     result = nag_commands.handle_body_double(
@@ -305,9 +305,11 @@ def test_body_double_creates_two_ephemeral_crons_with_explicit_target(env):
     assert result["ok"] is True
     assert len(created) == 2
     for descriptor in created:
-        # Explicit proven delivery.to + agentId + ephemeral deleteAfterRun.
-        assert descriptor["delivery"]["to"] == f"{PRODUCTIVITY}:topic:2"
-        assert descriptor["agentId"] == "niemand-work"
+        # V1: deterministic command cron (no LLM turn) + ephemeral deleteAfterRun.
+        assert "agentId" not in descriptor
+        assert "prompt" not in descriptor
+        assert descriptor["payload"]["kind"] == "command"
+        assert "checkin-dispatch" in descriptor["payload"]["argv"][2]
         assert descriptor["deleteAfterRun"] is True
         assert descriptor["schedule"]["kind"] == "at"
     session = nag_state.active_body_double_session(_state(state)["tsk_abc123"])
