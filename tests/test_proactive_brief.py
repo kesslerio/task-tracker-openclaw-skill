@@ -154,6 +154,25 @@ def test_seam_blocks_send_to_unbound_target(harness):
     assert delivered == []
 
 
+def test_authorised_send_caps_oversized_text_at_the_seam(harness):
+    """H10: authorised_send routes its text through redact_message before the transport,
+    so an over-large proactive body is length-capped at the gated-send choke point (the
+    brief's send seam), never blasted to Telegram in full."""
+    board, state = harness
+    gated = proactive_delivery.prove_and_gate("brief_sent", surface="standup")
+    assert gated["ok"] is True
+    delivered: list = []
+    huge = "Z" * 20000
+    out = proactive_delivery.authorised_send(
+        gated["act_id"], gated["delivery_target"], huge,
+        send=lambda t, x: delivered.append((t, x)))
+    assert out["ok"] is True
+    assert len(delivered) == 1
+    sent_text = delivered[0][1]
+    assert len(sent_text) < len(huge)
+    assert sent_text.endswith("[redacted]")
+
+
 # --- Friday proposal: proves target, sends to weekly topic, no U3 write -----
 
 def test_friday_proposal_targets_weekly_topic(harness):

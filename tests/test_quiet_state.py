@@ -190,9 +190,9 @@ def test_legacy_scalar_does_not_shadow_an_explicit_manual_lease(state_dir):
 def test_manual_shims_round_trip_through_the_manual_lease(state_dir):
     """``set_quiet`` / ``clear_quiet`` are thin shims over the manual lease and a
     session lease set alongside is untouched by ``clear_quiet`` (manual-only)."""
-    quiet_state.set_quiet(NOW + timedelta(hours=1))
+    quiet_state.set_quiet(NOW + timedelta(hours=1), now=NOW)
     quiet_state.set_lease("st_x", NOW + timedelta(minutes=30), now=NOW)
-    quiet_state.clear_quiet()  # releases only "manual"
+    quiet_state.clear_quiet(now=NOW)  # releases only "manual"; prune ref pinned to NOW
     leases = quiet_state._read_leases(quiet_state._read_raw())
     assert set(leases) == {"st_x"}  # the session lease survives a manual clear
     assert quiet_state.is_quiet(NOW) is True  # still muted by the session lease
