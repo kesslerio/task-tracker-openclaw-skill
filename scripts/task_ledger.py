@@ -8,7 +8,7 @@ import os
 import warnings
 from dataclasses import dataclass
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +17,8 @@ try:
 except ImportError:  # pragma: no cover - non-POSIX fallback
     fcntl = None
 
+import cos_config
+import redaction
 from utils import get_tasks_file
 
 
@@ -160,10 +162,105 @@ def new_event(
     }
 
 
+# --- H10 retention: prune stale entries on append, undo-window-safe ----------
+
+
+def _prune_cutoff(now: datetime | None = None) -> datetime:
+    """The age boundary below which an event may be pruned (H10 Part B).
+
+    The cutoff is ``now - max(ledger_retention_days, board undo window)``. Taking
+    the MAX is the load-bearing safety rule: ``events.jsonl`` is the audit/undo
+    substrate (``/audit`` + ``/undo`` resolve a board mutation by replaying its
+    ``pre_action_snapshot`` / ``evidence_link`` / revert events, and a pending
+    ``/approve`` references the harvest events), so an event INSIDE the board undo
+    window (7d default) must never be pruned even if a misconfigured retention is
+    shorter. Retention can shrink the kept history but NEVER below the window in
+    which an event is still operationally needed.
+    """
+    now = now or datetime.now(timezone.utc)
+    retention_hours = cos_config.ledger_retention_days() * 24
+    floor_hours = cos_config.undo_window_board_hours()
+    keep_hours = max(retention_hours, floor_hours)
+    return now - timedelta(hours=keep_hours)
+
+
+def _event_timestamp(line: str) -> datetime | None:
+    """Parse the ``timestamp`` out of one rendered JSONL line, or None on garbage.
+
+    A line we cannot parse (torn/corrupt) or whose timestamp is missing/garbage is
+    treated as un-ageable: ``None`` means "do not prune". We never drop a line we
+    cannot confidently date -- a wrongly-pruned audit/undo event is unrecoverable,
+    a lingering one is harmless.
+    """
+    try:
+        record = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    ts = record.get("timestamp") if isinstance(record, dict) else None
+    if not isinstance(ts, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _prune_stale_locked(target: Path, *, now: datetime | None = None) -> None:
+    """Drop ledger lines older than the undo-window-safe cutoff. IN PLACE, under the lock.
+
+    Rewrites the data file IN PLACE (``r+`` seek-0 / write / truncate) -- NOT via a
+    temp-file ``os.replace``. That matters: ``append_event`` holds its exclusive flock
+    on the DATA file's inode, so swapping the inode out with ``os.replace`` would
+    orphan that lock and let a waiting writer append to the unlinked old inode (a lost
+    append). An in-place rewrite keeps the one inode the lock guards, so the whole
+    read-trim-write is serialised by the SAME flock the caller already holds (external
+    writers open the same path and block on it) -- no torn line, no lost append, no new
+    locking scheme.
+
+    Best-effort: any error is swallowed by the caller. The rewrite only happens when a
+    line is CONFIDENTLY datable as older than the cutoff (``_event_timestamp`` returns
+    None for a torn/undateable line, which is always kept) -- so a quiet ledger never
+    pays the rewrite cost, and an event inside the undo window is never dropped.
+    """
+    try:
+        lines = target.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    cutoff = _prune_cutoff(now)
+    kept: list[str] = []
+    dropped = False
+    for line in lines:
+        if not line.strip():
+            continue
+        stamped = _event_timestamp(line)
+        if stamped is not None and stamped < cutoff:
+            dropped = True
+            continue
+        kept.append(line)
+    if not dropped:
+        return  # nothing stale: skip the rewrite so the common path stays append-only
+    content = "\n".join(kept) + ("\n" if kept else "")
+    with target.open("r+", encoding="utf-8") as rewriter:
+        rewriter.seek(0)
+        rewriter.write(content)
+        rewriter.truncate()
+        rewriter.flush()
+
+
 def append_event(event: dict[str, Any], path: Path | None = None) -> dict[str, Any]:
     target = Path(path) if path is not None else ledger_path()
     target.parent.mkdir(parents=True, exist_ok=True)
-    rendered = json.dumps(event, ensure_ascii=False, sort_keys=True)
+    # H10 Part A: redact BEFORE persisting so NO caller can bypass the redaction --
+    # the append-only ledger stores REFERENCES (subject/title, id, url, source_type,
+    # task_id, timestamps, status, scores), never a raw body/snippet/content. A
+    # future harvest source that adds a body field cannot leak it into this durable
+    # log. ``redact_event`` is pure + total (never raises), so a malformed payload
+    # degrades to a safe redacted event rather than crashing the append.
+    safe_event = redaction.redact_event(event)
+    rendered = json.dumps(safe_event, ensure_ascii=False, sort_keys=True)
     # Contract 1: hold an exclusive flock for the whole append so concurrent
     # writers (heartbeat cron + user CLI + every U1-U6 caller that goes through
     # append_event) can never interleave a torn JSONL line. The lock lives HERE,
@@ -176,6 +273,16 @@ def append_event(event: dict[str, Any], path: Path | None = None) -> dict[str, A
         try:
             handle.write(rendered + "\n")
             handle.flush()
+            # H10 Part B: APPEND FIRST, prune SECOND (best-effort) under the SAME
+            # flock -- mirroring outbox.deliver_once. The just-written event MUST
+            # survive; pruning only drops entries OLDER than the undo-window-safe
+            # cutoff, so it can never delete a fresh append or an in-window
+            # audit/undo/approval event. Any prune fault is contained here and never
+            # propagates out of append_event: the new line on disk stands.
+            try:
+                _prune_stale_locked(target)
+            except Exception:  # noqa: BLE001 -- prune is best-effort; the append is committed
+                pass
         finally:
             if fcntl is not None:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)

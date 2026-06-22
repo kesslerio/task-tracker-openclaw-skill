@@ -250,6 +250,29 @@ def undo_window_board_hours() -> int:
     return _int_env("UNDO_WINDOW_BOARD_HOURS", 168)
 
 
+# --- Ledger retention (H10) -----------------------------------------------
+
+def ledger_retention_days() -> int:
+    """Days of ``events.jsonl`` history to keep (default 90, floored at 1).
+
+    The append-only event ledger is the audit/undo/brag substrate, NOT a hot dedup
+    cache like the outbox -- so it earns a much LONGER window than
+    ``outbox_retention_days`` (7d). The outbox only needs recent periods to dedupe a
+    same-cycle retry; the ledger is the queryable accomplishment + reversibility
+    history a user may audit weeks later, so 90d keeps a full quarter of brag/audit
+    context while still bounding unbounded growth. It is a privacy/retention floor on
+    raw exposure: once content is redacted at append time (H10 Part A) the residual
+    references age out here.
+
+    CRITICAL: this window is the requested retention only. The ACTUAL prune cutoff
+    is ``max(this window, the board undo window)`` (see ``task_ledger._prune_cutoff``)
+    so retention can NEVER delete an event still needed by an in-window ``/undo`` or a
+    pending approval -- a misconfigured short retention degrades to the undo window,
+    never below it.
+    """
+    return max(1, _int_env("LEDGER_RETENTION_DAYS", 90))
+
+
 # --- State directory -------------------------------------------------------
 
 def state_dir() -> Path:
