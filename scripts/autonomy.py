@@ -556,15 +556,16 @@ def resolve_board_restore(content: str, snapshot: dict[str, Any]) -> dict[str, A
 
     1. ``board_revision`` present AND == the file's current revision -> the board is
        byte-identical to act time, so the stored ``line_number``/``raw_line`` still
-       agree: take the legacy content path directly (``resolved_by="revision"``).
-    2. Otherwise the board drifted (or carries no revision). Resolve by the stable
-       ``task_id`` marker: count the lines whose id == the snapshot's id. ONE ->
-       restore that line in place (``resolved_by="task_id"``); ZERO ->
-       ``conflict-not-found``; MORE THAN ONE -> ``conflict-duplicate``.
-    3. No stable id at all -> fall back to the content path, but only if the target
-       text is UNIQUE. If ``raw_line``/``post_raw_line`` appears more than once it is
-       a ``conflict-duplicate`` (the old code would have guessed); a clean unique
-       match restores (``resolved_by="content"``).
+       agree: take the content path directly (``resolved_by="revision"``).
+    2. NO ``board_revision`` (a LEGACY pre-H9 snapshot) -> honor the back-compat
+       contract and use the content path + line-number hint exactly as origin/main
+       did (``resolved_by="legacy-content"``). Without a revision we cannot tell
+       "removed by the act" from "board drifted", so we do not refuse a removal act.
+    3. ``board_revision`` present but DRIFTED -> resolve by the stable ``task_id``
+       marker: ONE match -> restore in place (``resolved_by="task_id"``); ZERO ->
+       ``conflict-not-found``; MORE THAN ONE -> ``conflict-duplicate``. With no id at
+       all, fall back to the content path but ONLY if the target text is UNIQUE; a
+       duplicate is ``conflict-duplicate`` (the old code would have guessed).
     """
     raw_line = str(snapshot.get("raw_line") or "")
     if not raw_line.strip():
@@ -572,7 +573,8 @@ def resolve_board_restore(content: str, snapshot: dict[str, Any]) -> dict[str, A
                 "resolved_by": "empty"}
 
     snap_revision = snapshot.get("board_revision")
-    if isinstance(snap_revision, str) and snap_revision == board_revision(content):
+    has_revision = isinstance(snap_revision, str) and snap_revision != ""
+    if has_revision and snap_revision == board_revision(content):
         new_content, restored = restore_line_by_content(
             content, raw_line,
             post_raw_line=snapshot.get("post_raw_line"),
@@ -581,6 +583,24 @@ def resolve_board_restore(content: str, snapshot: dict[str, Any]) -> dict[str, A
         return {"ok": True, "restored": restored, "new_content": new_content,
                 "resolved_by": "revision"}
 
+    if not has_revision:
+        # LEGACY snapshot (pre-H9, no revision stamp): honor the documented
+        # back-compat contract and restore via the content path + line-number hint
+        # exactly as origin/main did -- it re-inserts a removed line and replaces a
+        # toggled one. The id-keyed drift logic below would mis-handle a REMOVAL act
+        # (the id is gone with the line, so it would refuse conflict-not-found instead
+        # of re-inserting). The id+revision path applies ONLY to NEW snapshots that
+        # carry a revision, where "removed by the act" is distinguishable from "board
+        # drifted" and refusing-on-drift is the safe choice.
+        new_content, restored = restore_line_by_content(
+            content, raw_line,
+            post_raw_line=snapshot.get("post_raw_line"),
+            line_number_hint=snapshot.get("line_number"),
+        )
+        return {"ok": True, "restored": restored, "new_content": new_content,
+                "resolved_by": "legacy-content"}
+
+    # board_revision present but DRIFTED: resolve by the stable id, refuse on ambiguity.
     snap_task_id = snapshot.get("task_id") or task_id_in_line(raw_line)
     if snap_task_id:
         return _resolve_by_task_id(content, raw_line, snap_task_id,

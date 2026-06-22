@@ -418,7 +418,7 @@ def test_undo_id_match_not_found_is_conflict(tmp_path):
 
 def test_undo_old_snapshot_without_anchors_still_undoes(tmp_path):
     """Back-compat: an OLD snapshot lacking board_revision/task_id still undoes via
-    the legacy content path (unique match) -- it never crashes."""
+    the legacy content path -- it never crashes."""
     raw_line = "- [ ] Legacy line no id"
     board, snapshot = _board_snapshot(tmp_path, raw_line, line_number=14)  # no anchors
     assert "board_revision" not in snapshot and "task_id" not in snapshot
@@ -429,7 +429,28 @@ def test_undo_old_snapshot_without_anchors_still_undoes(tmp_path):
     result = autonomy.undo_act(gated["act_id"])
     assert result["ok"] is True
     assert result["board_restored"] is True
-    assert result["resolved_by"] == "content"
+    assert result["resolved_by"] == "legacy-content"
+    assert raw_line in board.read_text(encoding="utf-8").split("\n")
+
+
+def test_legacy_id_bearing_removal_undo_reinserts_via_content_path(tmp_path):
+    """Back-compat regression guard: a LEGACY snapshot (no board_revision) for a
+    line-REMOVAL act whose raw_line carries a task_id:: marker must RE-INSERT the line
+    via the content path (origin/main behavior), NOT refuse conflict-not-found because
+    the id vanished with the removed line. The id+revision drift logic applies only to
+    NEW snapshots that carry a revision."""
+    raw_line = "- [ ] Ship the thing task_id::tsk_rm"
+    board, snapshot = _board_snapshot(tmp_path, raw_line, line_number=3)  # no anchors
+    assert "board_revision" not in snapshot
+    # The act REMOVED the line; at undo time it is absent from the board.
+    board.write_text("# Board\n- [ ] Other A\n- [ ] Other B\n", encoding="utf-8")
+    _override_rung("wip_cap_enforced", autonomy_gate.RUNG_APPROVE)
+    gated = autonomy_gate.gate("wip_cap_enforced", task_id="tsk_rm", unit="U3",
+                               snapshot_provider=lambda: snapshot)
+    result = autonomy.undo_act(gated["act_id"])
+    assert result["ok"] is True
+    assert result["board_restored"] is True
+    assert result["resolved_by"] == "legacy-content"
     assert raw_line in board.read_text(encoding="utf-8").split("\n")
 
 
