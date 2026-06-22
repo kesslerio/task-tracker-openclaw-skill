@@ -274,6 +274,131 @@ def test_h3_idempotent_retry_via_peek_logs_no_gate_act(harness):
     assert undel == []  # nothing gated this fire -> nothing to reconcile
 
 
+def test_r2_fixb_peek_repairs_state_and_ledger_from_receipt(harness):
+    """R2 Fix B: a FIRST fire delivered (outbox receipt written) but crashed before
+    nag_state persisted the loop, and nag-state.json was then lost. The next same-cycle
+    run peeks the recorded receipt -- and instead of returning blind, REPAIRS the loop
+    from the stored receipt: the sender is NOT called again (no double-send), the loop
+    is reopened, and a nag_sent carrying the STORED message_id is emitted so state +
+    ledger catch up to the delivered fact."""
+    board, state = harness
+    sent = []
+    nag_check.run_nag_check(sender=fake_sender(sent, message_id="9001"))
+    assert len(sent) == 1  # first fire delivered + wrote the outbox receipt
+    # Reproduce the TRUE crash window: the process died inside the locked fire AFTER
+    # deliver_once committed the outbox receipt but BEFORE nag_state persisted the loop
+    # and BEFORE the nag_sent ledger event was appended -- so the outbox receipt is the
+    # ONLY durable trace. Wipe nag-state.json + events.jsonl, keep outbox.json.
+    (state / "nag-state.json").unlink()
+    (state / "events.jsonl").unlink()
+    assert (state / "outbox.json").exists()
+
+    sent_retry = []
+    nag_check.run_nag_check(sender=fake_sender(sent_retry, message_id="9001"))
+    assert sent_retry == []  # NOT re-sent -- the receipt deduped the delivery
+    # The loop is REPAIRED (reopened) from the stored receipt.
+    nag = _state(state)["tsk_abc123"]
+    assert nag["ack"] is False  # open loop, not split-brain
+    assert nag["nag_count"] == 1  # the delivered nag is now reflected in state
+    # The missing nag_sent is emitted carrying the STORED message_id (ledger caught up).
+    sent_events = [e for e in _events(state) if e["event_type"] == "nag_sent"]
+    assert len(sent_events) == 1
+    assert sent_events[0]["metadata"]["message_id"] == "9001"  # the stored receipt id
+    assert sent_events[0]["metadata"].get("repaired") is True
+
+
+def test_r2_fixb_repair_is_idempotent(harness):
+    """R2 Fix B: repairing twice does not double-open or double-emit. After the first
+    repair the loop is a genuine open loop, so a further same-cycle run is the normal
+    no-op retry -- no new nag_sent, count unchanged."""
+    board, state = harness
+    nag_check.run_nag_check(sender=fake_sender([], message_id="42"))
+    (state / "nag-state.json").unlink()  # lose state, keep outbox
+    nag_check.run_nag_check(sender=fake_sender([], message_id="42"))  # repair #1
+    count_after_repair = _state(state)["tsk_abc123"]["nag_count"]
+    sent_after_repair = len([e for e in _events(state) if e["event_type"] == "nag_sent"])
+
+    nag_check.run_nag_check(sender=fake_sender([], message_id="42"))  # would-be repair #2
+    assert _state(state)["tsk_abc123"]["nag_count"] == count_after_repair  # not double-bumped
+    assert len([e for e in _events(state)
+                if e["event_type"] == "nag_sent"]) == sent_after_repair  # no second emit
+
+
+def test_r2_fixb_repair_does_not_double_emit_when_ledger_survives(harness):
+    """R2 Fix B idempotency vs. a SURVIVING ledger: events.jsonl is append-only and
+    drifts independently of nag-state.json. If the genuine fire already wrote
+    nag_opened+nag_sent to the ledger and ONLY nag-state.json was later lost, the repair
+    must reopen the loop but NOT emit a SECOND nag_sent for the same delivered idem_key
+    (nag_sent counts DELIVERED nags -- a double emit over-counts one delivery)."""
+    board, state = harness
+    nag_check.run_nag_check(sender=fake_sender([], message_id="77"))
+    sent_before = [e for e in _events(state) if e["event_type"] == "nag_sent"]
+    assert len(sent_before) == 1  # the genuine fire logged its one nag_sent
+    # Lose ONLY the loop state; the ledger (and outbox receipt) survive.
+    (state / "nag-state.json").unlink()
+    assert (state / "events.jsonl").exists() and (state / "outbox.json").exists()
+
+    sent_retry = []
+    nag_check.run_nag_check(sender=fake_sender(sent_retry, message_id="77"))
+    assert sent_retry == []  # not re-sent
+    # The loop is reopened (state repaired)...
+    assert _state(state)["tsk_abc123"]["ack"] is False
+    # ...but the ledger is NOT double-counted: still exactly one nag_sent for the
+    # delivered message.
+    sent_after = [e for e in _events(state) if e["event_type"] == "nag_sent"]
+    assert len(sent_after) == 1  # no phantom second receipt for one delivery
+
+
+def test_r2_fixc_assert_failure_reconciles_gate_act(harness, monkeypatch):
+    """R2 Fix C: a gate fires (executed act logged) but the gate<->message SEAM asserts
+    out (gate target != send target). Pre-fix _authorise_nag dropped the act_id on the
+    assert path, leaving an executed act with NO reconciliation. Now: the loop stays
+    OPEN, no nag_sent, AND a nag_gate_act_undelivered event carries the gate act_id."""
+    import nag_delivery  # noqa: PLC0415
+    import autonomy_gate  # noqa: PLC0415
+    board, state = harness
+    # Force the seam to fail AFTER gate() already logged its executed act.
+    monkeypatch.setattr(nag_delivery, "authorise_target",
+                        lambda act_id, target: {"ok": False, "reason": "target-mismatch",
+                                                "stage": "assert"})
+    sent = []
+    counts = nag_check.run_nag_check(sender=fake_sender(sent))
+    assert sent == [] and counts["sent"] == 0 and counts["blocked"] == 1
+    # The gate logged exactly one executed act; we reconcile against it.
+    executed = [r for r in autonomy_gate.read_autonomy_log()
+                if r.get("act_type") == "nag_sent" and r.get("status") == "executed"]
+    assert len(executed) == 1
+    gate_act_id = executed[0]["act_id"]
+    undel = [e for e in _events(state) if e["event_type"] == "nag_gate_act_undelivered"]
+    assert len(undel) == 1
+    assert undel[0]["metadata"]["act_id"] == gate_act_id  # ties back to the gate act
+    assert undel[0]["metadata"]["stage"] == "assert"
+    # Loop stays OPEN, no phantom nag_sent.
+    on_disk = _state(state)
+    assert "tsk_abc123" not in on_disk or on_disk["tsk_abc123"]["ack"] is False
+    assert [e for e in _events(state) if e["event_type"] == "nag_sent"] == []
+
+
+def test_r2_fixc_env_missing_emits_no_reconciliation(tmp_path, monkeypatch):
+    """R2 Fix C: an env-missing block is a PROVE-stage block -- the gate NEVER fired, so
+    there is no executed act to reconcile. It emits ONLY nag_delivery_blocked, never a
+    nag_gate_act_undelivered (no phantom reconciliation for a gate that did not fire)."""
+    board = tmp_path / "Work Tasks.md"
+    board.write_text(BOARD, encoding="utf-8")
+    state = tmp_path / "state"
+    _set_env(monkeypatch, board, state)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID_PRODUCTIVITY", raising=False)  # prove-stage block
+    monkeypatch.setattr(nag_check, "_today", lambda: REF)
+    counts = nag_check.run_nag_check(sender=fake_sender([]))
+    assert counts["blocked"] == 1 and counts["sent"] == 0
+    blocked = [e for e in task_ledger.read_events(state / "events.jsonl")
+               if e["event_type"] == "nag_delivery_blocked"]
+    assert blocked and blocked[0]["metadata"]["reason"] == "env_missing"
+    undel = [e for e in task_ledger.read_events(state / "events.jsonl")
+             if e["event_type"] == "nag_gate_act_undelivered"]
+    assert undel == []  # gate never fired -> nothing to reconcile
+
+
 def test_h3_delivery_failure_reconciles_gate_act(harness):
     """Fix B (reconcile the gate act on non-delivery): when the sender RAISES after
     the gate already logged an ``executed`` act, a nag_gate_act_undelivered ledger
@@ -901,9 +1026,11 @@ def test_no_limit_fires_everything(multi):
 
 
 def test_main_caps_and_delivers_more_pointer(multi, capsys, monkeypatch):
-    """The cron CLI path caps at NAG_DISPLAY_LIMIT (3). Post-H3 the 3 nags AND the
-    '+2 more … /nag all' pointer are DELIVERED through the sender (stdout stays
-    empty); the operational footer on stderr carries the deferred count."""
+    """The cron CLI path caps at NAG_DISPLAY_LIMIT (3). Post-H3/Fix D the 3 nags are
+    DELIVERED through the sender (stdout stays empty) and the '+2 more … /nag all'
+    pointer is FOLDED into the LAST fired nag's text -- one send per fired nag, NO
+    separate pointer message; the operational footer on stderr carries the deferred
+    count."""
     board, state = multi
     delivered = []
     monkeypatch.setattr(nag_check.outbox, "openclaw_sender", fake_sender(delivered))
@@ -912,14 +1039,46 @@ def test_main_caps_and_delivers_more_pointer(multi, capsys, monkeypatch):
     out, err = captured.out, captured.err
     assert rc == 0
     blob = " ".join(text for _target, text in delivered)
-    # The 3 worst nags + the pointer were DELIVERED; the deferred 2 were not.
+    # The 3 worst nags were DELIVERED; the deferred 2 were not.
     assert "tsk_a" in blob and "tsk_b" in blob and "tsk_c" in blob
     assert "tsk_d" not in blob and "tsk_e" not in blob
+    # The pointer rides the LAST fired nag's body -- NOT a separate message.
     assert "+2 more overdue" in blob and "/nag all" in blob
-    assert len(delivered) == 4  # 3 nags + 1 pointer message
+    assert len(delivered) == 3  # exactly one send per fired nag, NO extra pointer send
+    last_text = delivered[-1][1]
+    assert "+2 more overdue" in last_text  # the pointer is on the last nag's text
     assert out.strip() == ""  # nothing on stdout: the send is the channel now
     # NAG_CHECK_DONE footer (stderr, not announced) reports the deferred count.
     assert "3 sent" in err and "2 deferred" in err
+
+
+def test_r2_fixd_pointer_rides_last_nag_no_separate_send(multi):
+    """R2 Fix D: with deferred>0 and >=1 nag fired, the '+K more' pointer is FOLDED into
+    the LAST fired nag's delivered text and rides that one gated, receipted, idempotent
+    send -- there is NO separate pointer send (exactly one send per fired nag, none
+    extra)."""
+    board, state = multi
+    sent = []
+    counts = nag_check.run_nag_check(limit=3, sender=fake_sender(sent))
+    assert counts["sent"] == 3 and counts["deferred"] == 2
+    assert len(sent) == 3  # one send per fired nag -- NO extra pointer message
+    last_text = sent[-1][1]
+    assert "+2 more overdue tasks — reply /nag all to see them." in last_text
+    # The pointer is on EXACTLY one (the last) nag, not duplicated across nags.
+    assert sum(1 for _t, text in sent if "more overdue" in text) == 1
+    # The earlier nags carry no pointer.
+    for _t, text in sent[:-1]:
+        assert "more overdue" not in text
+
+
+def test_r2_fixd_no_pointer_when_nothing_deferred(multi):
+    """R2 Fix D: when nothing is deferred (no cap held anything back), no pointer is
+    appended to any nag -- the wording only appears when there is a '+K more'."""
+    board, state = multi
+    sent = []
+    counts = nag_check.run_nag_check(sender=fake_sender(sent))  # uncapped -> 0 deferred
+    assert counts["deferred"] == 0
+    assert all("more overdue" not in text for _t, text in sent)
 
 
 def test_main_all_flag_fires_everything_no_pointer(multi, capsys, monkeypatch):

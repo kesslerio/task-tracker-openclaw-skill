@@ -109,13 +109,17 @@ def _entry_before(ts: str | None, cutoff: datetime) -> bool:
     """True if a receipt's timestamp is older than ``cutoff``.
 
     A missing/garbage ts is treated as NOT-stale (kept) -- we never drop an entry we
-    cannot confidently age out, since a wrongly-pruned key would re-send.
+    cannot confidently age out, since a wrongly-pruned key would re-send. A
+    non-string ``ts`` (an int, a list -- a corrupt/hand-edited entry) makes
+    ``fromisoformat`` raise ``TypeError``, not ``ValueError``; both are caught here so
+    a single garbage entry can NEVER raise out of pruning (which runs AFTER the
+    receipt is committed and the message sent -- a raise there would re-send).
     """
     if not ts:
         return False
     try:
         return datetime.fromisoformat(ts) < cutoff
-    except ValueError:
+    except (ValueError, TypeError):
         return False
 
 
@@ -158,19 +162,33 @@ def _outbox_flock() -> Iterator[None]:
                 fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
 
+def get_receipt(idem_key: str) -> dict[str, Any] | None:
+    """Read-only: the stored ``{message_id, target, ts}`` for ``idem_key``, or None.
+
+    Taken under the SAME sidecar flock ``deliver_once`` uses so the read is consistent
+    with a concurrent delivery -- it can never read a half-written ``outbox.json``, and
+    a delivery cannot land a new key inside this read. The nag engine PEEKS this BEFORE
+    gating: a recorded receipt short-circuits a same-cycle duplicate fire (avoiding the
+    phantom ``executed`` autonomy-gate act that gating-then-discovering-the-dup would
+    log) AND lets the caller REPAIR split-brain state+ledger from what was actually
+    delivered (a first fire that wrote the receipt but crashed before persisting the
+    loop). It is an OPTIMISATION, never the authority: ``deliver_once`` re-checks the
+    recorded key under its own flock, so the rare TOCTOU (another fire records between
+    this peek and that flock) is still caught and deduped there. A returned dict is the
+    committed proof of delivery; None means no receipt.
+    """
+    with _outbox_flock():
+        recorded = _read_outbox().get(idem_key)
+        return dict(recorded) if isinstance(recorded, dict) else None
+
+
 def is_recorded(idem_key: str) -> bool:
     """Read-only peek: is ``idem_key`` already recorded (a receipt exists)?
 
-    Taken under the SAME sidecar flock ``deliver_once`` uses so the read is
-    consistent with concurrent deliveries. This lets the caller short-circuit a
-    same-cycle duplicate fire BEFORE gating -- avoiding the phantom ``executed``
-    autonomy-gate act that gating-then-discovering-the-dup would log. It is an
-    OPTIMISATION, never the authority: ``deliver_once`` re-checks the recorded key
-    under its own flock, so the rare TOCTOU (another fire records between this peek
-    and that flock) is still caught and deduped there.
+    A thin bool over ``get_receipt`` (same flock, same snapshot semantics) for callers
+    that only need existence, not the stored receipt.
     """
-    with _outbox_flock():
-        return isinstance(_read_outbox().get(idem_key), dict)
+    return get_receipt(idem_key) is not None
 
 
 def deliver_once(
@@ -198,7 +216,7 @@ def deliver_once(
     the caller treats it as a delivery failure and leaves the nag loop OPEN. Only a
     real receipt is ever recorded, so the outbox never contains a phantom send. This
     under-flock recorded-key check is the AUTHORITATIVE dedup; an upstream
-    ``is_recorded`` peek is only an optimisation.
+    ``get_receipt`` / ``is_recorded`` peek is only an optimisation.
     """
     with _outbox_flock():
         state = _read_outbox()
@@ -217,8 +235,21 @@ def deliver_once(
             "ts": _now_iso(),
         }
         state[idem_key] = entry
-        _prune_outbox(state)  # drop stale periods so outbox.json stays flat
+        # RECEIPT FIRST, prune SECOND (best-effort). The just-sent message MUST leave
+        # a recorded receipt -- that durable at-most-once fact is what stops the
+        # caller's delivery_failed handler from re-sending the SAME message next run.
+        # So write the receipt-bearing state BEFORE pruning; then prune-and-rewrite as
+        # a swallowed best-effort step. If pruning (or its rewrite) ever raises -- a
+        # garbage ts, a transient write error -- the exception is contained here and
+        # NEVER propagates out of deliver_once: the receipt already on disk stands, the
+        # message is not re-sent, and the only cost is a stale entry lingering one more
+        # cycle (it ages out on the next clean write).
         _write_outbox(state)
+        try:
+            _prune_outbox(state)  # drop stale periods so outbox.json stays flat
+            _write_outbox(state)
+        except Exception:  # noqa: BLE001 -- prune is best-effort; the receipt is committed
+            pass
         return {**entry, "idempotent": False}
 
 
