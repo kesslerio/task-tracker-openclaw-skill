@@ -141,17 +141,28 @@ def _log_draft_pushed(
     append_event(new_event("ledger_draft_pushed", actor=actor, source=source, metadata=metadata))
 
 
-def _consume(proof: dict[str, Any], push: DigestPush) -> None:
+def _consume(proof: dict[str, Any], push: DigestPush, *, auto: bool) -> None:
     """Consume the digest's state: set the pushed-window, merge pending-approval ids,
-    mark evidence + wins seen, and persist. Called ONLY after the digest is confirmed
-    DELIVERED -- a RECEIPT on the auto path, PROOF on the reactive (relay) path.
+    and (CANONICAL delivery only) mark evidence + wins seen, then persist. Called ONLY
+    after the digest is confirmed DELIVERED -- a RECEIPT on the auto path, PROOF on the
+    reactive (relay) path.
 
-    Kind-aware dedup allows a reactive + a Friday auto push in one window, so the
-    pending-approval state is MERGED across same-window pushes, never overwritten: an
-    id the reactive digest advertised as approvable ("/approve A") survives the Friday
-    push (whose fresh matches differ, or are wins-only -> empty). Evidence + wins are
-    marked seen on the SAME success condition so a win/PR captured after this push stays
-    unseen for the next one and a delivered item never repeats.
+    Both paths record the push (``pushed_key``) and MERGE the pending-approval ids -- an
+    id a reactive digest advertised as approvable ("/approve A") survives the Friday push
+    so the user can still approve it. But ONLY the scheduled Friday digest (``auto``)
+    marks evidence + wins SEEN: the auto digest is the canonical weekly record, so its
+    items must not repeat. The reactive ``/ledger`` is a PREVIEW/pull -- if it consumed
+    the week's evidence + wins, Friday's headline digest would render thin or empty
+    (V-P1b). So a reactive pull never marks seen; Friday still delivers the FULL week.
+
+    Assumption (the auto digest is the SOLE win consumer): the scheduled Friday
+    ``ledger-cron --auto`` must fire weekly to consume wins -- ``read_unseen_wins`` is
+    date-UNFILTERED (the H8 "never silently lost" rule), so if that digest were
+    persistently blocked the reactive preview would re-render every accumulated win.
+    That is bounded by the deployed Friday cron and is observable (a persistently
+    blocked auto digest records a ``push_blocked`` health FAILURE, V2) -- and nothing is
+    lost, the wins simply deliver once the block clears. A windowed preview read would
+    be the mitigation if win accumulation ever became a real problem.
     """
     state = push.state
     state[push.pushed_key] = push.harvest_window_id
@@ -166,9 +177,11 @@ def _consume(proof: dict[str, Any], push: DigestPush) -> None:
             **push.match_index,
         }.items() if tid not in approved
     }
-    harvest_state.mark_seen(state, [item["evidence_hash"] for item in push.fresh])
+    if auto:  # CANONICAL weekly delivery -- the reactive PREVIEW must not consume.
+        harvest_state.mark_seen(state, [item["evidence_hash"] for item in push.fresh])
     harvest_state.save_state(state, push.window)
-    win_store.mark_wins_seen([win["id"] for win in push.wins])
+    if auto:
+        win_store.mark_wins_seen([win["id"] for win in push.wins])
 
 
 def push_and_consume(
@@ -205,9 +218,10 @@ def push_and_consume(
             # to push_blocked_reason so the cron path records a FAILURE (no false-green).
             return {"ok": False, "reason": f"delivery_failed:{delivered['reason']}"}
         message_id, idem_key = delivered.get("message_id"), delivered.get("idem_key")
-    # Delivered (auto: a receipt; reactive: the relay handoff). Log the
-    # proof-of-delivery push event and consume evidence + wins.
+    # Delivered (auto: a receipt; reactive: the relay handoff). Log the proof-of-delivery
+    # push event and consume state -- but only the canonical AUTO digest marks evidence +
+    # wins seen (the reactive PREVIEW must not gut Friday's full-week digest -- V-P1b).
     _log_draft_pushed(proof, push, actor=actor, source=source,
                       message_id=message_id, idem_key=idem_key)
-    _consume(proof, push)
+    _consume(proof, push, auto=auto)
     return {"ok": True, "delivery_target": proof["delivery_target"]}

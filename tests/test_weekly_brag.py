@@ -273,6 +273,32 @@ def test_dual_push_preserves_reactive_approvable_task(env, monkeypatch):
     assert approved.get("reason") != "stale-approval"
 
 
+def test_reactive_ledger_is_a_preview_that_does_not_gut_the_friday_digest(env, monkeypatch):
+    """V-P1b: a mid-week reactive /ledger is a PREVIEW -- it must NOT mark the week's
+    evidence/wins SEEN, or Friday's headline digest would render thin/empty. After a
+    reactive pull, the Friday AUTO digest still delivers the FULL week, and only THEN are
+    the items consumed (the canonical weekly record)."""
+    _set_productivity_env(monkeypatch)
+    harvest_ledger.capture_win("shipped the pricing deck")
+    # Mid-week reactive /ledger (auto=False) with content + a win, on a non-Friday.
+    _stub_sources(monkeypatch, gh_payload=PR_PAYLOAD)
+    reactive = _run(monkeypatch, auto=False, now=MONDAY)
+    assert reactive["draft_pushed"] is True
+    # The reactive PREVIEW consumed NOTHING: evidence + win stay UNSEEN for Friday.
+    state = harvest_state.load_state()
+    assert not state.get("seen_hashes")
+    assert [w["text"] for w in win_store.read_unseen_wins()] == ["shipped the pricing deck"]
+    # Friday's AUTO digest still delivers the FULL week (the PR + the win) -- not gutted.
+    _stub_sources(monkeypatch, gh_payload=PR_PAYLOAD)
+    friday = _run(monkeypatch, auto=True, now=FRIDAY)
+    assert friday["draft_pushed"] is True
+    assert PR_PAYLOAD[0]["title"] in friday["draft"]
+    assert "shipped the pricing deck" in friday["draft"]
+    # NOW the canonical Friday delivery consumed them (so they won't repeat next week).
+    assert harvest_state.load_state().get("seen_hashes")
+    assert win_store.read_unseen_wins() == []
+
+
 def test_suppressed_auto_run_consumes_no_evidence(env, monkeypatch):
     """A suppressed (non-Friday) auto run must NOT mark evidence seen -- the same PR
     is delivered when Friday's fire is allowed (accomplishments never silently lost)."""
