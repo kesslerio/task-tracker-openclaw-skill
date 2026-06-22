@@ -239,6 +239,26 @@ def _event_timestamp(line: str) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _oldest_datable_timestamp(target: Path) -> datetime | None:
+    """The timestamp of the first datable ledger line (the oldest), or None.
+
+    Events append in time order, so the first non-empty line is the oldest. Reads only
+    that one line (O(1)), so the prune hot-path can skip the full scan when nothing is
+    stale. Returns None when the file is unreadable OR its head line is undateable
+    (torn) -- both force the caller to fall back to the full scan rather than wrongly
+    short-circuit.
+    """
+    try:
+        with target.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                return _event_timestamp(line)
+    except OSError:
+        return None
+    return None
+
+
 def _prune_stale_locked(target: Path, *, now: datetime | None = None) -> None:
     """Drop ledger lines older than the undo-window-safe cutoff, under the sidecar lock.
 
@@ -254,12 +274,20 @@ def _prune_stale_locked(target: Path, *, now: datetime | None = None) -> None:
     line is CONFIDENTLY datable as older than the cutoff (``_event_timestamp`` returns
     None for a torn/undateable line, which is always kept) -- so a quiet ledger never
     pays the rewrite cost, and an event inside the undo window is never dropped.
+
+    Hot path: ``append_event`` calls this on EVERY append, so the common case (nothing
+    stale) must stay cheap. Events append in time order, so the FIRST datable line is
+    the OLDEST; peeking just it short-circuits the full O(n) read+parse when the oldest
+    event is still within the cutoff (only a genuinely-stale head pays the full scan).
     """
+    cutoff = _prune_cutoff(now)
+    oldest = _oldest_datable_timestamp(target)
+    if oldest is not None and oldest >= cutoff:
+        return  # the oldest event is still in-window -> nothing prunable, skip the scan
     try:
         lines = target.read_text(encoding="utf-8").splitlines()
     except OSError:
         return
-    cutoff = _prune_cutoff(now)
     kept: list[str] = []
     dropped = False
     for line in lines:

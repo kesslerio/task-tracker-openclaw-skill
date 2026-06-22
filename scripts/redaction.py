@@ -45,9 +45,9 @@ from typing import Any
 # BLOB is stripped; legitimate SHORT ``text`` references (a manual ``/win`` line, a
 # nag's short text) survive because they are passed as the message string through
 # ``redact_message`` / are kept short, and because the ledger events themselves
-# carry the win under ``text`` only via the win store (not the ledger). Where a
-# short ``text`` reference MUST survive in an event it is length-bounded by the
-# unknown-field cap, not the deny set -- see ``_REFERENCE_TEXT_FIELDS``.
+# carry the win under ``text`` only via the win store (not the ledger). A ``text``
+# field is neither denied nor exempt: it falls through to the unknown-field length
+# cap, so a SHORT win line survives while a LONG blob routed through it is truncated.
 _CONTENT_FIELD_NAMES: frozenset[str] = frozenset({
     "body",
     "snippet",
@@ -92,14 +92,7 @@ _REFERENCE_FIELD_NAMES: frozenset[str] = frozenset({
     "reason",  # a short classification reason, not free-form content
 })
 
-# A short free-text reference (``text``) that a unit legitimately stores in an
-# event payload -- e.g. a manual ``/win`` line echoed into a digest event. It is
-# NOT in the deny set, but it is NOT unconditionally exempt either: it is held to
-# the unknown-field length cap so a SHORT win line survives while a LONG blob
-# accidentally routed through a ``text`` field is truncated.
-_REFERENCE_TEXT_FIELDS: frozenset[str] = frozenset({"text"})
-
-# The sane cap for an unknown (and reference-``text``) free-text field. A string
+# The sane cap for an unknown free-text field. A string
 # longer than this is presumed content and truncated; shorter strings (ids, urls,
 # short titles, a one-line win) pass through. A title/subject is rarely longer than
 # this; an email body / transcript is far longer, so the cap separates the two

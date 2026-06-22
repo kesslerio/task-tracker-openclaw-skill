@@ -201,6 +201,16 @@ def test_proactive_message_text_uses_references_not_bodies():
     capped = redaction.redact_message(huge)
     assert len(capped) < len(huge)
     assert capped.endswith("[redacted]")
+    # The SEND SEAM is actually wired: build_draft routes its assembled text through
+    # redact_message, so an over-large value spliced into a digest line is capped by
+    # build_draft itself -- not only by redact_message called in isolation.
+    giant = [{
+        "title": "X" * 20000, "match_title": "x", "source_type": "pr",
+        "url": "u", "decision": "needs-review", "matched_task_id": "tsk_big", "score": 0.5,
+    }]
+    big_draft = harvest_ledger.build_draft(giant, "2026-W25", wins=[])
+    assert len(big_draft) < 20000
+    assert big_draft.endswith("[redacted]")
 
 
 # --- Part B: retention is undo-window-safe -----------------------------------

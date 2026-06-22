@@ -55,6 +55,7 @@ import cos_config
 import delivery_target
 import error_envelope
 import harvest_state
+import redaction
 import win_store
 from evidence_matching import extract_done_lines, match_evidence_content
 from task_ledger import append_event, ledger_path, new_event
@@ -404,7 +405,11 @@ def build_draft(matches: list[dict[str, Any]], harvest_window_id: str,
                 verb = "mark done" if item["decision"] == "evidence-link" else "confirm"
                 lines.append(f"  Reply /approve {task_id} to {verb}")
         lines.append("")
-    return "\n".join(lines).rstrip() + "\n"
+    # The digest is assembled from references (titles/subjects/ids), never raw bodies
+    # -- the real content guarantee. Pass the assembled text through redact_message as
+    # a belt-and-braces length backstop on the actual send seam, so a future renderer
+    # that splices an over-large value into a line cannot blast it to Telegram.
+    return redaction.redact_message("\n".join(lines).rstrip() + "\n")
 
 
 # --- the proven draft push (DELIVERY-TARGET-PROOF) -------------------------

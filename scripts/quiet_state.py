@@ -220,17 +220,25 @@ def release_lease(owner: str, *, now: datetime | None = None) -> None:
 # ``/quiet`` + ``/unquiet`` (quiet_cli.py) drive the manual lease through these
 # thin wrappers, so the manual path keeps working with no behaviour change.
 
-def set_quiet(until: datetime) -> None:
-    """Set the manual ``/quiet`` lease (thin shim = ``set_lease("manual", until)``)."""
-    set_lease(MANUAL_OWNER, until)
+def set_quiet(until: datetime, *, now: datetime | None = None) -> None:
+    """Set the manual ``/quiet`` lease (thin shim = ``set_lease("manual", until)``).
+
+    ``now`` is the expired-lease prune reference, threaded through to ``set_lease`` for
+    parity with the rest of the lease API (defaults to wall-clock UTC).
+    """
+    set_lease(MANUAL_OWNER, until, now=now)
 
 
-def clear_quiet() -> None:
+def clear_quiet(*, now: datetime | None = None) -> None:
     """Clear the manual ``/quiet`` lease (thin shim = ``release_lease("manual")``).
 
     Releases ONLY the manual lease -- a focus block's session lease is untouched.
+    ``now`` is the prune reference threaded through to ``release_lease`` (defaults to
+    wall-clock UTC): without it, releasing the manual lease prunes every OTHER still-
+    live-at-``now`` session lease against real wall-clock, which a caller replaying a
+    fixed clock (a test, or a deterministic batch) must be able to pin.
     """
-    release_lease(MANUAL_OWNER)
+    release_lease(MANUAL_OWNER, now=now)
 
 
 def quiet_until(now: datetime | None = None) -> datetime | None:
