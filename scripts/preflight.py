@@ -198,6 +198,15 @@ def _validate_delivery_targets(jobs: list[dict[str, Any]]) -> list[str]:
     warnings: list[str] = []
     for job in jobs:
         job_id = str(job.get("id") or job.get("job_id") or "<unknown>")
+        # V1: a COMMAND cron (``payload.kind == "command"``) runs a deterministic
+        # script that OWNS its own delivery (e.g. the check-in dispatcher proves the
+        # target + sends via the receipt-backed outbox at fire time). It carries no
+        # ``agentId``/``delivery`` BY DESIGN -- there is no agent turn to route. The
+        # delivery-target audit only applies to agentTurn crons (which the gateway
+        # delivers FOR), so a command cron is not a finding here.
+        payload = job.get("payload")
+        if isinstance(payload, dict) and payload.get("kind") == "command":
+            continue
         delivery = job.get("delivery") or {}
         to = delivery.get("to") if isinstance(delivery, dict) else None
         channel = delivery.get("channel") if isinstance(delivery, dict) else None

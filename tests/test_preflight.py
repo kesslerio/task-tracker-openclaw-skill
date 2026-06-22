@@ -177,6 +177,18 @@ def test_delivery_target_audit_flags_null_to_without_modifying(monkeypatch):
     assert not any("good" in w and "channel" in w for w in warnings)
 
 
+def test_delivery_target_audit_skips_command_crons(monkeypatch):
+    """V1: a command cron (the deterministic check-in dispatcher) owns its own send,
+    so it has no agentId/delivery BY DESIGN -- it must NOT be flagged as a finding."""
+    jobs = [
+        {"id": "checkin", "schedule": {"kind": "at", "at": "2026-06-19T09:00:00+00:00"},
+         "deleteAfterRun": True,
+         "payload": {"kind": "command", "argv": ["sh", "-lc", "bash telegram-commands.sh checkin-dispatch st_x tsk_x 30 true start"]}},
+    ]
+    warnings = preflight._validate_delivery_targets(jobs)
+    assert warnings == []  # a command cron is not a delivery-target finding
+
+
 def test_delivery_target_check_warns_when_cron_unavailable(env, monkeypatch):
     # No openclaw binary in a clean test env -> SOFT warn, never a hard fail.
     monkeypatch.setattr(preflight.shutil, "which", lambda name: None)

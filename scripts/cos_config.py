@@ -273,6 +273,38 @@ def ledger_retention_days() -> int:
     return max(1, _int_env("LEDGER_RETENTION_DAYS", 90))
 
 
+# --- V1 check-in command-cron knobs ----------------------------------------
+
+def checkin_scripts_dir() -> str:
+    """The directory the check-in command cron ``cd``s into before running.
+
+    V1: the focus/body-double check-in is a deterministic COMMAND cron (not an LLM
+    agent turn). Its argv ``cd``s here and runs ``telegram-commands.sh
+    checkin-dispatch``. Defaults to the AlphaClaw container install path; the
+    ``COS_CHECKIN_SCRIPTS_DIR`` override exists for tests/alternate hosts so the
+    path is never hardcoded into the descriptor builder.
+    """
+    return os.getenv("COS_CHECKIN_SCRIPTS_DIR") or "/data/.openclaw/skills/task-tracker/scripts"
+
+
+def checkin_cron_output_max_bytes() -> int:
+    """Cap on the check-in command cron's captured output (default 4096, floored 1).
+
+    The dispatcher OWNS the send and prints nothing user-facing on success, so the
+    bound only guards against a runaway log; it is small on purpose.
+    """
+    return max(1, _int_env("COS_CHECKIN_CRON_OUTPUT_MAX_BYTES", 4096))
+
+
+def checkin_cron_timeout_seconds() -> int:
+    """Hard bound on one check-in command-cron run (default 60s, floored at 1).
+
+    The dispatcher does a state read, a target proof, and one receipt-backed send;
+    60s is generous. Bounded so a wedged run is reaped rather than hanging the cron.
+    """
+    return max(1, _int_env("COS_CHECKIN_CRON_TIMEOUT_SECONDS", 60))
+
+
 # --- State directory -------------------------------------------------------
 
 def state_dir() -> Path:
