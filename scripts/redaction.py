@@ -215,12 +215,15 @@ def redact_event(event: dict[str, Any]) -> dict[str, Any]:
 def redact_message(text: Any) -> str:
     """Defensively cap a proactive message body before it is sent.
 
-    The brag digest / nag text is ASSEMBLED from subjects/titles/ids (see
-    ``harvest_ledger.build_draft``), not raw bodies -- this is the belt-and-braces
-    enforcement so a future renderer that interpolates a raw body cannot push it.
-    A non-string is coerced; the result is length-capped at the MESSAGE bound
-    (generous enough never to clip a real multi-line digest) so an accidentally-
-    huge body is truncated rather than blasted to Telegram.
+    Proactive text is ASSEMBLED from subjects/titles/ids (not raw bodies) -- that
+    reference-only assembly is the real content guarantee. This is the belt-and-braces
+    LENGTH backstop, wired at the proactive send seams: ``harvest_ledger.build_draft``
+    (the brag digest, relayed by the agent) and ``proactive_delivery.authorised_send``
+    (the gated-send choke point the proactive brief routes through). The nag path emits
+    short reference-only task lines through the outbox and is not length-wrapped here.
+    A non-string is coerced; the result is length-capped at the MESSAGE bound (generous
+    enough never to clip a real multi-line digest) so an accidentally-huge value spliced
+    into a line is truncated rather than blasted to Telegram.
     """
     if not isinstance(text, str):
         text = "" if text is None else str(text)

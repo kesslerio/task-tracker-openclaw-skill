@@ -30,6 +30,7 @@ from __future__ import annotations
 import os
 from typing import Any, Callable
 
+import redaction
 from autonomy_gate import assert_send_target, gate
 from delivery_target import prove_delivery_target
 from task_ledger import append_event, new_event
@@ -118,10 +119,15 @@ def authorised_send(
     "target-mismatch"}`` and NOTHING is sent. ``send`` is REQUIRED -- a missing
     transport is a delivery FAILURE, never a silent success (a brief logged as
     sent but delivered nowhere would be a phantom).
+
+    H10 (privacy): the text is passed through ``redaction.redact_message`` as a
+    length backstop right before it hits the transport -- this is the gated-send
+    choke point (the proactive brief routes through here), so any caller is bounded
+    even though the real content guarantee is reference-only assembly upstream.
     """
     check = assert_send_target(act_id, delivery_target)
     if not check["ok"]:
         return {"ok": False, "reason": check["reason"], "stage": "assert",
                 "message": check.get("message")}
-    send(delivery_target, text)
+    send(delivery_target, redaction.redact_message(text))
     return {"ok": True, "delivery_target": delivery_target}
