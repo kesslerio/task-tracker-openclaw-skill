@@ -218,7 +218,10 @@ def _build_daily_note_links(anchor_date: str | None = None) -> dict:
     relative_dir = os.getenv("TASK_TRACKER_DAILY_NOTES_RELATIVE_DIR", "01-TODOs/Daily").strip("/")
 
     from datetime import date
-    base_date = date.today()
+    import cos_config
+    # Local (Pacific) day, not the container's UTC day, so the fallback daily-note
+    # name matches the user's calendar day at Pacific evening.
+    base_date = cos_config.local_today()
     if anchor_date:
         try:
             base_date = date.fromisoformat(anchor_date)

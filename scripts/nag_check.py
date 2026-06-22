@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Callable
 
 import cos_config
@@ -70,7 +70,10 @@ SAFE_ENVELOPE = "NAG_CHECK_ERROR: internal error logged, no nag pushed this cycl
 
 
 def _today() -> datetime:
-    return datetime.now(timezone.utc)
+    # Local (Pacific) now, not UTC: the cron fires at 17:00/17:30 Pacific, when
+    # the UTC day has already rolled over, so ``ref.date()`` in ``_overdue_days``
+    # must read the local calendar day or a due-today task counts as 1d overdue.
+    return cos_config.local_now()
 
 
 def _overdue_days(due: str | None, *, ref: datetime) -> int | None:

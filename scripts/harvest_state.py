@@ -54,7 +54,7 @@ def _now_iso() -> str:
 
 def iso_week_id(reference: date | None = None) -> str:
     """The ISO-week id (e.g. ``2026-W25``) that scopes the weekly harvest window."""
-    ref = reference or date.today()
+    ref = reference or cos_config.local_today()
     iso_year, iso_week, _ = ref.isocalendar()
     return f"{iso_year}-W{iso_week:02d}"
 
@@ -65,7 +65,7 @@ def window_id(window: str, reference: date | None = None) -> str:
     The weekly window resets per ISO week (``2026-W25``); the 24h ``/done`` window
     is dated (``2026-06-20-24h``) and never resets the weekly state.
     """
-    ref = reference or date.today()
+    ref = reference or cos_config.local_today()
     if window == WINDOW_24H:
         return f"{ref.isoformat()}-24h"
     return iso_week_id(ref)
