@@ -80,6 +80,13 @@ def _set_productivity_env(monkeypatch):
     monkeypatch.setenv("OPENCLAW_TOPIC_PRODUCTIVITY_DONE", DONE_TOPIC)
 
 
+def _clear_productivity_env(monkeypatch):
+    """Unset the push-target env so a push is BLOCKED (unprovable target)."""
+    for name in ("TELEGRAM_CHAT_ID_PRODUCTIVITY", "TELEGRAM_CHAT_ID_WORK",
+                 "OPENCLAW_TOPIC_PRODUCTIVITY_DONE"):
+        monkeypatch.delenv(name, raising=False)
+
+
 class _FakeCompleted:
     def __init__(self, returncode, stdout):
         self.returncode = returncode
@@ -87,14 +94,18 @@ class _FakeCompleted:
         self.stderr = ""
 
 
-def _stub_sources(monkeypatch, *, gh_payload=None, gog_payload=None):
-    """Stub the harvest subprocesses (gh/gog) so a test never spawns a real one."""
+def _stub_sources(monkeypatch, *, gh_payload=None, gog_payload=None, gh_rc=0, gog_rc=0):
+    """Stub the harvest subprocesses (gh/gog) so a test never spawns a real one.
+
+    ``gh_rc`` / ``gog_rc`` set a nonzero exit to simulate a SOURCE ERROR (the cron
+    path then records a health FAILURE, distinct from a clean-empty week).
+    """
 
     def fake_run(cmd, **kwargs):
         if cmd[0] == "gh":
-            return _FakeCompleted(0, json.dumps(gh_payload if gh_payload is not None else []))
+            return _FakeCompleted(gh_rc, json.dumps(gh_payload if gh_payload is not None else []))
         if cmd[0] == "gog":
-            return _FakeCompleted(0, json.dumps(gog_payload if gog_payload is not None else {"threads": []}))
+            return _FakeCompleted(gog_rc, json.dumps(gog_payload if gog_payload is not None else {"threads": []}))
         raise AssertionError(f"unexpected command {cmd!r}")
 
     monkeypatch.setattr(harvest_ledger.subprocess, "run", fake_run)
@@ -218,6 +229,71 @@ def test_win_persists_across_a_crash(env, monkeypatch):
     assert record["text"] == "decided to pivot the roadmap"
 
 
+# === FIX 1: wins are seen-on-push (never silently lost after a digest) ========
+
+
+def test_win_after_push_surfaces_in_next_digest_and_first_not_repeated(env, monkeypatch):
+    """Capture win A, push a digest (A appears + becomes seen); capture win B AFTER
+    that push; the NEXT pushed digest includes B and NOT A. A delivered win never
+    repeats, and a win captured after the push is never silently lost."""
+    _set_productivity_env(monkeypatch)
+    _stub_sources(monkeypatch, gh_payload=[], gog_payload={"threads": []})
+
+    harvest_ledger.capture_win("shipped the pricing deck")  # win A
+    first = _run(monkeypatch, auto=True, now=FRIDAY)
+    assert first["draft_pushed"] is True
+    assert "shipped the pricing deck" in first["draft"]
+    # A is now seen (delivered).
+    assert "win:" in next(iter(win_store.read_seen_win_ids()))
+    assert win_store.read_unseen_wins() == []
+
+    # A win captured AFTER the push (the Fri-evening -> Sun gap) stays unseen.
+    harvest_ledger.capture_win("closed the Acme deal")  # win B
+    unseen = [w["text"] for w in win_store.read_unseen_wins()]
+    assert unseen == ["closed the Acme deal"]
+
+    # The next pushed digest (simulate next week's window) includes B and NOT A.
+    _stub_sources(monkeypatch, gh_payload=[], gog_payload={"threads": []})
+    monkeypatch.setattr(harvest_state, "iso_week_id", lambda reference=None: "2026-W99")
+    second = _run(monkeypatch, auto=True, now=FRIDAY)
+    assert second["draft_pushed"] is True
+    assert "closed the Acme deal" in second["draft"]
+    assert "shipped the pricing deck" not in second["draft"]
+
+
+def test_unseen_old_win_still_surfaces_regardless_of_capture_date(env, monkeypatch):
+    """A win captured 'last week' (captured_on before this week's Monday) that was
+    NEVER delivered still appears in this week's digest -- seen-on-push, not the
+    weekly window, is what consumes a win (the 'never silently lost' invariant)."""
+    _set_productivity_env(monkeypatch)
+    _stub_sources(monkeypatch, gh_payload=[], gog_payload={"threads": []})
+
+    # Capture a win dated well before this week's Monday; it was never pushed.
+    monkeypatch.setattr(cos_config, "local_today", lambda: __import__("datetime").date(2026, 6, 1))
+    harvest_ledger.capture_win("decided to pivot the roadmap")
+    monkeypatch.setattr(cos_config, "local_today", lambda: __import__("datetime").date(2026, 6, 19))
+
+    # This week's digest still surfaces the old, undelivered win.
+    result = _run(monkeypatch, auto=True, now=FRIDAY)
+    assert result["draft_pushed"] is True
+    assert "decided to pivot the roadmap" in result["draft"]
+
+
+def test_blocked_push_does_not_consume_wins(env, monkeypatch):
+    """A win is marked seen ONLY when the digest actually PUSHED. A blocked push
+    (no proven target) leaves the win unseen so the next allowed fire delivers it."""
+    # No productivity env => the push is BLOCKED (unprovable target).
+    _clear_productivity_env(monkeypatch)
+    _stub_sources(monkeypatch, gh_payload=[], gog_payload={"threads": []})
+    harvest_ledger.capture_win("hired the new VP of Sales")
+
+    blocked = _run(monkeypatch, auto=True, now=FRIDAY)
+    assert blocked["draft_pushed"] is False
+    assert blocked["push_blocked_reason"] is not None
+    # The win was NOT consumed -- it is still unseen for the next (provable) fire.
+    assert [w["text"] for w in win_store.read_unseen_wins()] == ["hired the new VP of Sales"]
+
+
 # === DONE 3: four-bucket digest =============================================
 
 
@@ -284,18 +360,86 @@ def test_cron_harvest_records_success_and_manifest_not_missing(env, monkeypatch)
     assert not any("MISSING ledger_harvest" in line for line in lines)
 
 
-def test_cron_harvest_records_failure_on_ok_false(env, monkeypatch):
-    """An ok:false harvest records a ledger_harvest FAILURE with the right class +
-    cron trigger, and the manifest surfaces that last bad run."""
-    harvest_ledger._record_ledger_health({"ok": False, "reason": "harvest_failed"})
+def _run_cli_auto(monkeypatch, since="2026-01-01"):
+    """Drive the REAL cron CLI path (--auto) so health is recorded by the real flow.
+
+    The CLI does not take ``now``, so force the Friday digest-day gate open here --
+    the tests target the harvest/push/health behavior, not the day gate (that is
+    covered by the DONE-1 tests)."""
+    monkeypatch.setattr(harvest_ledger, "is_digest_day", lambda now=None: True)
+    import argparse as _argparse
+    args = _argparse.Namespace(window="week", since=since, dry_run=False, json=True, auto=True)
+    return harvest_ledger._run_harvest_cli(args)
+
+
+def test_cron_source_error_records_failure_and_manifest_degraded(env, monkeypatch):
+    """A SOURCE-SUBPROCESS failure on the REAL cron flow (gh exits nonzero) records a
+    ledger_harvest FAILURE -- a quiet-empty digest is NOT mistaken for healthy. This
+    drives the real flow (not a hand-made ok:false), the gap the old test missed."""
+    _set_productivity_env(monkeypatch)
+    _stub_sources(monkeypatch, gh_rc=1, gog_payload={"threads": []})
+    _run_cli_auto(monkeypatch)
+
     entry = cos_health.read_health()["ledger_harvest"]
-    assert entry["last_failure"]["error_class"] == "harvest_failed"
+    assert entry["last_failure"]["error_class"] == "harvest_source_error"
     assert entry["last_failure"]["trigger"] == "cron:ledger_harvest"
-    # The manifest shows the failure (a failure with no recorded success is STALE-by-
-    # absent-success per the documented precedence, never silently OK/green).
+    # No recorded success + a fresh failure => STALE-by-absent-success (loud, not green).
     line = next(l for l in cos_manifest.health_lines() if "ledger_harvest" in l)
     assert line.startswith("STALE ledger_harvest")
-    assert "last_failure: harvest_failed" in line
+    assert "last_failure: harvest_source_error" in line
+
+
+def test_cron_source_error_after_success_is_degraded(env, monkeypatch):
+    """A source error AFTER a recorded success reads DEGRADED -- the most-recent real
+    outcome is a failure (the manifest must not false-green on the stale success)."""
+    _set_productivity_env(monkeypatch)
+    _stub_sources(monkeypatch, gh_payload=PR_PAYLOAD)
+    _run_cli_auto(monkeypatch)  # clean success first
+    _stub_sources(monkeypatch, gh_rc=1, gog_payload={"threads": []})
+    _run_cli_auto(monkeypatch)  # then a source error
+    assert any("DEGRADED ledger_harvest" in line for line in cos_manifest.health_lines())
+
+
+def test_cron_blocked_push_records_failure(env, monkeypatch):
+    """A BLOCKED push (digest had content but the target was unprovable -- env unset)
+    records a FAILURE: nothing was delivered, so it is not a healthy run."""
+    # No productivity env => the push is blocked though there IS content.
+    _clear_productivity_env(monkeypatch)
+    _stub_sources(monkeypatch, gh_payload=PR_PAYLOAD)
+    _run_cli_auto(monkeypatch)
+    entry = cos_health.read_health()["ledger_harvest"]
+    assert entry["last_failure"]["error_class"] == "push_blocked"
+    assert entry["last_failure"]["trigger"] == "cron:ledger_harvest"
+
+
+def test_cron_empty_week_records_success(env, monkeypatch):
+    """A legitimately-empty week (sources ran CLEAN, nothing to report) records
+    SUCCESS -- a quiet week is healthy, not a failure."""
+    _set_productivity_env(monkeypatch)
+    _stub_sources(monkeypatch, gh_payload=[], gog_payload={"threads": []})
+    _run_cli_auto(monkeypatch, since="2030-01-01")
+    entry = cos_health.read_health()["ledger_harvest"]
+    assert entry.get("last_success_ts")
+    assert entry.get("last_failure") is None
+    assert any(line.startswith("OK ledger_harvest") for line in cos_manifest.health_lines())
+
+
+def test_cron_crash_mid_harvest_records_failure(env, monkeypatch):
+    """A HARD crash mid-harvest on the cron path records a FAILURE before the no-raw-
+    leak boundary swallows it to exit 0 -- never false-green-until-STALE."""
+    _set_productivity_env(monkeypatch)
+
+    # Patch a non-source-handled crash point: match_evidence is called on every run.
+    def explode(*a, **k):
+        raise RuntimeError("matcher exploded")
+
+    _stub_sources(monkeypatch, gh_payload=PR_PAYLOAD)
+    monkeypatch.setattr(harvest_ledger, "match_evidence", explode)
+    with pytest.raises(RuntimeError):
+        _run_cli_auto(monkeypatch)
+    entry = cos_health.read_health()["ledger_harvest"]
+    assert entry["last_failure"]["error_class"] == "RuntimeError"
+    assert entry["last_failure"]["trigger"] == "cron:ledger_harvest"
 
 
 def test_cron_harvest_failure_after_success_is_degraded(env, monkeypatch):
@@ -306,14 +450,41 @@ def test_cron_harvest_failure_after_success_is_degraded(env, monkeypatch):
     assert any("DEGRADED ledger_harvest" in line for line in cos_manifest.health_lines())
 
 
+def _run_cli_reactive(monkeypatch):
+    import argparse as _argparse
+    args = _argparse.Namespace(window="week", since="2026-01-01", dry_run=False,
+                               json=True, auto=False)
+    return harvest_ledger._run_harvest_cli(args)
+
+
 def test_reactive_ledger_records_no_health(env, monkeypatch):
     """A reactive /ledger (auto=False) records NO ledger_harvest health -- the cron and
     reactive paths are never conflated (only the scheduled fire owns the health signal)."""
     _set_productivity_env(monkeypatch)
     _stub_sources(monkeypatch, gh_payload=PR_PAYLOAD)
-    # Drive the CLI path the reactive /ledger uses (no --auto) to prove it skips health.
-    import argparse as _argparse
-    args = _argparse.Namespace(window="week", since="2026-01-01", dry_run=False,
-                               json=True, auto=False)
-    harvest_ledger._run_harvest_cli(args)
+    _run_cli_reactive(monkeypatch)
+    assert "ledger_harvest" not in cos_health.read_health()
+
+
+def test_reactive_source_error_records_no_health(env, monkeypatch):
+    """A reactive /ledger with a source error still records NO health (reactive never
+    owns the health signal, even on failure)."""
+    _set_productivity_env(monkeypatch)
+    _stub_sources(monkeypatch, gh_rc=1, gog_payload={"threads": []})
+    _run_cli_reactive(monkeypatch)
+    assert "ledger_harvest" not in cos_health.read_health()
+
+
+def test_reactive_crash_records_no_health(env, monkeypatch):
+    """A reactive /ledger that crashes records NO health -- only the cron path records
+    a crash failure (no cron-vs-reactive conflation)."""
+    _set_productivity_env(monkeypatch)
+
+    def explode(*a, **k):
+        raise RuntimeError("matcher exploded")
+
+    _stub_sources(monkeypatch, gh_payload=PR_PAYLOAD)
+    monkeypatch.setattr(harvest_ledger, "match_evidence", explode)
+    with pytest.raises(RuntimeError):
+        _run_cli_reactive(monkeypatch)
     assert "ledger_harvest" not in cos_health.read_health()

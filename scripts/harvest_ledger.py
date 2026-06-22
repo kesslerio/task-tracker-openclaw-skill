@@ -118,27 +118,34 @@ def _harvest(
     *,
     trigger: str,
     timeout: int = 15,
-) -> list[dict[str, Any]]:
-    """Run one harvest subprocess and parse it; return ``[]`` on any failure.
+) -> tuple[list[dict[str, Any]], bool]:
+    """Run one harvest subprocess and parse it; return ``(evidence, failed)``.
 
     A missing/broken tool that has failed repeatedly trips the circuit breaker --
     the subprocess is skipped entirely so a daily cron does not loop on it. Any
-    failure is logged through ``error_envelope`` (classified, never echoed) and an
-    empty list is returned; this function NEVER raises.
+    failure (nonzero exit / exception / timeout / a tripped breaker) is logged
+    through ``error_envelope`` (classified, never echoed) and yields
+    ``([], failed=True)``; this function NEVER raises.
+
+    The ``failed`` flag is what distinguishes a SOURCE ERROR (couldn't harvest --
+    the cron path records a health FAILURE) from a legitimately-empty source (ran
+    clean, nothing to report -- a quiet week stays healthy). A tripped breaker is a
+    failure too: the source is unprovenly skipped, NOT confirmed empty. Without this
+    flag a gh/gog subprocess failure silently swallows to ``[]`` and false-greens.
     """
     component = f"{COMPONENT}:{source}"
     if error_envelope.breaker_open(component):
-        return []
+        return [], True
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if result.returncode != 0:
             raise subprocess.CalledProcessError(
                 result.returncode, cmd[0], output=result.stdout, stderr=result.stderr
             )
-        return parse(json.loads(result.stdout))
+        return parse(json.loads(result.stdout)), False
     except _SUBPROCESS_FAILURES as exc:
         error_envelope.log_degraded(component, exc, trigger=trigger, check=source)
-        return []
+        return [], True
 
 
 def _since_date(window: str, since_override: str | None, reference: date | None = None) -> str:
@@ -152,8 +159,11 @@ def _since_date(window: str, since_override: str | None, reference: date | None 
     return (ref - timedelta(days=ref.weekday())).isoformat()
 
 
-def harvest_github(since: str, *, trigger: str) -> list[dict[str, Any]]:
-    """Harvest merged PRs authored by the user since ``since`` (``gh``)."""
+def harvest_github(since: str, *, trigger: str) -> tuple[list[dict[str, Any]], bool]:
+    """Harvest merged PRs authored by the user since ``since`` (``gh``).
+
+    Returns ``(evidence, failed)`` -- ``failed`` is True when the ``gh`` subprocess
+    errored (so a source error is not mistaken for a clean-empty week)."""
 
     def parse(payload: Any) -> list[dict[str, Any]]:
         items = payload if isinstance(payload, list) else payload.get("items", [])
@@ -179,8 +189,11 @@ def harvest_github(since: str, *, trigger: str) -> list[dict[str, Any]]:
     return _harvest("github", cmd, parse, trigger=trigger)
 
 
-def harvest_gmail(since: str, *, trigger: str) -> list[dict[str, Any]]:
-    """Harvest sent-mail subjects since ``since`` (``gog``)."""
+def harvest_gmail(since: str, *, trigger: str) -> tuple[list[dict[str, Any]], bool]:
+    """Harvest sent-mail subjects since ``since`` (``gog``).
+
+    Returns ``(evidence, failed)`` -- ``failed`` is True when the ``gog`` subprocess
+    errored (so a source error is not mistaken for a clean-empty week)."""
 
     def parse(payload: Any) -> list[dict[str, Any]]:
         threads = payload.get("threads", []) if isinstance(payload, dict) else []
@@ -198,14 +211,18 @@ def harvest_gmail(since: str, *, trigger: str) -> list[dict[str, Any]]:
     return _harvest("gmail", cmd, parse, trigger=trigger)
 
 
-def harvest_all(since: str, *, trigger: str) -> tuple[list[dict[str, Any]], int]:
-    """Harvest every (non-deferred) source. Returns ``(evidence, sources_tried)``.
+def harvest_all(since: str, *, trigger: str) -> tuple[list[dict[str, Any]], int, bool]:
+    """Harvest every (non-deferred) source. Returns ``(evidence, sources_tried, source_error)``.
 
     Calendar harvest is DEFERRED to v0.3 (``STANDUP_CALENDARS`` not in container),
-    so only GitHub + Gmail are tried in v0.2.
+    so only GitHub + Gmail are tried in v0.2. ``source_error`` is True when ANY
+    source could not be harvested (subprocess error / tripped breaker), so the cron
+    path can record a health FAILURE rather than mistaking an unharvested source for
+    a quiet week.
     """
-    evidence = harvest_github(since, trigger=trigger) + harvest_gmail(since, trigger=trigger)
-    return evidence, 2
+    gh_evidence, gh_failed = harvest_github(since, trigger=trigger)
+    gmail_evidence, gmail_failed = harvest_gmail(since, trigger=trigger)
+    return gh_evidence + gmail_evidence, 2, gh_failed or gmail_failed
 
 
 # --- matching --------------------------------------------------------------
@@ -525,14 +542,18 @@ def run_harvest(window: str, *, since_override: str | None, dry_run: bool, trigg
         )
     )
 
-    evidence, sources_tried = harvest_all(since, trigger=trigger)
+    evidence, sources_tried, source_error = harvest_all(since, trigger=trigger)
     # Dedup against this window's seen set BEFORE matching, so a heartbeat re-fire
     # never re-ingests the same PR/email.
     fresh = [item for item in evidence if not harvest_state.is_seen(state, item["evidence_hash"])]
     matches = match_evidence(fresh)
-    # Manual /win captures within this window count as digest content alongside
-    # harvested evidence -- they are the strategy/decision items the harvest misses.
-    wins = win_store.read_wins(since=since)
+    # Manual /win captures count as digest content alongside harvested evidence --
+    # they are the strategy/decision items the harvest misses. Selected by the SAME
+    # seen-on-push dedup evidence uses (NOT the weekly ``since`` window): an unseen
+    # win older than this week's Monday must still surface (a win captured after
+    # Friday's push, or before a mid-week reactive push, would otherwise vanish when
+    # ``since`` advances). A delivered win is excluded by being in the seen set.
+    wins = win_store.read_unseen_wins()
     has_content = bool(matches) or bool(wins)
 
     pending_task_ids = sorted({
@@ -553,6 +574,10 @@ def run_harvest(window: str, *, since_override: str | None, dry_run: bool, trigg
             "reason": reason,
             "harvest_window_id": harvest_window_id,
             "expired": expired,
+            # A source error means "no content" is unproven -- carry the signal so the
+            # cron path records a FAILURE rather than false-greening an empty digest
+            # that may simply have failed to harvest.
+            "source_error": source_error,
             # Silent on the auto path: no message is surfaced when nothing should send.
             "message": None if auto else f"Nothing new to report for {harvest_window_id}.",
         }
@@ -568,6 +593,7 @@ def run_harvest(window: str, *, since_override: str | None, dry_run: bool, trigg
                 "harvest_window_id": harvest_window_id,
                 "delivery_target": state.get("delivery_target"),
                 "expired": expired,
+                "source_error": source_error,
                 "message": "Ledger draft already sent for this window.",
             }
         push = prove_and_gate_push(
@@ -590,6 +616,12 @@ def run_harvest(window: str, *, since_override: str | None, dry_run: bool, trigg
             state["pending_matches"] = _pending_match_index(matches)
             harvest_state.mark_seen(state, [item["evidence_hash"] for item in fresh])
             harvest_state.save_state(state, window)
+            # Consume the wins on the SAME success condition as the evidence: a win
+            # is marked seen ONLY when it was included in a digest that actually
+            # PUSHED, so a win captured after this push stays unseen for the next
+            # one, and a delivered win never repeats. (A suppressed/blocked/no-push
+            # run never reaches here, so it consumes no wins -- never silently lost.)
+            win_store.mark_wins_seen([win["id"] for win in wins])
 
     return {
         "ok": True,
@@ -604,6 +636,7 @@ def run_harvest(window: str, *, since_override: str | None, dry_run: bool, trigg
         "draft": draft,
         "delivery_target": push.get("delivery_target") if push["ok"] else None,
         "push_blocked_reason": None if push["ok"] else push.get("reason"),
+        "source_error": source_error,
         "expired": expired,
     }
 
@@ -764,6 +797,31 @@ def capture_win(text: str) -> dict[str, Any]:
 # --- R1 health (cron path only) --------------------------------------------
 
 
+def _ledger_failure_class(result: dict[str, Any]) -> str | None:
+    """Classify the SCHEDULED harvest result into a health failure class, or ``None``.
+
+    The harvest returns ``ok:True`` on EVERY path, so ``ok`` alone is useless as a
+    health signal. A REAL failure is one of:
+
+    * ``source_error`` -- a gh/gog subprocess errored (couldn't harvest), so an
+      "empty" digest is unproven (it may simply have failed to fetch).
+    * ``push_blocked_reason`` -- the digest had content but the push was BLOCKED
+      (env unset / unprovable target / gate rejection), so nothing was delivered.
+    * an explicit ``ok:False`` (a synthetic/legacy degraded result).
+
+    A legitimately-empty week (sources ran clean, nothing to report, no blocked
+    push) is NOT a failure -- a quiet week is healthy. Source-error outranks a
+    blocked push so the most upstream cause is the recorded class.
+    """
+    if result.get("source_error"):
+        return "harvest_source_error"
+    if result.get("push_blocked_reason"):
+        return "push_blocked"
+    if not result.get("ok"):
+        return str(result.get("reason") or "harvest_failed")
+    return None
+
+
 def _record_ledger_health(result: dict[str, Any]) -> None:
     """Best-effort: record the SCHEDULED harvest's outcome to the health substrate.
 
@@ -771,19 +829,22 @@ def _record_ledger_health(result: dict[str, Any]) -> None:
     shell ``run_with_envelope`` (not ``error_envelope.run_main``) and catches its own
     crash to exit 0, so without recording here a broken weekly harvest would
     false-green until STALE. Called ONLY from the cron (``--auto``) path, never from
-    a reactive ``/ledger`` run, so the two are not conflated. A degraded run
-    (``ok: false`` from the harvest) is a health FAILURE; a clean run is a success.
-    Wrapped so a broken/absent ``cos_health`` can never change the harvest outcome.
+    a reactive ``/ledger`` run, so the two are not conflated. A real FAILURE (a
+    source subprocess error, or a blocked push that delivered nothing) records a
+    health failure; a legitimately-empty week records success (a quiet week is
+    healthy). Wrapped so a broken/absent ``cos_health`` can never change the harvest
+    outcome.
     """
     try:
         import cos_health  # noqa: PLC0415 -- lazy + wrapped: health is best-effort
 
-        if result.get("ok"):
+        failure_class = _ledger_failure_class(result)
+        if failure_class is None:
             cos_health.record_success(COMPONENT)
         else:
             cos_health.record_failure(
                 COMPONENT,
-                error_class=str(result.get("reason") or "harvest_failed"),
+                error_class=failure_class,
                 trigger="cron:ledger_harvest",
             )
     except Exception:  # noqa: BLE001 -- health recording is best-effort, never fatal
@@ -811,14 +872,26 @@ def _run_harvest_cli(args: argparse.Namespace) -> int:
     # and records NO health (no cron-vs-reactive conflation). The trigger keys off the
     # same flag, not the window (a reactive /ledger also uses --window week).
     trigger = "cron:ledger_harvest" if args.auto else "user_command:/ledger"
-    result = run_harvest(
-        args.window,
-        since_override=args.since,
-        dry_run=args.dry_run,
-        trigger=trigger,
-        auto=args.auto,
-    )
-    if args.auto and not args.dry_run:
+    record_health = args.auto and not args.dry_run
+    try:
+        result = run_harvest(
+            args.window,
+            since_override=args.since,
+            dry_run=args.dry_run,
+            trigger=trigger,
+            auto=args.auto,
+        )
+    except Exception as exc:  # noqa: BLE001 -- record health on a crash, then re-raise
+        # A HARD crash mid-harvest is the worst silently-broken-cron case: the
+        # _cli_entry no-raw-leak boundary catches it and exits 0, so without
+        # recording here a crashing weekly harvest would false-green until STALE.
+        # Record a FAILURE before re-raising -- but ONLY on the scheduled (--auto)
+        # path, never a reactive /ledger (no cron-vs-reactive conflation). Mirrors
+        # nag_check.main's except -> _record_nag_health(crashed=...).
+        if record_health:
+            _record_ledger_health({"ok": False, "reason": type(exc).__name__})
+        raise
+    if record_health:
         _record_ledger_health(result)
     _emit(result, as_json=args.json)
     return 0

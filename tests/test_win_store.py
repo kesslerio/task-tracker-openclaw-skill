@@ -103,6 +103,44 @@ def test_since_filter_drops_older_wins(monkeypatch):
     assert len(win_store.read_wins()) == 2
 
 
+# --- seen-on-push dedup (mark_wins_seen / read_unseen_wins) -----------------
+
+
+def test_unseen_excludes_marked_wins_regardless_of_date():
+    """read_unseen_wins returns wins NOT yet delivered, unfiltered by capture date --
+    so a delivered win never repeats and an undelivered old win still surfaces."""
+    a = win_store.append_win("shipped the deck")
+    b = win_store.append_win("closed the deal")
+    assert {w["id"] for w in win_store.read_unseen_wins()} == {a["id"], b["id"]}
+
+    win_store.mark_wins_seen([a["id"]])
+    unseen = win_store.read_unseen_wins()
+    assert [w["text"] for w in unseen] == ["closed the deal"]
+    assert win_store.read_seen_win_ids() == {a["id"]}
+
+
+def test_win_id_is_stable_across_reads():
+    """The win id is derived from immutable capture facts, so a re-read resolves the
+    same id (a delivered win's seen-mark keeps matching it)."""
+    rec = win_store.append_win("decided to pivot")
+    reread = win_store.read_wins()[0]
+    assert reread["id"] == rec["id"] == win_store.win_id(rec)
+
+
+def test_mark_wins_seen_is_idempotent():
+    """Re-marking an already-seen id does not grow the seen file (no unbounded growth
+    on a heartbeat re-fire)."""
+    rec = win_store.append_win("hired a CFO")
+    win_store.mark_wins_seen([rec["id"]])
+    win_store.mark_wins_seen([rec["id"], rec["id"]])
+    lines = win_store.seen_wins_path().read_text().splitlines()
+    assert lines == [rec["id"]]
+
+
+def test_read_seen_missing_file_is_empty_set():
+    assert win_store.read_seen_win_ids() == set()
+
+
 def test_concurrent_appends_do_not_lose_or_tear_lines():
     """The flocked append serialises concurrent writers -- every line is complete."""
     n = 30
