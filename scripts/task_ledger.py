@@ -207,6 +207,14 @@ def _prune_cutoff(now: datetime | None = None) -> datetime:
     window (7d default) must never be pruned even if a misconfigured retention is
     shorter. Retention can shrink the kept history but NEVER below the window in
     which an event is still operationally needed.
+
+    Known edge (v0.3): the completion-candidate inbox projects a candidate's summary
+    from its seed ``candidate_seen`` event. A candidate snoozed UNBOUNDEDLY (past the
+    retention window, default 90d) can have its seed pruned while a newer snooze event
+    survives, so it resurfaces with no summary -- degraded display, never data loss or
+    a leak. A complete fix (carry the summary forward on each snooze, or a
+    candidate-aware prune) is deferred to v0.3 rather than coupling this prune to live
+    candidate state; 90d of un-acted snooze is itself the more pressing signal.
     """
     now = now or datetime.now(timezone.utc)
     retention_hours = cos_config.ledger_retention_days() * 24
