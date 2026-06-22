@@ -476,9 +476,48 @@ def run_main(component: str, main_func, trigger: str | None = None) -> int:
     except SystemExit:
         raise
     except BaseException as exc:  # noqa: BLE001 - this IS the catch-all boundary
-        print(handle_fatal(component, exc, resolved_trigger))
+        line = handle_fatal(component, exc, resolved_trigger)
+        # H4: make the failure machine-visible to an external watchdog WITHOUT
+        # changing the friendly-stdout + exit-0 contract. Best-effort: a health
+        # write that itself raised must never become a new failure source, so it
+        # is wrapped -- the friendly line is already printed, the exit stays 0.
+        _record_health_failure(component, classify(exc), resolved_trigger)
+        print(line)
         return 0
+    # H4: a CLEAN ritual run (no exception) is recorded as a success so a watchdog
+    # can tell a healthy cron from a silently-stuck one. Best-effort, post-main, so
+    # it can never alter what main() returned or printed.
+    _record_health_success(component)
     return int(result) if isinstance(result, int) else 0
+
+
+def _record_health_failure(component: str, error_class: str, trigger: str) -> None:
+    """Best-effort: mark ``component`` failed in the machine-visible health map.
+
+    Imported lazily and wrapped so a broken/absent ``cos_health`` can NEVER turn the
+    envelope's caught failure into an uncaught one -- health recording is observability,
+    not part of the NO-RAW-ERROR-LEAK contract.
+    """
+    try:
+        import cos_health
+
+        cos_health.record_failure(component, error_class=error_class, trigger=trigger)
+    except Exception:  # noqa: BLE001 - health recording is best-effort, never fatal
+        pass
+
+
+def _record_health_success(component: str) -> None:
+    """Best-effort: mark ``component`` succeeded in the machine-visible health map.
+
+    Same defensive wrap as ``_record_health_failure``: a health-write failure must
+    not change the exit code or stdout of an otherwise-clean ritual run.
+    """
+    try:
+        import cos_health
+
+        cos_health.record_success(component)
+    except Exception:  # noqa: BLE001 - health recording is best-effort, never fatal
+        pass
 
 
 # --- CLI (used by telegram-commands.sh run_with_envelope) ------------------

@@ -123,8 +123,20 @@ case "$1" in
     # fire, no push, no state write; the reply lands in the originating topic.
     run_with_envelope "nag" python3 "$SCRIPT_DIR/nag_check.py" --list
     ;;
+  health)
+    # H4 read-only observability: per-ritual last_success/last_failure, flagging a
+    # ritual whose last success is stale. Reactive + read-only (rung 0) -- no state
+    # write; the reply lands in the originating topic.
+    run_with_envelope "manifest" python3 "$SCRIPT_DIR/cos_manifest.py" health
+    ;;
+  manifest)
+    # H4: emit cos-manifest.json (enabled units + ritual health) and print it. A
+    # derived artifact a watchdog can poll; the command itself is rung-0 read-only
+    # over the board.
+    run_with_envelope "manifest" python3 "$SCRIPT_DIR/cos_manifest.py" manifest
+    ;;
   *)
-    echo "Usage: $0 {daily|weekly|done|reschedule|snooze|body-double|cancel-session|done24h|done7d|ledger|approve|nag-check|nag|audit|undo}"
+    echo "Usage: $0 {daily|weekly|done|reschedule|snooze|body-double|cancel-session|done24h|done7d|ledger|approve|nag-check|nag|health|manifest|audit|undo}"
     exit 1
     ;;
 esac

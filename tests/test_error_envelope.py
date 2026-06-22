@@ -518,3 +518,82 @@ def test_classify_does_not_emit_tool_names():
     line = error_envelope._friendly_line("standup")
     assert line.startswith("⚠️")
     assert "Traceback" not in line
+
+
+# --- H4: machine-visible health from the envelope --------------------------
+#
+# The envelope must make a failure (and a clean run) machine-visible in
+# cos-health.json WITHOUT regressing NO-RAW-ERROR-LEAK: stdout stays the friendly
+# notice, exit stays 0. A health-recording call that itself raises must NOT change
+# that contract -- health is observability, never a new failure source.
+
+
+def _read_health(state_dir: Path) -> dict:
+    import cos_health  # local import: same scripts dir is already on sys.path
+
+    cos_health  # ensure import side effects resolved
+    path = state_dir / "cos-health.json"
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def test_run_main_failure_records_health_and_no_raw_leak(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("TASK_MGMT_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("TASK_TRACKER_ERROR_LOG", str(tmp_path / "errors.jsonl"))
+    monkeypatch.setenv("TASK_TRACKER_LEDGER_FILE", str(tmp_path / "events.jsonl"))
+
+    def boom():
+        raise ConnectionError("gateway flake")
+
+    rc = error_envelope.run_main("standup", boom, trigger="cron:c42")
+    out = capsys.readouterr().out
+    assert rc == 0  # exit-0 contract preserved
+    assert "unavailable" in out
+    _assert_no_raw_leak(out)  # NO traceback / class / path leaked
+    # The failure is now machine-visible to a watchdog.
+    entry = _read_health(tmp_path)["standup"]
+    assert entry["last_failure"]["error_class"] == error_envelope.TRANSIENT
+    assert entry["last_failure"]["trigger"] == "cron:c42"
+    assert "last_success_ts" not in entry  # a pure failure records no success
+
+
+def test_run_main_clean_run_records_success(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("TASK_MGMT_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("TASK_TRACKER_ERROR_LOG", str(tmp_path / "errors.jsonl"))
+
+    def main_func():
+        print("📋 ok")
+        return 0
+
+    rc = error_envelope.run_main("standup", main_func)
+    assert rc == 0
+    assert "ok" in capsys.readouterr().out
+    entry = _read_health(tmp_path)["standup"]
+    assert entry["last_success_ts"]
+    assert "last_failure" not in entry  # a clean run records no failure
+
+
+def test_health_recording_failure_never_breaks_envelope(monkeypatch, tmp_path, capsys):
+    """A cos_health recorder that itself RAISES must not change exit-0 / friendly
+    stdout -- health recording is best-effort, wrapped defensively at the call site."""
+    import cos_health
+
+    monkeypatch.setenv("TASK_MGMT_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("TASK_TRACKER_ERROR_LOG", str(tmp_path / "errors.jsonl"))
+    monkeypatch.setenv("TASK_TRACKER_LEDGER_FILE", str(tmp_path / "events.jsonl"))
+
+    def explode(*a, **k):
+        raise RuntimeError("health substrate is on fire")
+
+    monkeypatch.setattr(cos_health, "record_failure", explode)
+    monkeypatch.setattr(cos_health, "record_success", explode)
+
+    # Failure path: the friendly line still prints, exit still 0.
+    rc = error_envelope.run_main("standup", lambda: (_ for _ in ()).throw(ValueError("x")))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "unavailable" in out
+    _assert_no_raw_leak(out)
+
+    # Clean path: a raising record_success does not turn a good run into a failure.
+    rc2 = error_envelope.run_main("standup", lambda: 0)
+    assert rc2 == 0
