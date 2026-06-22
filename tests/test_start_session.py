@@ -494,6 +494,25 @@ def test_start_cli_status_via_main(env, capsys):
     assert out["active"] is False
 
 
+def test_start_status_lists_all_concurrent_sessions(env, monkeypatch):
+    """The one-per-task guard is per task, so a user can have concurrent focus blocks
+    on multiple tasks. /start status must list ALL of them, not just the first."""
+    board, state = env
+    monkeypatch.setattr(nag_commands, "_now", lambda: REF)
+    state.mkdir(parents=True, exist_ok=True)
+    future = (REF + timedelta(hours=1)).isoformat()
+    (state / "nag-state.json").write_text(json.dumps({
+        "tsk_a": {"body_double_sessions": [
+            {"session_id": "sa", "cue": "open A", "started_at": "x", "ends_at": future}]},
+        "tsk_b": {"body_double_sessions": [
+            {"session_id": "sb", "cue": "open B", "started_at": "x", "ends_at": future}]},
+    }))
+    status = nag_commands.handle_start_status()
+    assert status["active"] is True
+    assert {s["task_id"] for s in status["sessions"]} == {"tsk_a", "tsk_b"}
+    assert "open A" in status["message"] and "open B" in status["message"]
+
+
 def test_body_double_sessions_list_is_bounded():
     """The continue-loop (/start again after a block elapses) leaves elapsed sessions
     on disk; add_body_double_session prunes to the most recent few so the per-task

@@ -625,12 +625,14 @@ def _annotate_quiet(state: dict[str, Any], task_id: str, session_id: str,
 
 
 def handle_start_status(*, personal: bool = False) -> dict[str, Any]:
-    """``/start`` (no task) / ``/start status`` -- show the active session + its cue.
+    """``/start`` (no task) / ``/start status`` -- show ALL active focus sessions.
 
-    A context-switched user has lost the thread; this surfaces the live focus
-    session and its resumption cue (``Resume: <cue>``) so they can pick back up. It
-    is read-only over nag-state.json -- no board read, no target proof, no push.
-    Scans every task's entry because the cue/session live keyed by task_id.
+    A context-switched user has lost the thread; this surfaces every live focus
+    session and its resumption cue (``Resume: <cue>``) so they can pick back up. The
+    one-per-task guard is per task, so a user may have a concurrent block on more than
+    one task -- all are listed in ``sessions`` (the single-session top-level fields are
+    kept for back-compat when there is exactly one). It is read-only over
+    nag-state.json -- no board read, no target proof, no push.
 
     ``now`` is passed so an ELAPSED session (its block already over) is treated as
     not active -- we don't advertise a stale ``Resume:`` cue for a block that has
@@ -638,20 +640,32 @@ def handle_start_status(*, personal: bool = False) -> dict[str, Any]:
     """
     now = _now()
     state = nag_state.read_state()
+    found = []
     for task_id, entry in state.items():
         session = nag_state.active_body_double_session(entry, now=now)
         if session is None:
             continue
-        cue = session.get("cue")
-        resume = f"Resume: {cue}" if cue else "No resumption cue saved for this session."
-        return {"ok": True, "active": True, "task_id": task_id,
-                "session_id": session.get("session_id"), "cue": cue,
-                "started_at": session.get("started_at"),
-                "duration_min": session.get("duration_min"),
-                "message": (f"Active focus session on {task_id} "
-                            f"(started {session.get('started_at')}). {resume}")}
-    return {"ok": True, "active": False,
-            "message": "No active focus session. /start <task_id> to begin one."}
+        found.append({
+            "task_id": task_id, "session_id": session.get("session_id"),
+            "cue": session.get("cue"), "started_at": session.get("started_at"),
+            "duration_min": session.get("duration_min"),
+        })
+    if not found:
+        return {"ok": True, "active": False, "sessions": [],
+                "message": "No active focus session. /start <task_id> to begin one."}
+    # Surface EVERY active session: the one-per-task guard is per task, so a user can
+    # have a concurrent focus block on more than one task -- showing only the first
+    # would silently hide the others' resumption cues.
+    lines = [f"• {s['task_id']} (started {s['started_at']}). "
+             + (f"Resume: {s['cue']}" if s['cue'] else "No resumption cue saved.")
+             for s in found]
+    header = ("Active focus session:" if len(found) == 1
+              else f"{len(found)} active focus sessions:")
+    out = {"ok": True, "active": True, "sessions": found,
+           "message": header + "\n" + "\n".join(lines)}
+    if len(found) == 1:  # back-compat: keep the single-session top-level fields
+        out.update(found[0])
+    return out
 
 
 def handle_cancel_session(
