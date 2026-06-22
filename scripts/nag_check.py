@@ -60,6 +60,7 @@ import error_envelope
 import nag_delivery
 import nag_state
 import outbox
+import quiet_state
 import task_ledger
 from task_ledger import append_event, new_event
 from task_records import active_records, load_records
@@ -207,10 +208,20 @@ def _nag_sent_already_logged(idem_key: str) -> bool:
                for e in events)
 
 
-def _nag_text(record, section: str, overdue: int) -> str:
-    """Fallback wording for a nag push. Deterministic here; the cron prompt
-    LLM-varies the phrasing per fire to reduce habituation (spec §2.1) -- this is
-    the fallback / dry-run body and the audit record of what was pushed."""
+def _nag_text(record, section: str, overdue: int, *, snooze_count: int = 0) -> str:
+    """Wording for a nag push. Deterministic here; the cron prompt LLM-varies the
+    phrasing per fire to reduce habituation (spec §2.1) -- this is the fallback /
+    dry-run body and the audit record of what was pushed.
+
+    H5 attention-budget: once a loop has been snoozed ``nag_disposition_after_snoozes``
+    times (default 2), the review says STOP re-asking the same way and ask for a
+    DISPOSITION instead -- is it blocked, unclear, too big, or no longer important?
+    There is no interval to stop tightening (the cadence is the fixed cron schedule,
+    not a per-loop shrink), so the escalation is purely this text swap on the SAME
+    gated/receipted send. Below the threshold the normal overdue nag stands.
+    """
+    if snooze_count >= cos_config.nag_disposition_after_snoozes():
+        return _disposition_text(record, snooze_count)
     title = record.title or record.canonical_id or "(untitled)"
     plural = "s" if overdue != 1 else ""
     return (
@@ -221,8 +232,31 @@ def _nag_text(record, section: str, overdue: int) -> str:
     )
 
 
-def _authorise_nag(record, section: str, overdue: int, *, dry_run: bool
-                   ) -> dict[str, Any]:
+def _disposition_text(record, snooze_count: int) -> str:
+    """The after-N-snoozes DISPOSITION prompt (replaces tightening the interval).
+
+    Names the task, notes how many times it has been snoozed, and asks the review's
+    four-way question -- blocked / unclear / too big / no longer important -- routing
+    the user to the EXISTING commands only (there is no /park or /split): /done to
+    close it (done OR not important), /reschedule to move it (blocked), or just reply
+    in words to break it down (unclear / too big). Concise on purpose: this surface
+    is the one the review flagged as over-aggressive.
+    """
+    title = record.title or record.canonical_id or "(untitled)"
+    cid = record.canonical_id
+    plural = "s" if snooze_count != 1 else ""
+    return (
+        f"🔁 Snoozed {snooze_count} time{plural}: \"{title}\" [{cid}]\n\n"
+        "Let's stop nudging and sort it out -- is it **blocked**, **unclear**, "
+        "**too big**, or **no longer important**?\n"
+        f"• /done {cid} -- done, or no longer important (just close it)\n"
+        f"• /reschedule {cid} <date> -- blocked; move it to when it can move\n"
+        "• reply in words and I'll help break it down (unclear / too big)"
+    )
+
+
+def _authorise_nag(record, section: str, overdue: int, *, dry_run: bool,
+                   snooze_count: int = 0) -> dict[str, Any]:
     """Prove+gate+assert ONE nag, returning the authorised target + text.
 
     This is the proof chain that MUST pass before any byte leaves: an env-missing /
@@ -237,7 +271,7 @@ def _authorise_nag(record, section: str, overdue: int, *, dry_run: bool
     and manufacture a phantom undoable nag that was never sent. A dry-run touches
     no append-only state, honouring its documented "preview, no write" contract.
     """
-    text = _nag_text(record, section, overdue)
+    text = _nag_text(record, section, overdue, snooze_count=snooze_count)
     if dry_run:
         proof = nag_delivery.resolve_target()
         if not proof["ok"]:
@@ -290,6 +324,19 @@ def run_nag_check(*, dry_run: bool = False, limit: int | None = None,
     if not dry_run and sender is None:
         raise ValueError("run_nag_check requires a sender transport for a real run.")
     ref = _today()
+
+    # H5 attention budget: if the user set a quiet window (``/quiet <dur>``), SUPPRESS
+    # every proactive push this cycle -- prove/gate/send NOTHING and open/fire/resolve
+    # NO loop. The ritual still RAN fine (it is a deliberate user-set suppression, not a
+    # failure), so this returns clean zero counts carrying a ``quiet`` marker; ``main``
+    # records a health SUCCESS and notes "quiet until <ts>" on the footer. A dry-run is a
+    # preview, so it honours quiet too (it would report what a real cycle does -- nothing).
+    # Quiet suppresses PROACTIVE output only: the reactive ``/nag --list`` read does NOT
+    # route through here, so it still works while quiet.
+    if quiet_state.is_quiet(ref):
+        return {"open": 0, "sent": 0, "closed": 0, "blocked": 0, "deferred": 0,
+                "quiet": 1}
+
     _tasks_file, _content, records = load_records(personal=False)
     active = {r.canonical_id: r for r in active_records(records) if r.canonical_id}
     counts = {"open": 0, "sent": 0, "closed": 0, "blocked": 0, "deferred": 0}
@@ -368,7 +415,9 @@ def _fire_one(task_id, record, section, overdue, counts, *,
         if (isinstance(current, dict) and current.get("ack")) or \
                 nag_state.is_snoozed(current, now=ref):
             return  # the real run would skip this -- preview must too
-        outcome = _authorise_nag(record, section, overdue, dry_run=True)
+        snooze_count = int(current.get("snooze_count") or 0) if isinstance(current, dict) else 0
+        outcome = _authorise_nag(record, section, overdue, dry_run=True,
+                                 snooze_count=snooze_count)
         if outcome["ok"]:
             counts["open"] += 1
         else:
@@ -462,7 +511,12 @@ def _fire_locked(live, task_id, record, section, overdue, *, ref, sender,
                 "message_id": receipt.get("message_id"), "idem_key": idem_key,
                 "nag_loop_id": opened.get("nag_loop_id")}
 
-    authorised = _authorise_nag(record, section, overdue, dry_run=False)
+    # H5: the disposition prompt swaps in once the loop has been snoozed enough
+    # times. Read the count off the LIVE locked entry (``current``) so the text
+    # reflects the persisted snooze history, not a stale snapshot.
+    snooze_count = int(current.get("snooze_count") or 0) if isinstance(current, dict) else 0
+    authorised = _authorise_nag(record, section, overdue, dry_run=False,
+                                snooze_count=snooze_count)
     if not authorised["ok"]:
         # Carry the act_id + stage through (Fix C): an ASSERT-stage block means gate()
         # already fired (executed act logged) but the seam asserted out, so the caller
@@ -732,6 +786,12 @@ def main(argv: list[str] | None = None) -> int:
         footer = (f"NAG_CHECK_DONE: {counts['open']} open loops, {counts['sent']} sent, "
                   f"{counts['closed']} closed, {counts['blocked']} blocked, "
                   f"{counts['deferred']} deferred")
+        # H5: a quiet cycle suppressed all proactive pushes -- note the active window on
+        # the footer so the operator sees WHY nothing fired (the ritual ran fine, it was
+        # deliberately muted, not idle or broken).
+        if counts.get("quiet"):
+            until = quiet_state.quiet_until(_today())
+            footer += f" (quiet until {until.isoformat() if until else 'now'})"
         print(footer, file=sys.stdout if args.dry_run else sys.stderr)
         # R1: a SWALLOWED per-task delivery failure (run_nag_check absorbs every transport
         # failure into ``counts['blocked']``, leaving the loops OPEN) must be machine-

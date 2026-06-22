@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Telegram slash command wrapper for task-tracker skill
 # Usage: telegram-commands.sh {daily|weekly|done|reschedule|snooze|body-double|cancel-session|
-#                              done24h|done7d|ledger|approve|nag-check|nag|audit|undo}
+#                              done24h|done7d|ledger|approve|nag-check|nag|quiet|unquiet|audit|undo}
 #
 # U1 NO-RAW-ERROR-LEAK boundary: every python3 invocation goes through
 # run_with_envelope, which captures stdout AND stderr. On a non-zero exit the
@@ -123,6 +123,19 @@ case "$1" in
     # fire, no push, no state write; the reply lands in the originating topic.
     run_with_envelope "nag" python3 "$SCRIPT_DIR/nag_check.py" --list
     ;;
+  quiet)
+    # H5 attention budget: `/quiet <dur>` suppresses the PROACTIVE nag (nags only;
+    # body-double check-ins the user started keep running) until local now+dur;
+    # `/quiet off` clears it; `/quiet` (no arg)
+    # shows the current window. Reactive (the user typed it) -- it read/writes only
+    # its own quiet-state.json, proves no target, opens no loop, sends no push.
+    shift
+    run_with_envelope "quiet" python3 "$SCRIPT_DIR/quiet_cli.py" "$@"
+    ;;
+  unquiet)
+    # H5 alias: `/unquiet` == `/quiet off` -- resume proactive pushes immediately.
+    run_with_envelope "quiet" python3 "$SCRIPT_DIR/quiet_cli.py" off
+    ;;
   health)
     # H4 read-only observability: per-ritual last_success/last_failure, flagging a
     # ritual whose last success is stale. Reactive + read-only (rung 0) -- no state
@@ -136,7 +149,7 @@ case "$1" in
     run_with_envelope "manifest" python3 "$SCRIPT_DIR/cos_manifest.py" manifest
     ;;
   *)
-    echo "Usage: $0 {daily|weekly|done|reschedule|snooze|body-double|cancel-session|done24h|done7d|ledger|approve|nag-check|nag|health|manifest|audit|undo}"
+    echo "Usage: $0 {daily|weekly|done|reschedule|snooze|body-double|cancel-session|done24h|done7d|ledger|approve|nag-check|nag|quiet|unquiet|health|manifest|audit|undo}"
     exit 1
     ;;
 esac

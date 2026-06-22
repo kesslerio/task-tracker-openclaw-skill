@@ -17,7 +17,7 @@ grep (-100[0-9]{8,}); real ids are env-sourced, never committed.
 
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -1171,3 +1171,171 @@ def test_nag_all_list_empty_board_says_caught_up(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "caught up" in out.lower()
+
+
+# --- H5 Feature 1: /quiet suppresses PROACTIVE pushes -----------------------
+
+def _snooze_loop_n_times(state_dir, task_id, n, *, until):
+    """Open-then-snooze a loop ``n`` times with an ALREADY-EXPIRED window so the loop
+    is firable again next cycle but carries ``snooze_count == n``. ``until`` is the
+    (expired) snoozed_until used for each snooze."""
+    for _ in range(n):
+        nag_state.transition(lambda s: nag_state.apply_snooze(
+            s, task_id, snoozed_until=until, block_reason=None))
+
+
+def test_h5_quiet_cycle_sends_nothing_opens_no_loop(harness):
+    """A quiet cron cycle SUPPRESSES all proactive pushes: the sender is NEVER called,
+    no loop is opened, and counts carry the ``quiet`` marker. The overdue task is
+    real (it would fire if not quiet) -- so this proves quiet, not an idle board."""
+    import quiet_state  # noqa: PLC0415
+    board, state = harness
+    quiet_state.set_quiet(REF + timedelta(hours=1))  # quiet across the REF cycle
+    sent = []
+    counts = nag_check.run_nag_check(sender=fake_sender(sent))
+    assert sent == []  # NOTHING delivered while quiet
+    assert counts["sent"] == 0 and counts["open"] == 0
+    assert counts.get("quiet") == 1  # the quiet marker is set
+    # No loop was opened or fired and no ledger nag event was written.
+    assert not (state / "nag-state.json").exists() or "tsk_abc123" not in _state(state)
+    assert [e for e in _events(state) if e["event_type"] in ("nag_opened", "nag_sent")] == []
+
+
+def test_h5_quiet_cycle_records_health_success_not_failure(harness, monkeypatch, capsys):
+    """A quiet cycle is a SUCCESSFUL ritual (deliberate suppression), not a failure: it
+    records a health SUCCESS, returns 0, and the footer notes 'quiet until <ts>'."""
+    import cos_health  # noqa: PLC0415
+    import quiet_state  # noqa: PLC0415
+    board, state = harness
+    quiet_state.set_quiet(REF + timedelta(hours=1))
+    monkeypatch.setattr(nag_check.outbox, "openclaw_sender", fake_sender([]))
+    rc = nag_check.main([])
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "0 sent" in err and "quiet until" in err  # footer notes the window
+    entry = cos_health.read_health()["nag_check"]
+    assert "last_success_ts" in entry and "last_failure" not in entry  # SUCCESS, not failure
+
+
+def test_h5_nag_list_still_works_while_quiet(harness, capsys):
+    """Quiet suppresses PROACTIVE pushes, NOT user-initiated reads: `/nag --list`
+    (the reactive read-only path) still prints the full overdue list while quiet."""
+    import quiet_state  # noqa: PLC0415
+    board, state = harness
+    quiet_state.set_quiet(REF + timedelta(hours=1))
+    rc = nag_check.main(["--list"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "tsk_abc123" in out  # the read still shows the overdue task while quiet
+
+
+def test_h5_quiet_window_expired_fires_normally(harness, monkeypatch):
+    """An EXPIRED quiet window does not suppress: once the deadline passes, the next
+    cycle fires the nag normally (quiet fails toward nagging, never permanent silence)."""
+    import quiet_state  # noqa: PLC0415
+    board, state = harness
+    quiet_state.set_quiet(REF - timedelta(hours=1))  # already expired at REF
+    sent = []
+    counts = nag_check.run_nag_check(sender=fake_sender(sent))
+    assert counts.get("quiet") is None  # not quiet
+    assert counts["sent"] == 1 and len(sent) == 1  # fired normally
+
+
+# --- H5 Feature 2: after-N-snoozes disposition prompt -----------------------
+
+def test_h5_disposition_prompt_after_two_snoozes(harness, monkeypatch):
+    """A loop snoozed >= NAG_DISPOSITION_AFTER_SNOOZES (default 2) times fires the
+    DISPOSITION prompt -- naming the task, the snooze count, and asking blocked/unclear/
+    too big/not important via /done + /reschedule -- NOT the normal overdue nag."""
+    board, state = harness
+    _run(harness)  # open the loop (nag_count=1)
+    # Snooze twice with an ALREADY-EXPIRED window so the loop is firable next cycle
+    # but carries snooze_count==2.
+    expired = (REF - timedelta(hours=1)).isoformat()
+    _snooze_loop_n_times(state, "tsk_abc123", 2, until=expired)
+    assert _state(state)["tsk_abc123"]["snooze_count"] == 2
+    # Next scheduled cycle: the loop re-fires, but now as a DISPOSITION prompt.
+    monkeypatch.setattr(nag_check, "_today", lambda: REF + timedelta(hours=3))
+    sent = []
+    counts = nag_check.run_nag_check(sender=fake_sender(sent))
+    assert counts["sent"] == 1 and len(sent) == 1
+    text = sent[0][1]
+    # It is the disposition prompt, not the normal overdue nag.
+    assert "Overdue task still open" not in text
+    for word in ("blocked", "unclear", "too big", "no longer important"):
+        assert word in text
+    assert "/done tsk_abc123" in text and "/reschedule tsk_abc123" in text
+    assert "snoozed 2 times" in text.lower()
+    # There is NO invented command -- only /done and /reschedule are named.
+    assert "/park" not in text and "/split" not in text
+
+
+def test_h5_below_threshold_gets_normal_nag(harness, monkeypatch):
+    """A loop with snooze_count < the disposition threshold gets the NORMAL overdue
+    nag, not the disposition prompt (one snooze is not yet 'asking instead')."""
+    board, state = harness
+    _run(harness)
+    expired = (REF - timedelta(hours=1)).isoformat()
+    _snooze_loop_n_times(state, "tsk_abc123", 1, until=expired)  # only ONE snooze
+    assert _state(state)["tsk_abc123"]["snooze_count"] == 1
+    monkeypatch.setattr(nag_check, "_today", lambda: REF + timedelta(hours=3))
+    sent = []
+    nag_check.run_nag_check(sender=fake_sender(sent))
+    text = sent[0][1]
+    assert "Overdue task still open" in text  # the normal nag
+    assert "no longer important" not in text  # NOT the disposition prompt
+
+
+def test_h5_disposition_rides_the_gated_receipted_send(harness, monkeypatch):
+    """The disposition is the SAME gated/receipted/idempotent send (H3), not a separate
+    push: the proven target gets the disposition text and a nag_sent receipt with a
+    message_id + idem_key is captured."""
+    board, state = harness
+    _run(harness)
+    expired = (REF - timedelta(hours=1)).isoformat()
+    _snooze_loop_n_times(state, "tsk_abc123", 2, until=expired)
+    monkeypatch.setattr(nag_check, "_today", lambda: REF + timedelta(hours=3))
+    sent = []
+    nag_check.run_nag_check(sender=fake_sender(sent, message_id="5150"))
+    target, text = sent[0]
+    # Delivered to the PROVEN gated target with the disposition wording.
+    assert target == {"chat_id": PRODUCTIVITY, "topic_id": "2",
+                      "agent_id": "niemand-work", "channel": "telegram"}
+    assert "no longer important" in text
+    # The receipt was captured on the nag_sent event (same H3 send path).
+    sent_events = [e for e in _events(state) if e["event_type"] == "nag_sent"]
+    assert sent_events and sent_events[-1]["metadata"]["message_id"] == "5150"
+    assert sent_events[-1]["metadata"]["idem_key"].startswith("nag:tsk_abc123:")
+
+
+def test_h5_disposition_does_not_tighten_any_interval(harness, monkeypatch):
+    """The disposition REPLACES tightening, it does not add it: firing a disposition
+    nag does not shrink the threshold or alter the loop's snooze cadence -- the loop's
+    snooze_count is untouched by the fire and the same fixed thresholds still govern.
+    (There was no interval-tightening in the code to begin with; this pins that.)"""
+    board, state = harness
+    _run(harness)
+    expired = (REF - timedelta(hours=1)).isoformat()
+    _snooze_loop_n_times(state, "tsk_abc123", 2, until=expired)
+    before = _state(state)["tsk_abc123"]
+    snooze_before = before["snooze_count"]
+    monkeypatch.setattr(nag_check, "_today", lambda: REF + timedelta(hours=3))
+    nag_check.run_nag_check(sender=fake_sender([]))
+    after = _state(state)["tsk_abc123"]
+    # The fire bumped nag_count (a delivered nag) but did NOT touch snooze_count or
+    # mint a shorter window -- there is no tightening, only the disposition text swap.
+    assert after["snooze_count"] == snooze_before  # snooze cadence untouched
+    assert after.get("snoozed_until") == expired  # no new (shorter) window written
+    assert after["nag_count"] == before["nag_count"] + 1  # the disposition was delivered
+
+
+def test_h5_disposition_threshold_env_override_and_floor(monkeypatch):
+    """nag_disposition_after_snoozes: default 2, env override honoured, floored at 1
+    (a 0/negative misconfig must not make EVERY nag a disposition prompt)."""
+    import cos_config  # noqa: PLC0415
+    assert cos_config.nag_disposition_after_snoozes() == 2  # default
+    monkeypatch.setenv("NAG_DISPOSITION_AFTER_SNOOZES", "3")
+    assert cos_config.nag_disposition_after_snoozes() == 3  # override
+    for bad in ("0", "-1", "  -4 "):
+        monkeypatch.setenv("NAG_DISPOSITION_AFTER_SNOOZES", bad)
+        assert cos_config.nag_disposition_after_snoozes() == 1  # floored at 1
