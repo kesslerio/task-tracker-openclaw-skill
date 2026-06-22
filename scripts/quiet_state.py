@@ -4,10 +4,11 @@
 ``/quiet <dur>`` is the ADHD attention-budget escape hatch (external review:
 "the nag is too aggressive -- alert fatigue"). It sets a deadline in
 ``quiet-state.json`` (under ``cos_config.state_dir()``); while ``now`` is before
-that deadline the nag cron suppresses every PROACTIVE push -- no nag is proved,
-gated, or sent, and no loop is opened. The read-only RESOLVE pass (which sends
-nothing) and the user-initiated ``/nag --list`` read still work: quiet mutes
-PROACTIVE output, not user-initiated reads.
+that deadline the nag cron returns early: no nag is proved, gated, or sent, no
+loop is opened, AND the resolve/close pass is skipped too (it sends nothing, so
+suppressing it is harmless -- open loops simply reconcile on the first cron cycle
+after quiet ends). Only the user-initiated ``/nag --list`` read still works:
+quiet mutes the PROACTIVE cron, not user-initiated reads.
 
 A single small flag (``quiet_until``) -- so this reuses the ``outbox.py`` /
 ``proactive_state.py`` flock + ``utils._atomic_write`` idiom rather than inventing

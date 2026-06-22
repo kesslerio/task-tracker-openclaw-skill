@@ -124,8 +124,9 @@ case "$1" in
     run_with_envelope "nag" python3 "$SCRIPT_DIR/nag_check.py" --list
     ;;
   quiet)
-    # H5 attention budget: `/quiet <dur>` suppresses PROACTIVE pushes (nags +
-    # check-ins) until local now+dur; `/quiet off` clears it; `/quiet` (no arg)
+    # H5 attention budget: `/quiet <dur>` suppresses the PROACTIVE nag (nags only;
+    # body-double check-ins the user started keep running) until local now+dur;
+    # `/quiet off` clears it; `/quiet` (no arg)
     # shows the current window. Reactive (the user typed it) -- it read/writes only
     # its own quiet-state.json, proves no target, opens no loop, sends no push.
     shift

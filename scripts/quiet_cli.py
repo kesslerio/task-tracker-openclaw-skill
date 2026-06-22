@@ -59,8 +59,9 @@ def handle_quiet(duration: str | None) -> dict[str, Any]:
     until = now + timedelta(minutes=minutes)
     quiet_state.set_quiet(until)
     return {"ok": True, "quiet": True, "quiet_until": until.isoformat(),
-            "message": (f"Quiet until {until.isoformat()} -- proactive nags + check-ins "
-                        "are suppressed until then. Reply /quiet off to resume.")}
+            "message": (f"Quiet until {until.isoformat()} -- the proactive nag is "
+                        "suppressed until then. (Body-double check-ins you started keep "
+                        "running -- /cancel-session to stop one.) Reply /quiet off to resume.")}
 
 
 def main(argv: list[str] | None = None) -> int:
