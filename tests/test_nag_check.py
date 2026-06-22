@@ -253,6 +253,56 @@ def test_h3_idempotent_retry_logs_no_second_receipt(harness):
     assert _state(state)["tsk_abc123"]["nag_count"] == 1  # count NOT bumped
 
 
+def test_h3_idempotent_retry_via_peek_logs_no_gate_act(harness):
+    """Fix A (peek before gate): a same-cycle retry short-circuits at the outbox PEEK
+    -- before _authorise_nag -- so gate() is NEVER called and NO new ``executed``
+    autonomy-gate act is appended for the undelivered duplicate fire. We assert the
+    autonomy-log length is UNCHANGED across the second (retry) fire: the phantom
+    executed-but-undelivered act the pre-fix ordering manufactured is gone."""
+    import autonomy_gate  # noqa: PLC0415
+    board, state = harness
+    sender = fake_sender([])
+    nag_check.run_nag_check(sender=sender)  # genuine fire: gate logs ONE executed act
+    log_before = len(autonomy_gate.read_autonomy_log())
+
+    nag_check.run_nag_check(sender=sender)  # same cycle -> peek short-circuits, no gate()
+    # No new autonomy-log act for the deduped retry (the peek skipped gate entirely),
+    # and -- since nothing was gated -- no reconciliation event either.
+    assert len(autonomy_gate.read_autonomy_log()) == log_before
+    undel = [e for e in _events(state) if e["event_type"] == "nag_gate_act_undelivered"]
+    assert undel == []  # nothing gated this fire -> nothing to reconcile
+
+
+def test_h3_delivery_failure_reconciles_gate_act(harness):
+    """Fix B (reconcile the gate act on non-delivery): when the sender RAISES after
+    the gate already logged an ``executed`` act, a nag_gate_act_undelivered ledger
+    event is appended carrying that gate act_id -- so the executed-but-undelivered act
+    is reconcilable from the ledger. The loop stays OPEN and no nag_sent is written."""
+    import autonomy_gate  # noqa: PLC0415
+    board, state = harness
+
+    def boom(target, text):
+        raise nag_check.outbox.OpenclawSendError("gateway unreachable")
+
+    counts = nag_check.run_nag_check(sender=boom)
+    assert counts["sent"] == 0 and counts["blocked"] == 1
+    # The gate logged exactly one executed nag_sent act (its authoritative record is
+    # untouched -- we never forge a status over it); we tie our reconciliation to it.
+    executed = [r for r in autonomy_gate.read_autonomy_log()
+                if r.get("act_type") == "nag_sent" and r.get("status") == "executed"]
+    assert len(executed) == 1
+    gate_act_id = executed[0]["act_id"]
+    undel = [e for e in _events(state) if e["event_type"] == "nag_gate_act_undelivered"]
+    assert len(undel) == 1
+    meta = undel[0]["metadata"]
+    assert meta["act_id"] == gate_act_id  # reconciliation ties back to the gate act
+    assert meta["reason"] == "OpenclawSendError" and meta["stage"] == "send"
+    # Loop stays OPEN, no phantom nag_sent ledger receipt.
+    on_disk = _state(state)
+    assert "tsk_abc123" not in on_disk or on_disk["tsk_abc123"]["ack"] is False
+    assert [e for e in _events(state) if e["event_type"] == "nag_sent"] == []
+
+
 def test_h3_sender_failure_leaves_loop_open_and_logs_block(harness):
     """A sender that RAISES is a delivery FAILURE: the loop is NOT closed, NO phantom
     nag_sent is recorded, and a delivery-failure (nag_delivery_blocked) is logged."""
@@ -467,14 +517,19 @@ def test_t9_corrupt_state_via_main_emits_safe_envelope(tmp_path, monkeypatch, ca
 def test_crash_mid_run_leaves_open_loop_open(harness, monkeypatch):
     """NAG-CLOSES-ONLY-ON-ACK: a crash after state-read but before push must not
     close an open loop; the next clean run finds it open and re-fires."""
+    from datetime import timedelta
     board, state = harness
-    _run(harness)  # loop is open
+    _run(harness)  # loop is open (recorded the idem-key for the REF cycle)
     assert _state(state)["tsk_abc123"]["ack"] is False
 
     # Inject a crash inside the prove/authorise step so the run aborts mid-cycle.
     # Restore ONLY authorise (not the env/board monkeypatches) so the recovery run
     # stays isolated. A raised authorise (unlike a controlled sender failure) is an
     # uncaught fault: it propagates out, transition() persists nothing, loop stays open.
+    # The crash run must land in a FRESH cycle so the outbox peek does NOT short-circuit
+    # on the REF cycle's recorded delivery before _authorise_nag is reached -- otherwise
+    # we would be exercising the dedup peek, not the mid-authorise crash this pins.
+    monkeypatch.setattr(nag_check, "_today", lambda: REF + timedelta(hours=3))
     real_authorise = nag_check._authorise_nag
 
     def boom(*a, **k):
@@ -486,10 +541,10 @@ def test_crash_mid_run_leaves_open_loop_open(harness, monkeypatch):
     # State on disk is unchanged -- the loop is still open.
     assert _state(state)["tsk_abc123"]["ack"] is False
 
-    # Recovery: a clean run re-fires the still-open loop. We advance the clock a day
-    # so the receipt idem-key (keyed on the run's reference day) is fresh and the
-    # recovery genuinely re-delivers -- proving the crashed loop was processed, not
-    # lost (on the SAME day the idempotent outbox would suppress the duplicate send).
+    # Recovery: a clean run re-fires the still-open loop. We advance the clock again
+    # to a fresh cycle so the receipt idem-key is unseen and the recovery genuinely
+    # re-delivers -- proving the crashed loop was processed, not lost (in the crashed
+    # cycle nothing was ever recorded, so this is a clean new delivery).
     monkeypatch.setattr(nag_check, "_authorise_nag", real_authorise)
     monkeypatch.setattr(nag_check, "_today",
                         lambda: datetime(2026, 6, 20, tzinfo=timezone.utc))

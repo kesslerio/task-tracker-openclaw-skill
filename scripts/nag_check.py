@@ -27,6 +27,15 @@ fire it:
    STAYS OPEN; a transport FAILURE (the sender raises) likewise leaves the loop OPEN
    and records NO ``nag_sent`` -- it is never silently cleared or phantom-sent.
 
+CADENCE COUPLING (HARD DEPENDENCY): the outbox idem-key period is the local date +
+HOUR (``%Y-%m-%d-%H``), so the same-fire dedup window assumes >= 1h spacing between
+scheduled fires. This holds for the 11/14/17 cadence (each lands in a distinct clock
+hour). If the schedule is EVER tightened to sub-hourly (two fires in one hour), the
+second would silently dedupe to the same key -- a DROPPED nag with NO log. A
+sub-hourly schedule MUST coarsen or re-key the period (e.g. include the minute)
+before tightening. The invariant is restated at the idem-key site in ``_fire_locked``;
+keep both halves in sync.
+
 Hard invariants enforced here:
 
 * NAG-CLOSES-ONLY-ON-ACK -- a loop closes only on verified_done / rescheduled (or
@@ -337,29 +346,61 @@ def _fire_locked(live, task_id, record, section, overdue, *, ref, sender):
     """The under-lock fire decision for ONE task (runs inside nag_state.transition).
 
     Returns a small result dict the caller turns into ledger events + counts. The
-    whole chain -- ack/snooze re-check, prove+gate+assert, the receipt-captured send,
-    and the state persist -- happens UNDER the lock, so a reactive ``/done`` that
-    acks the loop before this takes the lock means NO message is sent and NO gate act
-    is logged. The send goes through ``outbox.deliver_once`` (idempotent + receipt),
-    keyed on the loop id chosen here, so a re-fire of the SAME loop on the same day
-    never double-sends even across retries.
+    whole chain -- ack/snooze re-check, outbox peek, prove+gate+assert, the
+    receipt-captured send, and the state persist -- happens UNDER the lock, so a
+    reactive ``/done`` that acks the loop before this takes the lock means NO message
+    is sent and NO gate act is logged. The send goes through ``outbox.deliver_once``
+    (idempotent + receipt), keyed on (task_id, period), so a re-fire of the SAME loop
+    in the SAME cycle never double-sends even across retries.
+
+    Ordering (audit-honest): peek -> [skip | gate->assert->deliver] -> reconcile.
+    The idem-key is computed FIRST and the outbox PEEKED before any gate() call. A
+    key already recorded this cycle short-circuits to ``already_delivered`` WITHOUT
+    proving/gating/asserting, so a same-cycle idempotent retry logs NO phantom
+    ``executed`` autonomy-gate act -- mirroring how the acked/snoozed SKIP path above
+    also avoids gate(). Only an unrecorded key proceeds to ``_authorise_nag``
+    (prove->gate->assert, which logs the executed act) and then ``deliver_once``,
+    whose own under-flock recorded-key check stays the AUTHORITATIVE dedup for the
+    rare TOCTOU where another fire records between this peek and that flock.
 
     State is mutated ONLY AFTER a proven, delivered send. A delivery failure (the
     sender raises) returns ``delivery_failed`` having mutated ``live`` not at all, so
     ``nag_state.transition`` persists nothing -- the loop stays exactly as it was
-    (OPEN), never a phantom "sent". An ``idempotent`` short-circuit (the key was
-    already recorded this cycle -- a same-cycle retry) returns ``already_delivered``
-    having ALSO mutated nothing: no message was delivered, so nag_count is not bumped
-    and no second receipt is written. nag_count counts DELIVERED nags.
+    (OPEN), never a phantom "sent"; the result carries the gate ``act_id`` so the
+    caller can reconcile the now-undelivered executed act in the ledger. A post-gate
+    ``idempotent`` short-circuit (the rare TOCTOU race) returns ``already_delivered``
+    likewise carrying the ``act_id`` to reconcile, having mutated nothing: no message
+    was delivered, so nag_count is not bumped and no second receipt is written.
+    nag_count counts DELIVERED nags.
     """
     current = live.get(task_id)
     if (isinstance(current, dict) and current.get("ack")) or \
             nag_state.is_snoozed(current, now=ref):
         return {"status": "skipped"}  # raced with a close/snooze -- do nothing
 
+    # CADENCE COUPLING (P3): the period is local date + HOUR, so the dedup window
+    # assumes >= 1h spacing between scheduled fires (the 11/14/17 cadence -- each
+    # lands in a distinct clock hour). If the schedule is ever tightened to
+    # sub-hourly (two fires in one hour), the second would silently dedupe here to
+    # the same key -- a DROPPED nag with no log. A sub-hourly schedule MUST coarsen
+    # or re-key this period (e.g. include the minute) before tightening. See the
+    # module docstring; do NOT change the granularity without changing both halves.
+    idem_key = outbox.make_idem_key("nag", task_id, ref.strftime("%Y-%m-%d-%H"))
+
+    # PEEK BEFORE GATE: if this cycle's delivery is already recorded, this is a
+    # same-cycle idempotent retry. Short-circuit BEFORE _authorise_nag so gate() is
+    # never called and NO phantom ``executed`` act is logged for an undelivered fire.
+    # deliver_once re-checks under its own flock, so this peek is an optimisation, not
+    # the authority -- the rare post-peek TOCTOU is still caught + reconciled below.
+    if outbox.is_recorded(idem_key):
+        return {"status": "already_delivered"}
+
     authorised = _authorise_nag(record, section, overdue, dry_run=False)
     if not authorised["ok"]:
         return {"status": "blocked", "reason": authorised["reason"]}
+    # _authorise_nag's gate() has now logged an ``executed`` act under this act_id. If
+    # delivery does NOT happen below, the caller reconciles that act in the ledger.
+    act_id = authorised["act_id"]
 
     # Open a fresh loop unless there is ALREADY a genuine open nag loop (one that
     # has fired). An absent entry, an acked one, or a body-double-only STUB
@@ -373,34 +414,30 @@ def _fire_locked(live, task_id, record, section, overdue, *, ref, sender):
     # fresh loop mints a RANDOM id BEFORE the loop is persisted, so keying on it means
     # a process death between the outbox write and the state persist mints a new id
     # next run -> a new key -> a missed dedup -> a double-send. The idem-key keys only
-    # on DURABLE identity instead (see below).
+    # on DURABLE identity instead (task_id + period, computed above).
     nag_loop_id = (current.get("nag_loop_id") if not opened and isinstance(current, dict)
                    else nag_state.new_nag_loop_id())
-    # The idem-key identity is (task_id, period) -- DURABLE facts that survive a crash.
-    # PERIOD is the scheduled cron cycle = local date + hour (ref is
-    # cos_config.local_now() in production; the nag fires at 11/14/17 Pacific). So
-    # each distinct cycle is its OWN delivery -- the re-nag cadence is PRESERVED --
-    # while a same-cycle retry (a re-run within the hour) dedupes to a single send
-    # REGARDLESS of whether the loop was persisted, closing the first-fire double-send
-    # window. A later cycle is always a new delivery. Cadence itself is H5's job; H3
-    # only suppresses a duplicate of the SAME fire, never a scheduled re-nag.
-    idem_key = outbox.make_idem_key("nag", task_id, ref.strftime("%Y-%m-%d-%H"))
 
     target = authorised["delivery_target"]
     try:
         receipt = outbox.deliver_once(target, authorised["text"], idem_key, sender=sender)
     except Exception as exc:  # noqa: BLE001 -- a send failure is a per-task block,
         # not a run crash: leave the loop OPEN (state untouched), log it, move on.
+        # The gate already logged an executed act; carry act_id so the caller can
+        # emit nag_gate_act_undelivered and keep the audit trail reconcilable.
         return {"status": "delivery_failed", "reason": type(exc).__name__,
-                "message": str(exc)}
+                "message": str(exc), "act_id": act_id}
 
-    # An idempotent short-circuit means deliver_once did NOT call the sender: the
-    # message was already delivered THIS cycle, so this duplicate fire must not
-    # inflate nag_count or write a phantom second receipt. nag_count counts DELIVERED
-    # nags; a same-cycle retry is a no-op -- no open_loop, no record_sent, no ledger
-    # event. State is left untouched (transition persists nothing new).
+    # A post-gate idempotent short-circuit (the rare TOCTOU: another fire recorded
+    # the key between our peek and deliver_once's flock) means deliver_once did NOT
+    # call the sender: the message was already delivered THIS cycle, so this duplicate
+    # fire must not inflate nag_count or write a phantom second receipt. nag_count
+    # counts DELIVERED nags; this fire is a no-op -- no open_loop, no record_sent, no
+    # nag_sent. State is left untouched (transition persists nothing new). But gate()
+    # already logged an executed act, so carry act_id so the caller reconciles it.
     if receipt.get("idempotent"):
-        return {"status": "already_delivered"}
+        return {"status": "already_delivered", "act_id": act_id,
+                "reason": "idempotent_after_gate"}
 
     if opened:
         nag_state.open_loop(
@@ -424,8 +461,15 @@ def _apply_fire_result(result, task_id, section, counts) -> None:
         # WITHOUT calling the sender, so no message went out this fire. The genuine
         # delivery already logged its one nag_sent; logging again would write a
         # phantom second receipt for a single delivery and inflate the delivered
-        # count. So the ledger is untouched -- only an observability counter ticks.
+        # count. So the nag_sent ledger is untouched -- only an observability counter
+        # ticks. EXCEPT in the rare post-gate TOCTOU case (an act_id is present): the
+        # peek missed the dup, so _authorise_nag's gate() DID log an executed act for
+        # a fire that delivered nothing. Reconcile that act so the audit trail stays
+        # honest -- every gated-but-undelivered fire is reconcilable from the ledger.
         counts["idempotent"] = counts.get("idempotent", 0) + 1
+        if result.get("act_id"):
+            _log("nag_gate_act_undelivered", task_id=task_id,
+                 act_id=result["act_id"], reason=result.get("reason", "idempotent_after_gate"))
         return
     if status == "blocked":
         _log("nag_delivery_blocked", task_id=task_id, reason=result["reason"],
@@ -439,6 +483,14 @@ def _apply_fire_result(result, task_id, section, counts) -> None:
         # the failure and the next cycle retries.
         _log("nag_delivery_blocked", task_id=task_id, reason=result["reason"],
              section=section, stage="send", message=result.get("message"))
+        # gate() already logged an executed act for this fire, but nothing was
+        # delivered. Reconcile that act in the append-only ledger (we do NOT touch
+        # autonomy_gate's authoritative executed record -- the FIRST record stays the
+        # truth) so /undo + audit counting can tie this executed act to its
+        # non-delivery and not overstate what was pushed.
+        if result.get("act_id"):
+            _log("nag_gate_act_undelivered", task_id=task_id, act_id=result["act_id"],
+                 reason=result["reason"], stage="send")
         counts["blocked"] += 1
         return
     entry, target = result["entry"], result["delivery_target"]

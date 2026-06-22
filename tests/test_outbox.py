@@ -116,6 +116,20 @@ def test_deliver_once_sender_failure_records_nothing(state):
     assert _outbox(state)[key]["message_id"] == FAKE_ID
 
 
+# --- is_recorded peek ------------------------------------------------------
+
+def test_is_recorded_true_after_delivery_false_for_unseen_key(state):
+    """is_recorded peeks the outbox under the same flock as deliver_once: True once a
+    key has a recorded receipt, False for a key never delivered. This is the peek the
+    nag engine uses to skip gating a same-cycle duplicate fire."""
+    key = outbox.make_idem_key("nag", "tsk_x", "2026-06-22-11")
+    assert outbox.is_recorded(key) is False  # never delivered -> not recorded
+    outbox.deliver_once(TARGET, "hi", key, sender=lambda t, x: {"message_id": FAKE_ID})
+    assert outbox.is_recorded(key) is True  # recorded after a delivery
+    # An unrelated, never-delivered key is still unseen.
+    assert outbox.is_recorded(outbox.make_idem_key("nag", "tsk_other", "2026-06-22-11")) is False
+
+
 # --- openclaw_sender parsing -----------------------------------------------
 
 def _fake_run(stdout="", returncode=0, stderr=""):

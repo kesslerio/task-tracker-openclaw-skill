@@ -36,9 +36,10 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 try:
     import fcntl
@@ -131,6 +132,47 @@ def _prune_outbox(state: dict[str, Any]) -> None:
         del state[key]
 
 
+@contextmanager
+def _outbox_flock() -> Iterator[None]:
+    """Hold the exclusive sidecar flock over ``outbox.json`` (the same pattern
+    ``nag_state.transition`` uses) for the duration of the block.
+
+    Both ``deliver_once`` (read-modify-write) and ``is_recorded`` (read-only peek)
+    acquire the lock through HERE, so the peek sees a consistent snapshot relative
+    to a concurrent delivery -- it can never read a half-written ``outbox.json``,
+    and a delivery cannot land a new key inside a single peek's read.
+    """
+    state_dir()  # ensure the 0o700 dir exists before opening the lockfile
+    lock_path = outbox_lock_path()
+    with lock_path.open("a", encoding="utf-8") as lock_handle:
+        try:
+            os.fchmod(lock_handle.fileno(), 0o600)
+        except OSError:
+            pass
+        if fcntl is not None:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
+def is_recorded(idem_key: str) -> bool:
+    """Read-only peek: is ``idem_key`` already recorded (a receipt exists)?
+
+    Taken under the SAME sidecar flock ``deliver_once`` uses so the read is
+    consistent with concurrent deliveries. This lets the caller short-circuit a
+    same-cycle duplicate fire BEFORE gating -- avoiding the phantom ``executed``
+    autonomy-gate act that gating-then-discovering-the-dup would log. It is an
+    OPTIMISATION, never the authority: ``deliver_once`` re-checks the recorded key
+    under its own flock, so the rare TOCTOU (another fire records between this peek
+    and that flock) is still caught and deduped there.
+    """
+    with _outbox_flock():
+        return isinstance(_read_outbox().get(idem_key), dict)
+
+
 def deliver_once(
     delivery_target: dict[str, Any],
     text: str,
@@ -154,40 +196,30 @@ def deliver_once(
 
     A ``sender`` that raises propagates OUT of the lock having recorded NOTHING --
     the caller treats it as a delivery failure and leaves the nag loop OPEN. Only a
-    real receipt is ever recorded, so the outbox never contains a phantom send.
+    real receipt is ever recorded, so the outbox never contains a phantom send. This
+    under-flock recorded-key check is the AUTHORITATIVE dedup; an upstream
+    ``is_recorded`` peek is only an optimisation.
     """
-    state_dir()  # ensure the 0o700 dir exists before opening the lockfile
-    lock_path = outbox_lock_path()
-    with lock_path.open("a", encoding="utf-8") as lock_handle:
-        try:
-            os.fchmod(lock_handle.fileno(), 0o600)
-        except OSError:
-            pass
-        if fcntl is not None:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-        try:
-            state = _read_outbox()
-            recorded = state.get(idem_key)
-            if isinstance(recorded, dict):
-                return {
-                    "message_id": recorded.get("message_id"),
-                    "target": recorded.get("target"),
-                    "ts": recorded.get("ts"),
-                    "idempotent": True,
-                }
-            receipt = sender(delivery_target, text)
-            entry = {
-                "message_id": str(receipt["message_id"]),
-                "target": delivery_target,
-                "ts": _now_iso(),
+    with _outbox_flock():
+        state = _read_outbox()
+        recorded = state.get(idem_key)
+        if isinstance(recorded, dict):
+            return {
+                "message_id": recorded.get("message_id"),
+                "target": recorded.get("target"),
+                "ts": recorded.get("ts"),
+                "idempotent": True,
             }
-            state[idem_key] = entry
-            _prune_outbox(state)  # drop stale periods so outbox.json stays flat
-            _write_outbox(state)
-            return {**entry, "idempotent": False}
-        finally:
-            if fcntl is not None:
-                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        receipt = sender(delivery_target, text)
+        entry = {
+            "message_id": str(receipt["message_id"]),
+            "target": delivery_target,
+            "ts": _now_iso(),
+        }
+        state[idem_key] = entry
+        _prune_outbox(state)  # drop stale periods so outbox.json stays flat
+        _write_outbox(state)
+        return {**entry, "idempotent": False}
 
 
 class OpenclawSendError(RuntimeError):
