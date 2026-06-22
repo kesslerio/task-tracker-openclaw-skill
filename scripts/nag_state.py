@@ -320,6 +320,31 @@ def active_body_double_session(
     return None
 
 
+def session_by_id(state: dict[str, Any], session_id: str) -> dict[str, Any] | None:
+    """The body-double/focus session with this ``session_id`` that is NOT user-closed.
+
+    Scans EVERY task entry's ``body_double_sessions`` and returns the session whose id
+    matches, iff ``ended_at`` is unset. Unlike ``active_body_double_session`` (which
+    returns the FIRST non-ended session per entry and never matches an id), this is
+    keyed on the id, so a STALE elapsed-but-unclosed predecessor in a ``/start``
+    continue-chain -- which sits first in the list with ``ended_at`` unset -- never
+    masks the live session a check-in cron is firing for. It applies NO elapsed gate
+    (the end check-in fires AT ``ends_at``); only an explicit ``/done`` /
+    ``/cancel-session`` (which stamp ``ended_at``) close a session here.
+    """
+    if not isinstance(state, dict):
+        return None
+    for entry in state.values():
+        if not isinstance(entry, dict):
+            continue
+        for session in entry.get("body_double_sessions") or []:
+            if (isinstance(session, dict)
+                    and session.get("session_id") == session_id
+                    and not session.get("ended_at")):
+                return session
+    return None
+
+
 def _session_elapsed(session: dict[str, Any], now: datetime) -> bool:
     """Has this session's block ended by ``now`` (a parseable ``ends_at <= now``)?
 

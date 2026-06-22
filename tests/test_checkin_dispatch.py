@@ -326,6 +326,32 @@ def test_done_ends_the_live_session_not_a_stale_elapsed_one(env, monkeypatch):
     assert result["sent"] is False and sent == []
 
 
+def test_continue_chain_dispatches_live_block_not_stale_predecessor(env, monkeypatch):
+    """REGRESSION (continue loop): a /start -> elapse -> /start chain leaves a STALE
+    unended block1 FIRST in the list. block2's check-in must resolve block2 BY ID and
+    SEND -- a 'first-active' lookup would return block1, mismatch the id, and silently
+    drop the live block's check-ins."""
+    board, state = env
+    monkeypatch.setattr(nag_commands, "_now", lambda: REF)
+    block1 = nag_commands.handle_start("tsk_abc123", "25m", create_cron=lambda d: "c1")
+    assert block1["ok"] is True
+    # Elapse block1 (never /done'd), then /start again -> live block2.
+    monkeypatch.setattr(nag_commands, "_now", lambda: REF + timedelta(hours=1))
+    block2 = nag_commands.handle_start("tsk_abc123", "25m", create_cron=lambda d: "c2")
+    assert block2["ok"] is True and block2["session_id"] != block1["session_id"]
+    sessions = _state(state)["tsk_abc123"]["body_double_sessions"]
+    assert sessions[0]["session_id"] == block1["session_id"]   # stale predecessor FIRST
+    assert sessions[0].get("ended_at") is None                  # ...and unended
+    # block2's end check-in fires at block2's ends_at -> must find block2 and SEND.
+    monkeypatch.setattr(checkin_dispatch, "_now",
+                        lambda: REF + timedelta(hours=1, minutes=25))
+    sent, sender = _recording_sender()
+    result = checkin_dispatch.run_dispatch(
+        block2["session_id"], "tsk_abc123", 25, is_final=True, sender=sender)
+    assert result["sent"] is True
+    assert len(sent) == 1
+
+
 # --- CLI: argv contract + no-raw-leak envelope ----------------------------------
 
 def test_cli_dispatch_active_session_via_main(env, monkeypatch, capsys):

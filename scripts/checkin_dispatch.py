@@ -212,12 +212,13 @@ def _find_dispatchable_session(session_id: str) -> dict[str, Any] | None:
     ``/done`` / ``/cancel-session`` (which stamp ``ended_at``) close a session here.
     (The one-per-task ``/start`` guard still passes ``now`` elsewhere, so an
     elapsed-but-undisposed session never blocks a fresh start -- different purpose.)
+
+    Matching is by ``session_id`` (``nag_state.session_by_id``), NOT "first active":
+    a ``/start`` continue-chain leaves a STALE elapsed-but-unclosed predecessor first
+    in the list, and a first-active lookup would return it, mismatch the id, and drop
+    the live block's check-ins.
     """
-    for entry in nag_state.read_state().values():
-        session = nag_state.active_body_double_session(entry)
-        if session is not None and session.get("session_id") == session_id:
-            return session
-    return None
+    return nag_state.session_by_id(nag_state.read_state(), session_id)
 
 
 def main(argv: list[str] | None = None) -> int:
