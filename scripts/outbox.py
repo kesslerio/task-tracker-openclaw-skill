@@ -58,7 +58,12 @@ from utils import _atomic_write
 #   dedupe identity: each check-in is a single logical send for its session phase,
 #   so a deterministic-dispatcher cron RETRY (the command cron re-runs) can never
 #   double-send the same halfway/end nudge.
-_KNOWN_KINDS: frozenset[str] = frozenset({"nag", "checkin"})
+# * ``ledger`` -- a U5 weekly brag digest, keyed on (harvest_window_id, kind) where
+#   kind is ``auto`` (the scheduled Friday push). The window+kind (not a clock
+#   period) is the dedupe identity: one digest per window per kind, so a cron retry
+#   AFTER a successful send short-circuits to the recorded receipt and never
+#   double-sends the same Friday digest.
+_KNOWN_KINDS: frozenset[str] = frozenset({"nag", "checkin", "ledger"})
 
 
 def _now_iso() -> str:

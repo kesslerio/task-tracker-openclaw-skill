@@ -111,11 +111,31 @@ def _stub_sources(monkeypatch, *, gh_payload=None, gog_payload=None, gh_rc=0, go
     monkeypatch.setattr(harvest_ledger.subprocess, "run", fake_run)
 
 
-def _run(monkeypatch, *, auto, now, since="2026-01-01", dry_run=False):
+def fake_sender(record=None, *, message_id="msg-1"):
+    """A deliver_once-shaped fake sender: records (target, draft) and returns a canned
+    ``{"message_id": ...}`` receipt. NEVER calls real openclaw. The auto digest now
+    OWNS its send through the receipt-backed outbox, so a receipt-returning sender is
+    required for an auto run to consume state (mirrors test_nag_check.fake_sender)."""
+    calls = record if record is not None else []
+
+    def _send(target, draft):
+        calls.append((target, draft))
+        return {"message_id": message_id}
+
+    return _send
+
+
+def _run(monkeypatch, *, auto, now, since="2026-01-01", dry_run=False, sender=None):
+    # On the AUTO path the digest delivers itself (receipt-backed outbox), so inject a
+    # fake receipt-returning sender by default; tests that exercise a transport FAILURE
+    # pass their own raising sender. The reactive path ignores ``sender`` (the relay
+    # delivers there).
+    if auto and sender is None and not dry_run:
+        sender = fake_sender()
     return harvest_ledger.run_harvest(
         "week", since_override=since, dry_run=dry_run,
         trigger="cron:ledger_harvest" if auto else "user_command:/ledger",
-        auto=auto, now=now,
+        auto=auto, now=now, sender=sender,
     )
 
 
@@ -266,6 +286,113 @@ def test_suppressed_auto_run_consumes_no_evidence(env, monkeypatch):
     delivered = _run(monkeypatch, auto=True, now=FRIDAY)
     assert delivered["draft_pushed"] is True
     assert delivered["evidence_count"] == 1
+
+
+# === V2 (O3 HIGH 1): the AUTO digest is RECEIPT-BACKED, not consume-on-proof ==
+# The scheduled Friday digest now OWNS its delivery through the receipt-backed outbox
+# and consumes NOTHING until the transport returns a message-id receipt. A relay/
+# transport failure can no longer lose the digest AND false-green the ritual.
+
+
+def _raising_sender(exc=None):
+    """A sender that simulates a transport FAILURE: it RAISES (the openclaw_sender
+    contract on a non-zero exit / unparseable output), so deliver_once records no
+    receipt and the auto path consumes nothing."""
+
+    def _send(target, draft):
+        raise (exc or RuntimeError("simulated transport failure"))
+
+    return _send
+
+
+def test_auto_digest_consumes_on_receipt(env, monkeypatch):
+    """A receipt-returning sender => the digest is DELIVERED: evidence + wins marked
+    seen, ledger_draft_pushed logged (carrying the message-id receipt), auto_pushed_
+    window set, and the receipt recorded under the idem-key."""
+    _set_productivity_env(monkeypatch)
+    _stub_sources(monkeypatch, gh_payload=PR_PAYLOAD)
+    harvest_ledger.capture_win("shipped the pricing deck")
+
+    sent: list = []
+    result = _run(monkeypatch, auto=True, now=FRIDAY, sender=fake_sender(sent, message_id="m-77"))
+    assert result["draft_pushed"] is True
+    assert len(sent) == 1  # the script OWNED the send (one outbox delivery)
+    # Evidence consumed.
+    state = harvest_state.load_state()
+    assert state["seen_hashes"]
+    assert state["auto_pushed_window"] == harvest_state.window_id("week")
+    # Wins consumed.
+    assert win_store.read_unseen_wins() == []
+    # ledger_draft_pushed logged WITH the receipt message-id + idem-key.
+    pushed = [json.loads(l) for l in env["ledger"].read_text().splitlines()
+              if l.strip() and json.loads(l)["event_type"] == "ledger_draft_pushed"]
+    assert len(pushed) == 1
+    assert pushed[0]["metadata"]["message_id"] == "m-77"
+    # The receipt is recorded under the ledger idem-key.
+    import outbox  # noqa: PLC0415
+    idem_key = outbox.make_idem_key("ledger", harvest_state.window_id("week"), "auto")
+    assert outbox.get_receipt(idem_key)["message_id"] == "m-77"
+
+
+def test_auto_digest_no_receipt_consumes_nothing_and_reattempts(env, monkeypatch):
+    """A sender that RAISES (transport failure) => the digest delivered NOTHING:
+    evidence NOT consumed, wins NOT consumed, NO ledger_draft_pushed, auto_pushed_
+    window NOT set, push_blocked_reason carried. A SECOND fire re-attempts the send."""
+    _set_productivity_env(monkeypatch)
+    _stub_sources(monkeypatch, gh_payload=PR_PAYLOAD)
+    harvest_ledger.capture_win("closed the Acme deal")
+
+    first = _run(monkeypatch, auto=True, now=FRIDAY, sender=_raising_sender())
+    assert first["draft_pushed"] is False
+    assert first["push_blocked_reason"].startswith("delivery_failed:")
+    # NOTHING consumed: no state persisted at all (no pushed-window, no seen evidence).
+    assert harvest_state.load_state() is None
+    assert [w["text"] for w in win_store.read_unseen_wins()] == ["closed the Acme deal"]
+    assert "ledger_draft_pushed" not in _ledger_event_types(env["ledger"])
+
+    # A SECOND fire re-attempts the send (deliver_once is called again -- the prior
+    # failure recorded no receipt, so it is not short-circuited).
+    _stub_sources(monkeypatch, gh_payload=PR_PAYLOAD)
+    sent: list = []
+    second = _run(monkeypatch, auto=True, now=FRIDAY, sender=fake_sender(sent, message_id="m-9"))
+    assert len(sent) == 1  # the re-attempt actually called the sender
+    assert second["draft_pushed"] is True
+    assert second["evidence_count"] == 1  # the same PR is re-harvested + now delivered
+    assert win_store.read_unseen_wins() == []  # the win is finally delivered
+
+
+def test_auto_digest_refire_after_success_does_not_double_send(env, monkeypatch):
+    """After a SUCCESSFUL send, a re-fire of the SAME window+kind does NOT double-send:
+    deliver_once short-circuits on the recorded receipt and the evidence is already
+    seen (so the harvest finds no new evidence -> no_new_evidence / already_pushed)."""
+    _set_productivity_env(monkeypatch)
+    _stub_sources(monkeypatch, gh_payload=PR_PAYLOAD)
+
+    sent: list = []
+    first = _run(monkeypatch, auto=True, now=FRIDAY, sender=fake_sender(sent, message_id="m-1"))
+    assert first["draft_pushed"] is True
+    assert len(sent) == 1
+
+    # Re-fire the SAME window+kind. The auto_pushed_window dedup short-circuits before
+    # the send, AND even if it did not, deliver_once would short-circuit on the receipt.
+    _stub_sources(monkeypatch, gh_payload=PR_PAYLOAD)
+    second = _run(monkeypatch, auto=True, now=FRIDAY, sender=fake_sender(sent, message_id="m-2"))
+    assert second["draft_pushed"] is False
+    assert second["reason"] in ("no_new_evidence", "already_pushed")
+    assert len(sent) == 1  # NO second send -- the digest was not double-delivered
+
+
+def test_auto_digest_proof_without_receipt_records_health_failure(env, monkeypatch):
+    """A digest that PROVED a target but FAILED to deliver records a ledger_harvest
+    health FAILURE -- no false-green (the exact O3 HIGH 1 invariant) -- on the real
+    cron CLI flow."""
+    _set_productivity_env(monkeypatch)
+    _stub_sources(monkeypatch, gh_payload=PR_PAYLOAD)
+    _run_cli_auto(monkeypatch, sender=_raising_sender())
+    entry = cos_health.read_health()["ledger_harvest"]
+    assert entry.get("last_success_ts") is None
+    assert entry["last_failure"]["error_class"] == "push_blocked"
+    assert entry["last_failure"]["trigger"] == "cron:ledger_harvest"
 
 
 # === DONE 2: /win frictionless capture + round-trip into the digest ==========
@@ -443,13 +570,19 @@ def test_cron_harvest_records_success_and_manifest_not_missing(env, monkeypatch)
     assert not any("MISSING ledger_harvest" in line for line in lines)
 
 
-def _run_cli_auto(monkeypatch, since="2026-01-01"):
+def _run_cli_auto(monkeypatch, since="2026-01-01", *, sender=None):
     """Drive the REAL cron CLI path (--auto) so health is recorded by the real flow.
 
     The CLI does not take ``now``, so force the Friday digest-day gate open here --
     the tests target the harvest/push/health behavior, not the day gate (that is
-    covered by the DONE-1 tests)."""
+    covered by the DONE-1 tests). The auto digest delivers itself through the
+    receipt-backed outbox, so the default ``openclaw_sender`` is replaced with a fake
+    receipt-returning sender (or a test-supplied raising one) -- the CLI never reaches
+    real Telegram. A test exercising a BLOCKED push (env unset) never reaches the send,
+    so the sender is moot there."""
     monkeypatch.setattr(harvest_ledger, "is_digest_day", lambda now=None: True)
+    monkeypatch.setattr(harvest_ledger.ledger_delivery.outbox, "openclaw_sender",
+                        sender or fake_sender())
     import argparse as _argparse
     args = _argparse.Namespace(window="week", since=since, dry_run=False, json=True, auto=True)
     return harvest_ledger._run_harvest_cli(args)
