@@ -576,6 +576,30 @@ def _deliver_more_pointer(deferred: int) -> None:
              message=str(exc))
 
 
+def _record_nag_health(*, blocked: int = 0, crashed: str | None = None) -> None:
+    """Best-effort: record this cron fire's outcome to the machine-visible health map.
+
+    A HARD crash (``crashed`` = the exception class) or a swallowed delivery failure
+    (``blocked > 0``) is a health FAILURE; an otherwise-clean real run is a success.
+    Recorded DIRECTLY (not via the exit code) because the cron's shell wrapper would turn
+    a nonzero exit into a user-facing "unavailable" announce -- and because nag_check
+    catches its own crash and returns 0, so the shell's log_subprocess_error never fires
+    either; without recording here a crashing nag_check would false-green until STALE.
+    Wrapped so a broken/absent ``cos_health`` can never change the nag run.
+    """
+    try:
+        import cos_health  # noqa: PLC0415 -- lazy + wrapped: health is best-effort
+        if crashed is not None:
+            cos_health.record_failure("nag_check", error_class=crashed, trigger="cron:nag_check")
+        elif blocked > 0:
+            cos_health.record_failure("nag_check", error_class="nag_delivery_blocked",
+                                      trigger="cron:nag_check")
+        else:
+            cos_health.record_success("nag_check")
+    except Exception:  # noqa: BLE001 -- health recording is best-effort, never fatal
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="nag_check.py", description=__doc__)
     parser.add_argument("--dry-run", action="store_true",
@@ -614,6 +638,19 @@ def main(argv: list[str] | None = None) -> int:
                   f"{counts['closed']} closed, {counts['blocked']} blocked, "
                   f"{counts['deferred']} deferred")
         print(footer, file=sys.stdout if args.dry_run else sys.stderr)
+        # R1: a SWALLOWED per-task delivery failure (run_nag_check absorbs every transport
+        # failure into ``counts['blocked']``, leaving the loops OPEN) must be machine-
+        # visible WITHOUT a user-facing regression. The cron runs this via the shell
+        # ``run_with_envelope``, which turns a NONZERO exit into a "nag_check is
+        # unavailable" notice it blind-announces -- so a partial-delivery cycle (most nags
+        # sent) must NOT exit nonzero. Instead record the outcome to the health substrate
+        # DIRECTLY and return 0: a blocked run is a health FAILURE (-> DEGRADED), an
+        # otherwise-clean real run is a success, and the cron announces only the real nags.
+        # (The reactive ``/nag`` path returns early at ``--list`` above, so only the cron
+        # fire records ``nag_check`` health -- no reactive-run conflation.) A dry-run never
+        # delivers, so it records nothing.
+        if not args.dry_run:
+            _record_nag_health(blocked=counts["blocked"])
         return 0
     except Exception as exc:  # noqa: BLE001 -- top-level NO-RAW-ERROR-LEAK boundary
         error_envelope.log_error(
@@ -621,6 +658,9 @@ def main(argv: list[str] | None = None) -> int:
             message="nag-check run failed", raw=repr(exc),
             trigger="cron:nag_check",
         )
+        # R1: a HARD crash is the worst silently-broken-cron case -- record a health
+        # FAILURE (best-effort) so it shows DEGRADED, not false-green-until-STALE.
+        _record_nag_health(crashed=type(exc).__name__)
         print(SAFE_ENVELOPE)
         return 0  # exit 0 so cron does not treat as failure
 

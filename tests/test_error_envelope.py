@@ -384,15 +384,27 @@ def test_classify_anchored_patterns_avoid_false_positives():
     assert error_envelope.classify(None, stderr="connection reset by peer") == error_envelope.TRANSIENT
 
 
-def test_run_main_preserves_main_return_code(monkeypatch, tmp_path):
+def test_run_main_nonzero_result_records_failure_and_returns_the_code(monkeypatch, tmp_path):
+    """R1 Fix 1: a handled-but-failed ritual (main() returns a NONZERO int) is NOT healthy.
+    run_main records a health FAILURE (error_class ``nonzero_exit``) AND returns the ACTUAL
+    code -- it does NOT coerce to 0. Coercing would silently defeat an intentional
+    diagnostic exit code (e.g. ``preflight --strict-exit``); the exit-0-for-the-cron
+    contract is the ritual's/shell-wrapper's job, not run_main's."""
+    import cos_health  # noqa: PLC0415
+
     monkeypatch.setenv("TASK_MGMT_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("TASK_TRACKER_ERROR_LOG", str(tmp_path / "errors.jsonl"))
     monkeypatch.setenv("TASK_TRACKER_LEDGER_FILE", str(tmp_path / "events.jsonl"))
 
     def main_func():
-        return 3  # a non-zero success signal must be preserved, not forced to 0
+        return 3  # a handled-but-failed / diagnostic ritual return code
 
-    assert error_envelope.run_main("standup", main_func) == 3
+    rc = error_envelope.run_main("standup", main_func, trigger="cron:c99")
+    assert rc == 3  # the ACTUAL code is preserved (preflight --strict-exit stays meaningful)
+    entry = cos_health.read_health()["standup"]
+    assert entry["last_failure"]["error_class"] == "nonzero_exit"
+    assert entry["last_failure"]["trigger"] == "cron:c99"
+    assert "last_success_ts" not in entry  # a nonzero result records NO success
 
 
 def test_done_failure_surfaces_friendly_line(tmp_path):
@@ -556,6 +568,50 @@ def test_run_main_failure_records_health_and_no_raw_leak(monkeypatch, tmp_path, 
     assert "last_success_ts" not in entry  # a pure failure records no success
 
 
+def test_log_subprocess_error_records_health_failure(monkeypatch, tmp_path):
+    """R1 Fix 3: a failed subprocess is machine-visible in cos-health.json. For the cron
+    rituals that run through the shell wrapper (nag_check, ledger_harvest) -- NOT through
+    run_main -- log_subprocess_error is the ONLY place the failure is recorded, so it must
+    stamp a health failure too (else a return-code soft failure false-greens). The
+    error_class is the one classify() derives from the captured stderr."""
+    import cos_health  # noqa: PLC0415
+
+    monkeypatch.setenv("TASK_MGMT_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("TASK_TRACKER_ERROR_LOG", str(tmp_path / "errors.jsonl"))
+    monkeypatch.setenv("TASK_TRACKER_LEDGER_FILE", str(tmp_path / "events.jsonl"))
+
+    error_envelope.log_subprocess_error(
+        "nag_check", ["python3", "nag_check.py"], 1,
+        "connection reset by peer", "user_command:/nag_check")
+    entry = cos_health.read_health()["nag_check"]
+    # classify("connection reset by peer") -> TRANSIENT; recorded as the failure class.
+    assert entry["last_failure"]["error_class"] == error_envelope.TRANSIENT
+    assert entry["last_failure"]["trigger"] == "user_command:/nag_check"
+    # And the structured error log still got its entry (Fix 3 ADDS health, keeps logging).
+    log = json.loads((tmp_path / "errors.jsonl").read_text().splitlines()[-1])
+    assert log["component"] == "nag_check" and log["check"] == "subprocess"
+
+
+def test_log_subprocess_error_health_failure_is_best_effort(monkeypatch, tmp_path):
+    """A raising cos_health.record_failure must NOT escalate a subprocess log into a new
+    failure -- log_subprocess_error stays best-effort (the shell wrapper already owns the
+    friendly notice). The error-log entry is still written even when health recording
+    raises."""
+    import cos_health  # noqa: PLC0415
+
+    monkeypatch.setenv("TASK_MGMT_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("TASK_TRACKER_ERROR_LOG", str(tmp_path / "errors.jsonl"))
+    monkeypatch.setenv("TASK_TRACKER_LEDGER_FILE", str(tmp_path / "events.jsonl"))
+    monkeypatch.setattr(cos_health, "record_failure",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("health on fire")))
+
+    # Must not raise despite the broken recorder.
+    error_envelope.log_subprocess_error(
+        "ledger_harvest", ["python3", "harvest_ledger.py"], 1, "boom", "cron:harvest")
+    log = json.loads((tmp_path / "errors.jsonl").read_text().splitlines()[-1])
+    assert log["component"] == "ledger_harvest"
+
+
 def test_run_main_clean_run_records_success(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("TASK_MGMT_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("TASK_TRACKER_ERROR_LOG", str(tmp_path / "errors.jsonl"))
@@ -597,3 +653,13 @@ def test_health_recording_failure_never_breaks_envelope(monkeypatch, tmp_path, c
     # Clean path: a raising record_success does not turn a good run into a failure.
     rc2 = error_envelope.run_main("standup", lambda: 0)
     assert rc2 == 0
+
+    # R1 Fix 1 nonzero path: a raising record_failure on a nonzero RESULT must not change
+    # what run_main returns -- it still returns the ACTUAL code (run_main no longer coerces
+    # to 0) and prints nothing itself. Health recording stays best-effort across all three
+    # outcome paths.
+    capsys.readouterr()  # drain
+    rc3 = error_envelope.run_main("standup", lambda: 1)
+    out3 = capsys.readouterr().out
+    assert rc3 == 1  # the code is preserved; the raising recorder did not alter it
+    assert out3 == ""  # the nonzero-result path prints nothing itself

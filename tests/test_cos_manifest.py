@@ -82,6 +82,127 @@ def test_health_flags_never_run_ritual_as_stale(capsys):
     assert "last_failure: auth" in out  # the last bad run is surfaced too
 
 
+# --- R1 Fix 4: DEGRADED on a fresh failure + the expected-ritual registry --------
+
+
+def test_r1_newer_failure_is_degraded_not_ok(capsys):
+    """R1 Fix 4: a ritual whose last_failure_ts is NEWER than its (still-fresh)
+    last_success_ts is DEGRADED, not OK. A ritual that ran and BROKE must not read OK
+    just because the older success is inside the stale window -- the most-recent outcome
+    is a failure, the loudest signal."""
+    now = cos_config.local_now()
+    success = (now - timedelta(hours=2)).isoformat()  # fresh success...
+    failure = (now - timedelta(hours=1)).isoformat()  # ...but a NEWER failure
+    _write_health({"standup": {
+        "last_success_ts": success,
+        "last_failure": {"error_class": "transient", "ts": failure},
+        "last_failure_ts": failure,
+    }})
+    cos_manifest.main(["health"])
+    out = capsys.readouterr().out
+    assert "DEGRADED standup" in out
+    assert "OK standup" not in out  # NOT a false-green
+    assert "last_failure: transient" in out  # the bad run is still surfaced
+
+
+def test_r1_failure_equal_to_success_is_degraded(capsys):
+    """The boundary: last_failure_ts EQUAL to last_success_ts is DEGRADED (>= is the
+    documented rule -- a failure at least as recent as the last good run)."""
+    ts = cos_config.local_now().isoformat()
+    _write_health({"nag_check": {
+        "last_success_ts": ts,
+        "last_failure": {"error_class": "nonzero_exit", "ts": ts},
+        "last_failure_ts": ts,
+    }})
+    cos_manifest.main(["health"])
+    assert "DEGRADED nag_check" in capsys.readouterr().out
+
+
+def test_r1_older_failure_then_newer_success_is_ok(capsys):
+    """A failure OLDER than a newer success is a RECOVERED ritual -- OK, not DEGRADED.
+    The fresh-failure rule must not flag a ritual that already recovered."""
+    now = cos_config.local_now()
+    failure = (now - timedelta(hours=5)).isoformat()  # older failure...
+    success = (now - timedelta(hours=1)).isoformat()  # ...then a newer success
+    _write_health({"standup": {
+        "last_success_ts": success,
+        "last_failure": {"error_class": "auth", "ts": failure},
+        "last_failure_ts": failure,
+    }})
+    cos_manifest.main(["health"])
+    out = capsys.readouterr().out
+    assert "OK standup" in out
+    assert "DEGRADED standup" not in out
+
+
+def test_r1_registered_ritual_never_run_is_missing(capsys):
+    """A REGISTERED ritual with NO health entry at all (never ran) is flagged MISSING --
+    the registry is iterated even when health.json lacks the entry, so a never-started
+    ritual is visible, not silently absent. Here only standup is recorded; nag_check and
+    the rest are MISSING."""
+    _write_health({"standup": {"last_success_ts": cos_config.local_now().isoformat()}})
+    cos_manifest.main(["health"])
+    out = capsys.readouterr().out
+    assert "OK standup" in out  # the one recorded ritual is OK...
+    # ...and every OTHER registered ritual that never ran is MISSING, not absent.
+    for missing in ("nag_check", "weekly_review", "eod_review"):
+        assert f"MISSING {missing}: last_success never" in out
+
+
+def test_r1_registry_iterated_when_health_json_lacks_entry(capsys):
+    """Even with a health.json that records ONLY an unregistered ad-hoc ritual, every
+    REGISTERED ritual still appears (MISSING) -- the view is registry UNION recorded, so
+    a registered ritual is never dropped just because the file has no entry for it."""
+    _write_health({"some_adhoc_ritual": {"last_success_ts": cos_config.local_now().isoformat()}})
+    cos_manifest.main(["health"])
+    out = capsys.readouterr().out
+    for ritual in cos_manifest._EXPECTED_RITUALS:
+        assert f"MISSING {ritual}" in out
+    # The unregistered recorded ritual is still shown (with its own OK/STALE status).
+    assert "some_adhoc_ritual" in out
+
+
+def test_r1_per_ritual_cadence_weekly_review_ok_at_100h(capsys):
+    """weekly_review's registry cadence is 192h, so a clean run 100h ago is OK -- it is
+    judged against ITS OWN cadence, NOT the global 36h default (which would false-STALE a
+    healthy weekly ritual for ~5 of every 7 days)."""
+    ts = (cos_config.local_now() - timedelta(hours=100)).isoformat()
+    _write_health({"weekly_review": {"last_success_ts": ts}})
+    cos_manifest.main(["health"])
+    out = capsys.readouterr().out
+    assert "OK weekly_review" in out  # 100h < 192h cadence -> OK
+
+
+def test_r1_per_ritual_cadence_daily_ritual_stale_past_its_window(capsys):
+    """A daily-cadence ritual (standup, 24h) IS stale at 40h -- the per-ritual cadence
+    tightens as well as loosens; only the registry value is used, not the global default."""
+    ts = (cos_config.local_now() - timedelta(hours=40)).isoformat()
+    _write_health({"standup": {"last_success_ts": ts}})
+    cos_manifest.main(["health"])
+    out = capsys.readouterr().out
+    assert "STALE standup" in out  # 40h > 24h cadence -> STALE
+
+
+def test_r1_fresh_success_no_newer_failure_is_ok(capsys):
+    """The OK baseline under the new rule: a recent success with no failure at all (or
+    only an older one) reads OK -- Fix 4 does not over-flag a healthy ritual."""
+    _write_health({"standup": {"last_success_ts": cos_config.local_now().isoformat()}})
+    cos_manifest.main(["health"])
+    assert "OK standup" in capsys.readouterr().out
+
+
+def test_r1_failure_without_success_stays_stale(capsys):
+    """A ritual with a failure but NO recorded success is STALE-by-absent-success, NOT
+    DEGRADED: there is no good run to be 'newer than', so the staleness story holds.
+    (Pins the documented precedence boundary so DEGRADED requires a comparable success.)"""
+    _write_health({"standup": {"last_failure": {"error_class": "auth", "ts": "x"},
+                               "last_failure_ts": "x"}})
+    cos_manifest.main(["health"])
+    out = capsys.readouterr().out
+    assert "STALE standup" in out
+    assert "DEGRADED standup" not in out
+
+
 def test_health_threshold_is_configurable(capsys):
     at_30h = (cos_config.local_now() - timedelta(hours=30)).isoformat()
     _write_health({"r": {"last_success_ts": at_30h}})
@@ -92,9 +213,18 @@ def test_health_threshold_is_configurable(capsys):
     assert "OK r" in capsys.readouterr().out
 
 
-def test_health_empty_when_nothing_recorded(capsys):
+def test_health_empty_shows_registry_rituals_as_missing(capsys):
+    """R1 Fix 4: with NOTHING recorded, the expected-ritual registry is still iterated --
+    every registered ritual that has never run is flagged MISSING (a kind of STALE), so
+    a never-started ritual is LOUD, not silently absent. This replaces the pre-R1
+    'No ritual health recorded yet.' empty line (the registry is never empty)."""
     cos_manifest.main(["health"])
-    assert "No ritual health recorded yet." in capsys.readouterr().out
+    out = capsys.readouterr().out
+    for ritual in ("standup", "nag_check", "weekly_review", "eod_review"):
+        assert f"MISSING {ritual}: last_success never" in out
+    # ledger_harvest is intentionally NOT registered (no health-recording path yet), so
+    # it must NOT appear as a false-MISSING alarm.
+    assert "ledger_harvest" not in out
 
 
 # --- skill_version best-effort ----------------------------------------------

@@ -29,6 +29,7 @@ import task_records  # noqa: E402
 import task_ledger  # noqa: E402
 import nag_state  # noqa: E402
 import nag_check  # noqa: E402
+import error_envelope  # noqa: E402
 
 PRODUCTIVITY = "-4242424242"
 WORK_GROUP = "-5252525252"
@@ -380,6 +381,103 @@ def test_run_nag_check_requires_transport_for_real_run(harness):
     """A real run with no transport raises rather than silently delivering nothing."""
     with pytest.raises(ValueError):
         nag_check.run_nag_check()  # no send, not dry-run
+
+
+# --- R1 Fix 2: a swallowed delivery failure surfaces as a NONZERO main() code -----
+
+def test_r1_blocked_run_records_health_failure_returns_zero(tmp_path, monkeypatch, capsys):
+    """A swallowed per-task transport failure (counts['blocked']>0, loop left OPEN) is
+    recorded as a health FAILURE for nag_check DIRECTLY, and main() returns 0 -- so the
+    cron's shell wrapper never turns it into a user-facing "unavailable" announce. Env
+    unset => the nag is delivery-blocked at the prove stage without any real send."""
+    import cos_health  # noqa: PLC0415
+    board = tmp_path / "Work Tasks.md"
+    board.write_text(BOARD, encoding="utf-8")
+    state = tmp_path / "state"
+    _set_env(monkeypatch, board, state)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID_PRODUCTIVITY", raising=False)  # delivery-blocked
+    monkeypatch.setattr(nag_check, "_today", lambda: REF)
+    rc = nag_check.main([])
+    err = capsys.readouterr().err
+    assert rc == 0  # NO nonzero -> the shell wrapper does not announce "unavailable"
+    assert "1 blocked" in err  # the footer still reports the blocked count (unchanged)
+    entry = cos_health.read_health()["nag_check"]
+    assert entry["last_failure"]["error_class"] == "nag_delivery_blocked"
+    assert "last_success_ts" not in entry  # a blocked run is NOT recorded healthy
+    on_disk = _state(state)
+    assert "tsk_abc123" not in on_disk or on_disk["tsk_abc123"]["ack"] is False  # loop OPEN
+
+
+def test_r1_sender_failure_records_health_failure_returns_zero(harness, monkeypatch, capsys):
+    """A transport FAILURE (the sender raises) is swallowed into counts['blocked'] with the
+    loop OPEN; main() records a health failure directly and returns 0 (no user-facing
+    'unavailable' announce on the cron path)."""
+    import cos_health  # noqa: PLC0415
+    board, state = harness
+    def boom(target, text):
+        raise nag_check.outbox.OpenclawSendError("gateway unreachable")
+    monkeypatch.setattr(nag_check.outbox, "openclaw_sender", boom)
+    rc = nag_check.main([])
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "0 sent" in err and "1 blocked" in err
+    assert cos_health.read_health()["nag_check"]["last_failure"]["error_class"] == "nag_delivery_blocked"
+
+
+def test_r1_clean_run_records_health_success_returns_zero(harness, monkeypatch, capsys):
+    """A clean real run (a nag delivered, nothing blocked) records a health SUCCESS and
+    returns 0."""
+    import cos_health  # noqa: PLC0415
+    board, state = harness
+    monkeypatch.setattr(nag_check.outbox, "openclaw_sender", fake_sender([]))
+    rc = nag_check.main([])
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "1 sent" in err and "0 blocked" in err
+    entry = cos_health.read_health()["nag_check"]
+    assert "last_success_ts" in entry and "last_failure" not in entry
+
+
+def test_r1_idle_run_records_health_success(tmp_path, monkeypatch, capsys):
+    """An idle cycle (nothing overdue) is a HEALTHY run -- record success, return 0 (the
+    cron fired fine, there was just nothing to nag)."""
+    import cos_health  # noqa: PLC0415
+    board = tmp_path / "Work Tasks.md"
+    board.write_text(
+        "# Work\n\n## 🟡 Q2\n- [ ] **Soon** task_id::tsk_future 🗓️2026-07-15 area:: Ops\n",
+        encoding="utf-8")
+    state = tmp_path / "state"
+    _set_env(monkeypatch, board, state)
+    monkeypatch.setattr(nag_check, "_today", lambda: REF)
+    rc = nag_check.main([])
+    capsys.readouterr()
+    assert rc == 0
+    assert "last_success_ts" in cos_health.read_health()["nag_check"]
+
+
+def test_r1_dry_run_records_no_health(harness, monkeypatch):
+    """A --dry-run NEVER delivers, so it records NO health (neither success nor failure)
+    and returns 0 -- a preview is not a real cron outcome."""
+    import cos_health  # noqa: PLC0415
+    board, state = harness
+    monkeypatch.delenv("TELEGRAM_CHAT_ID_PRODUCTIVITY", raising=False)  # preview is blocked
+    rc = nag_check.main(["--dry-run"])
+    assert rc == 0
+    assert "nag_check" not in cos_health.read_health()  # dry-run records nothing
+
+
+def test_r1_crash_records_health_failure(harness, monkeypatch):
+    """A HARD crash (an unexpected exception -- worse than a swallowed block) is recorded
+    as a health FAILURE too. nag_check catches its own crash and returns 0, so the shell
+    log_subprocess_error never fires; without recording here a crashing cron would
+    false-green until STALE."""
+    import cos_health  # noqa: PLC0415
+    board, state = harness
+    monkeypatch.setattr(nag_check, "run_nag_check",
+                        lambda **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    rc = nag_check.main([])
+    assert rc == 0  # the crash is enveloped (exit 0), SAFE_ENVELOPE printed
+    assert cos_health.read_health()["nag_check"]["last_failure"]["error_class"] == "RuntimeError"
 
 
 # --- Background recycle: no-longer-overdue clears (never terminally acks) ------
