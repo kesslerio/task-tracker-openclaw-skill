@@ -55,6 +55,11 @@ CLOSED_EXPLICIT_DONE = "explicit_done"
 CLOSED_VERIFIED_DONE = "verified_done"
 CLOSED_RESCHEDULED = "rescheduled"
 
+# Cap on retained per-task focus/body-double session records. The lazy-expire +
+# continue-loop leaves elapsed sessions on disk, so add_body_double_session prunes
+# to the most recent few (the active one is always the newest, so it is retained).
+_MAX_BODY_DOUBLE_SESSIONS = 8
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -272,7 +277,16 @@ def add_body_double_session(
     if active_body_double_session(entry, now=now) is not None:
         return None
     entry = state.setdefault(task_id, default_nag_entry(new_nag_loop_id()))
-    entry.setdefault("body_double_sessions", []).append(session)
+    sessions = entry.setdefault("body_double_sessions", [])
+    sessions.append(session)
+    # Bound the list. The continue-loop (`/start <id>` again after a block elapses)
+    # leaves an elapsed session on disk (lazy expire, NOT delete), so a frequently-
+    # restarted task would grow ``body_double_sessions`` without bound -- and
+    # active_body_double_session scans it on every status/start/cancel. Keep only the
+    # most recent few: the just-appended (active) session is last so it is always
+    # retained, and the append-only ledger holds the durable audit trail.
+    if len(sessions) > _MAX_BODY_DOUBLE_SESSIONS:
+        del sessions[:-_MAX_BODY_DOUBLE_SESSIONS]
     return entry
 
 

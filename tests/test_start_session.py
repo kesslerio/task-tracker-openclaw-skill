@@ -492,3 +492,19 @@ def test_start_cli_status_via_main(env, capsys):
     out = json.loads(capsys.readouterr().out)
     assert rc == 0
     assert out["active"] is False
+
+
+def test_body_double_sessions_list_is_bounded():
+    """The continue-loop (/start again after a block elapses) leaves elapsed sessions
+    on disk; add_body_double_session prunes to the most recent few so the per-task
+    list (scanned on every status/start/cancel) can't grow without bound. The newest
+    (active) session is always retained; the oldest are dropped."""
+    state: dict = {}
+    for i in range(12):
+        # each session is pre-ended so it does not block the next append
+        nag_state.add_body_double_session(state, "tsk_x", {
+            "session_id": f"s{i}", "cron_ids": [], "started_at": "x", "ended_at": "x"})
+    sessions = state["tsk_x"]["body_double_sessions"]
+    assert len(sessions) == nag_state._MAX_BODY_DOUBLE_SESSIONS  # bounded
+    assert sessions[-1]["session_id"] == "s11"  # the most recent is retained
+    assert all(s["session_id"] != "s0" for s in sessions)  # the oldest were pruned

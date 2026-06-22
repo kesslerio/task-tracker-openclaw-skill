@@ -372,7 +372,12 @@ def _open_focus_session(
     the configured default; ``cue`` / ``extra_session`` are stored ON the session so
     they survive a crash (in nag-state.json); ``final_prompt`` overrides the final
     check-in cron's prompt (``/start``'s disposition text). ``/body-double`` passes
-    none of these, so its behaviour is unchanged.
+    none of these, so its prompts/cue/quiet behaviour is unchanged. NOTE: ``ends_at``
+    is now stamped on EVERY session (both commands), so an elapsed body-double session
+    also auto-expires -- a benign improvement (an orphan body-double whose block is
+    over no longer blocks a new session); a ``/cancel-session`` after a body-double
+    block has elapsed returns ``no-active-session`` (its check-in crons already fired
+    + were reaped, so there is nothing left to cancel) rather than re-closing it.
     """
     minutes = parse_duration_minutes(duration)
     if minutes <= 0 and default_minutes is not None and not (duration or "").strip():
