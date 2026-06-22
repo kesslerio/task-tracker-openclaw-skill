@@ -486,6 +486,28 @@ def test_parse_start_tail_cue_without_minutes():
     assert parsed["cue"] == "call the vendor"
 
 
+def test_parse_start_tail_bare_cue_without_next_marker():
+    """Trailing free text IS the cue even without the `next:` marker -- silently
+    dropping the user's own phrasing of the next action was the H7 footgun."""
+    parsed = nag_commands.parse_start_tail(["tsk_abc123", "finish", "the", "slides"])
+    assert parsed["duration"] is None
+    assert parsed["cue"] == "finish the slides"
+
+
+def test_parse_start_tail_bare_cue_after_duration():
+    parsed = nag_commands.parse_start_tail(["tsk_abc123", "45m", "finish", "the", "slides"])
+    assert parsed["duration"] == "45m"
+    assert parsed["cue"] == "finish the slides"
+
+
+def test_parse_start_tail_next_marker_shields_duration_like_cue():
+    """The `next:` marker still earns its keep: a cue whose first word looks like a
+    duration is not eaten as the minutes when the marker is present."""
+    parsed = nag_commands.parse_start_tail(["tsk_abc123", "next:", "30", "min", "sprint"])
+    assert parsed["duration"] is None
+    assert parsed["cue"] == "30 min sprint"
+
+
 def test_start_cli_status_via_main(env, capsys):
     """The CLI `start` (no task) routes to status without tripping the id guard."""
     rc = nag_commands.main(["start"])

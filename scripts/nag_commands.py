@@ -846,40 +846,37 @@ def main(argv: list[str] | None = None) -> int:
 def parse_start_tail(rest: list[str]) -> dict[str, Any]:
     """Parse ``/start`` args into ``{task_id, duration, cue}`` (or a status request).
 
-    Grammar: ``[<task_id>] [<minutes>] [next: <cue words...>]``.
+    Grammar: ``[<task_id>] [<minutes>] [next:] <cue words...>``.
 
     * No tokens, or a lone ``status`` token -> ``{"status": True}`` (the no-arg /
-      ``/start status`` form that shows the active session's cue).
+      ``/start status`` form that shows the active sessions).
     * First token is the task_id. An optional second token that looks like a
-      duration (``25`` / ``45m`` / ``1h``) is the minutes. Everything from a ``next:``
-      token onward is the resumption cue text (joined back into one line).
+      duration (``25`` / ``45m`` / ``1h``) is the minutes. Every remaining word is
+      the resumption cue -- the ``next:`` marker is an OPTIONAL separator, never
+      required: both ``/start tsk finish the slides`` and ``/start tsk next: finish
+      the slides`` capture the cue. (Silently dropping a marker-less cue was a
+      footgun: ``/start`` exists to capture the next action at the moment of
+      friction, so the user's own phrasing must not be discarded.) The marker still
+      earns its keep as an escape so a cue whose first word looks like a duration
+      (``next: 30 min sprint``) is not eaten as the minutes.
     """
     tokens = [t for t in rest if t != ""]
     if not tokens or (len(tokens) == 1 and tokens[0].lower() == "status"):
         return {"status": True}
 
     task_id = tokens[0]
+    rest_tokens = tokens[1:]
     duration: str | None = None
-    cue: str | None = None
-    idx = 1
-    # Find a `next:` marker (the cue), so the words after it are not mistaken for a
-    # duration. Accept `next:` as its own token or as a `next:foo` prefix.
-    next_at = None
-    for i, tok in enumerate(tokens[1:], start=1):
-        if tok.lower() == "next:" or tok.lower().startswith("next:"):
-            next_at = i
-            break
-    cue_end = next_at if next_at is not None else len(tokens)
-    # An optional duration sits between the task_id and the cue (or end).
-    if idx < cue_end and parse_duration_minutes(tokens[idx]) > 0:
-        duration = tokens[idx]
-    if next_at is not None:
-        cue_tokens = tokens[next_at:]
-        # Strip the leading `next:` marker (whole token or prefix).
-        first = cue_tokens[0]
-        remainder = first[len("next:"):] if len(first) > len("next:") else ""
-        cue_words = ([remainder] if remainder else []) + cue_tokens[1:]
-        cue = " ".join(cue_words).strip() or None
+    # An optional duration sits immediately after the task_id.
+    if rest_tokens and parse_duration_minutes(rest_tokens[0]) > 0:
+        duration, rest_tokens = rest_tokens[0], rest_tokens[1:]
+    # Everything left is the cue. A leading `next:` marker (whole token or prefix)
+    # is stripped if present, but trailing free text is the cue either way.
+    cue_words = rest_tokens
+    if cue_words and cue_words[0].lower().startswith("next:"):
+        remainder = cue_words[0][len("next:"):]
+        cue_words = ([remainder] if remainder else []) + cue_words[1:]
+    cue = " ".join(cue_words).strip() or None
     return {"status": False, "task_id": task_id, "duration": duration, "cue": cue}
 
 
