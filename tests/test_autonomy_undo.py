@@ -454,6 +454,33 @@ def test_legacy_id_bearing_removal_undo_reinserts_via_content_path(tmp_path):
     assert raw_line in board.read_text(encoding="utf-8").split("\n")
 
 
+def test_anchored_removal_act_undo_reinserts_after_drift(tmp_path):
+    """A NEW (anchored) snapshot for a line-REMOVAL act must RE-INSERT on undo, not
+    refuse. A removal's board_revision is taken pre-mutation, so the board ALWAYS
+    drifts (the act then removes the line), forcing the id path -- where the id is
+    gone WITH the removed line. The removal (post_raw_line absent) re-inserts via the
+    content path instead of conflict-not-found, so anchored removals stay undoable."""
+    board = tmp_path / "Weekly TODOs.md"
+    raw_line = "- [ ] Migrate billing task_id::tsk_mig"
+    pre_content = f"# Board\n- [ ] Other A\n{raw_line}\n- [ ] Other B\n"
+    board.write_text(pre_content, encoding="utf-8")
+    # Anchored snapshot taken PRE-removal (no post_raw_line -> a removal act).
+    snapshot = autonomy.board_snapshot(board, raw_line, 3, content=pre_content)
+    assert snapshot["board_revision"].startswith("sha256:")
+    assert snapshot["task_id"] == "tsk_mig"
+    # The act removed the line AND the board drifted (other lines changed).
+    board.write_text("# Board\n- [ ] Other A renamed\n- [ ] Other B\n- [ ] New C\n",
+                     encoding="utf-8")
+    _override_rung("wip_cap_enforced", autonomy_gate.RUNG_APPROVE)
+    gated = autonomy_gate.gate("wip_cap_enforced", task_id="tsk_mig", unit="U3",
+                               snapshot_provider=lambda: snapshot)
+    result = autonomy.undo_act(gated["act_id"])
+    assert result["ok"] is True
+    assert result["board_restored"] is True
+    assert result["resolved_by"] == "task_id"
+    assert raw_line in board.read_text(encoding="utf-8").split("\n")
+
+
 def test_board_snapshot_helper_stamps_revision_and_id(tmp_path):
     """Unit: board_snapshot() captures sha256 revision + the line's stable id."""
     board = tmp_path / "b.md"

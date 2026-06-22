@@ -562,10 +562,13 @@ def resolve_board_restore(content: str, snapshot: dict[str, Any]) -> dict[str, A
        did (``resolved_by="legacy-content"``). Without a revision we cannot tell
        "removed by the act" from "board drifted", so we do not refuse a removal act.
     3. ``board_revision`` present but DRIFTED -> resolve by the stable ``task_id``
-       marker: ONE match -> restore in place (``resolved_by="task_id"``); ZERO ->
-       ``conflict-not-found``; MORE THAN ONE -> ``conflict-duplicate``. With no id at
-       all, fall back to the content path but ONLY if the target text is UNIQUE; a
-       duplicate is ``conflict-duplicate`` (the old code would have guessed).
+       marker: ONE match -> restore in place (``resolved_by="task_id"``); MORE THAN
+       ONE -> ``conflict-duplicate``; ZERO -> if the act was a REMOVAL (``post_raw_line``
+       absent, so the id left with the deleted line) re-insert via the content path
+       (a removal's revision always drifts, so this is the normal removal-undo path),
+       else ``conflict-not-found``. With no id at all, fall back to the content path
+       but ONLY if the target text is UNIQUE; a duplicate is ``conflict-duplicate``
+       (the old code would have guessed).
     """
     raw_line = str(snapshot.get("raw_line") or "")
     if not raw_line.strip():
@@ -644,11 +647,22 @@ def _resolve_by_task_id(
     if len(matches) > 1:
         return {"ok": False, "reason": "conflict-duplicate", "candidates": len(matches)}
 
-    # ZERO id matches. The act may have REMOVED the line entirely -- if the exact
-    # original is already back verbatim, it is an idempotent no-op; otherwise the
-    # id is gone and we will not blindly re-insert against a drifted board.
+    # ZERO id matches.
     if raw_line in lines:
+        # The exact original is already back verbatim -> idempotent no-op.
         return {"ok": True, "restored": False, "new_content": content,
+                "resolved_by": "task_id"}
+    if post_raw_line is None:
+        # A REMOVAL act (it wrote no replacement line): the id left WITH the deleted
+        # line, so its absence is EXPECTED, not a conflict. A removal's revision ALWAYS
+        # drifts (the snapshot is taken pre-mutation, then the act removes the line),
+        # so without this branch every anchored removal would be non-undoable. Re-insert
+        # the original via the content path + hint, exactly as the legacy/no-id removal
+        # paths do. A toggle/edit act (post_raw_line present) whose id vanished IS
+        # genuinely unresolvable -> conflict below.
+        new_content, restored = restore_line_by_content(
+            content, raw_line, post_raw_line=None, line_number_hint=line_number_hint)
+        return {"ok": True, "restored": restored, "new_content": new_content,
                 "resolved_by": "task_id"}
     return {"ok": False, "reason": "conflict-not-found", "candidates": 0}
 
