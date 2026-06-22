@@ -193,7 +193,7 @@ def test_ended_session_sends_nothing(env, monkeypatch):
     result = checkin_dispatch.run_dispatch(
         session_id, "tsk_abc123", dur, is_final=True, sender=sender)
     assert result["sent"] is False
-    assert result["reason"] == "session-inactive"
+    assert result["reason"] == "session-closed"
     assert sent == []
 
 
@@ -207,23 +207,26 @@ def test_done_session_sends_nothing(env):
     result = checkin_dispatch.run_dispatch(
         session_id, "tsk_abc123", dur, is_final=True, sender=sender)
     assert result["sent"] is False
-    assert result["reason"] == "session-inactive"
+    assert result["reason"] == "session-closed"
     assert sent == []
 
 
-def test_elapsed_session_sends_nothing(env, monkeypatch):
-    """A session whose block has elapsed (ends_at <= now) is not active -> no send."""
+def test_elapsed_but_unclosed_session_still_fires_final_checkin(env, monkeypatch):
+    """REGRESSION: the END check-in cron is scheduled AT ends_at and fires at-or-after
+    it, so a block that merely ELAPSED (was not /done'd or cancelled) must STILL get its
+    done/continue/blocked/redefine disposition -- the whole point of the check-in. Only
+    a user-CLOSED session is a no-op (covered by the /done + cancel-session tests)."""
     board, state = env
     monkeypatch.setattr(nag_commands, "_now", lambda: REF)
     session_id, dur = _start_session(env, duration="25m")
-    # Advance the dispatcher's clock PAST ends_at.
-    monkeypatch.setattr(checkin_dispatch, "_now", lambda: REF + timedelta(hours=1))
+    # Fire the dispatcher AT ends_at (== started_at + 25m) -- the exact boundary where
+    # the old elapsed gate (ends_at <= now) wrongly suppressed the disposition.
+    monkeypatch.setattr(checkin_dispatch, "_now", lambda: REF + timedelta(minutes=25))
     sent, sender = _recording_sender()
     result = checkin_dispatch.run_dispatch(
         session_id, "tsk_abc123", dur, is_final=True, sender=sender)
-    assert result["sent"] is False
-    assert result["reason"] == "session-inactive"
-    assert sent == []
+    assert result["sent"] is True
+    assert len(sent) == 1
 
 
 def test_unknown_session_sends_nothing(env):
@@ -232,7 +235,7 @@ def test_unknown_session_sends_nothing(env):
     result = checkin_dispatch.run_dispatch(
         "st_doesnotexist", "tsk_abc123", 30, is_final=True, sender=sender)
     assert result["sent"] is False
-    assert result["reason"] == "session-inactive"
+    assert result["reason"] == "session-closed"
     assert sent == []
 
 

@@ -139,8 +139,10 @@ def run_dispatch(
 
     Send-NOTHING outcomes (each exits clean, no message):
 
-    * the session is not active (ended / ``/done``'d / cancelled / elapsed / not
-      found) -> ``reason: session-inactive``;
+    * the session was CLOSED by the user (``/done`` / ``/cancel-session`` set
+      ``ended_at``) or its record is gone -> ``reason: session-closed``. A merely
+      ELAPSED-but-unclosed block is NOT closed: the end check-in still fires its
+      disposition (the cron is scheduled AT ``ends_at`` and fires at-or-after it);
     * the delivery target cannot be proven NOW -> ``reason: target-unproven``
       (records a health failure -- never a send to an unproven target).
 
@@ -148,17 +150,19 @@ def run_dispatch(
     ``(session_id, phase)`` via the receipt-backed outbox.
     """
     now = _now()
-    # 1. Reload state and find the LIVE session by id. A session ended by /done,
-    #    /cancel-session, or elapsed past ends_at is NOT active -> send nothing. We
-    #    scan all entries because the dispatcher knows the session_id, not which
-    #    task_id key it lives under (and the board may have moved).
-    session = _find_active_session(session_id, now=now)
+    # 1. Reload state and find the session by id. Skip ONLY if the user CLOSED it
+    #    (/done or /cancel-session set ended_at) -- NOT merely because it has elapsed.
+    #    The end check-in cron is scheduled AT ends_at and fires at-or-after it, so an
+    #    elapsed gate would always suppress the done/continue/blocked/redefine
+    #    disposition (the whole point of the check-in). We scan all entries because
+    #    the dispatcher knows the session_id, not which task_id key it lives under.
+    session = _find_dispatchable_session(session_id)
     if session is None:
-        # The user already closed/cancelled the block, or it elapsed. A check-in for
-        # a dead session must say nothing -- the post-/done no-op the V1 fix exists
-        # for. Benign, so a SUCCESS health stamp (the dispatcher ran correctly).
+        # The user already /done'd or cancelled the block (ended_at set), or its
+        # record is gone. A check-in for a closed session must say nothing -- the
+        # post-/done no-op the V1 fix exists for. Benign, so a SUCCESS health stamp.
         _record_health(ok=True)
-        return {"sent": False, "reason": "session-inactive", "session_id": session_id}
+        return {"sent": False, "reason": "session-closed", "session_id": session_id}
 
     # 2. RE-PROVE the target NOW -- never trust a target baked in at create time.
     proof = nag_delivery.resolve_target()
@@ -196,16 +200,21 @@ def _phase(is_final: bool) -> str:
     return PHASE_END if is_final else PHASE_HALFWAY
 
 
-def _find_active_session(session_id: str, *, now: datetime) -> dict[str, Any] | None:
-    """The LIVE session matching ``session_id`` across all nag-state entries, or None.
+def _find_dispatchable_session(session_id: str) -> dict[str, Any] | None:
+    """The session matching ``session_id`` that is still PENDING (not user-closed), else None.
 
-    Active means ``active_body_double_session`` (not ended, not elapsed at ``now``)
-    returns a session whose id matches. A session that has been ``/done``'d,
-    cancelled, or has elapsed is treated as gone -> None -> the dispatcher sends
-    nothing.
+    The check-in must fire as long as the block has not been CLOSED by the user, and
+    skip only when it has. ``active_body_double_session`` WITHOUT ``now`` means exactly
+    "not ended" (``ended_at`` unset) -- it does NOT apply the elapsed gate. That is the
+    correct rule here: the final check-in cron is scheduled AT ``ends_at`` and fires
+    at-or-after it, so passing ``now`` (the elapsed gate ``ends_at <= now``) would
+    always judge the session elapsed and suppress the end-of-session disposition. Only
+    ``/done`` / ``/cancel-session`` (which stamp ``ended_at``) close a session here.
+    (The one-per-task ``/start`` guard still passes ``now`` elsewhere, so an
+    elapsed-but-undisposed session never blocks a fresh start -- different purpose.)
     """
     for entry in nag_state.read_state().values():
-        session = nag_state.active_body_double_session(entry, now=now)
+        session = nag_state.active_body_double_session(entry)
         if session is not None and session.get("session_id") == session_id:
             return session
     return None
