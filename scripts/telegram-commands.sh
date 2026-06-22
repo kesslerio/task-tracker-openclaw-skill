@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Telegram slash command wrapper for task-tracker skill
-# Usage: telegram-commands.sh {daily|weekly|promote|swap|done|reschedule|snooze|body-double|cancel-session|
+# Usage: telegram-commands.sh {daily|weekly|promote|swap|done|reschedule|snooze|body-double|start|cancel-session|
 #                              done24h|done7d|ledger|approve|nag-check|nag|quiet|unquiet|audit|undo}
 #
 # U1 NO-RAW-ERROR-LEAK boundary: every python3 invocation goes through
@@ -121,6 +121,18 @@ case "$1" in
     sub="$1"; shift
     run_with_envelope "$sub" python3 "$SCRIPT_DIR/nag_commands.py" "$sub" "$@"
     ;;
+  start)
+    # H7 initiation loop: `/start <task_id> [<minutes>] [next: <cue>]` begins a focus
+    # block -- REUSES the body-double focus-session machinery (a cue stored on the
+    # session, ephemeral check-in crons with the explicit proven delivery target),
+    # mutes the nag (H5 quiet) for the duration, and ends with a structured
+    # done/continue/blocked/redefine disposition. `/start` (no arg) or `/start status`
+    # shows the active session's resumption cue. Reactive: reply lands in the
+    # originating topic. The free-form tail (incl. the multi-word `next:` cue) is
+    # forwarded verbatim; nag_commands parses it.
+    shift
+    run_with_envelope "start" python3 "$SCRIPT_DIR/nag_commands.py" start "$@"
+    ;;
   nag-check)
     # U4 nag engine (cron). Proactive push: every nag goes through
     # prove_delivery_target + the gated act_id + assert_send_target. An unset env
@@ -161,7 +173,7 @@ case "$1" in
     run_with_envelope "manifest" python3 "$SCRIPT_DIR/cos_manifest.py" manifest
     ;;
   *)
-    echo "Usage: $0 {daily|weekly|promote|swap|done|reschedule|snooze|body-double|cancel-session|done24h|done7d|ledger|approve|nag-check|nag|quiet|unquiet|health|manifest|audit|undo}"
+    echo "Usage: $0 {daily|weekly|promote|swap|done|reschedule|snooze|body-double|start|cancel-session|done24h|done7d|ledger|approve|nag-check|nag|quiet|unquiet|health|manifest|audit|undo}"
     exit 1
     ;;
 esac

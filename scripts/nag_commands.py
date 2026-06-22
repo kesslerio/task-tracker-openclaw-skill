@@ -19,8 +19,14 @@ Command summary:
   (``deleteAfterRun:true``) check-in crons, each carrying an explicit proven
   ``delivery.to`` + ``agentId``.  Refuses a task not on the active board, and a
   second concurrent session for the same task.
-* ``/cancel-session <id>`` -- end the active body-double session + delete its
-  pending crons.
+* ``/start <id> [<min>] [next: <cue>]`` (H7) -- the initiation loop: REUSES the
+  body-double focus-session machinery (``_open_focus_session``) and layers on a
+  resumption CUE stored on the session, a QUIET window for the session duration
+  (H5), and an end-of-session done/continue/blocked/redefine DISPOSITION prompt.
+  ``/start`` (no task) / ``/start status`` shows the active session's cue.
+* ``/cancel-session <id>`` -- end the active focus/body-double session + delete its
+  pending crons, and clear THIS session's quiet (only if it still matches -- a
+  longer manual ``/quiet`` is left intact).
 
 The body-double ephemeral crons use ``deleteAfterRun: true`` so the gateway reaps
 them after they fire -- the agent never issues a ``cron rm`` (orphan risk if a
@@ -40,6 +46,7 @@ import cos_config
 import cron_backend
 import nag_delivery
 import nag_state
+import quiet_state
 from task_ledger import append_event, new_event
 from task_records import active_records, load_records
 from task_transitions import complete_by_id, reschedule_by_id
@@ -260,24 +267,31 @@ _CHECKIN_FRACTIONS = (0.5, 1.0)
 
 
 def _checkin_cron(session_id: str, task_id: str, elapsed_min: int, fire_at: datetime,
-                  delivery_target: dict[str, Any], *, is_final: bool) -> dict[str, Any]:
+                  delivery_target: dict[str, Any], *, is_final: bool,
+                  label: str = "body-double", prompt: str | None = None) -> dict[str, Any]:
     """Build ONE ephemeral check-in cron descriptor.
 
     Every check-in cron carries an EXPLICIT ``delivery.to`` + ``agentId`` set at
     session-start time (it can never derive the target at fire time from session
     history -- Hard Gate #4), and ``deleteAfterRun: true`` so the gateway reaps it
     after firing (no agent-issued cron rm).
+
+    ``label`` names the session kind in the cron name (``body-double`` or ``start``)
+    and ``prompt`` lets the caller override the default check-in prompt -- H7's
+    ``/start`` final check-in carries the done/continue/blocked/redefine disposition
+    text instead of the body-double check-in marker. When ``prompt`` is omitted the
+    default body-double marker is used, so ``/body-double`` is unchanged.
     """
     to = f"{delivery_target['chat_id']}:topic:{delivery_target['topic_id']}"
     kind = "session-end" if is_final else "halfway"
     return {
-        "name": f"body-double {kind} {session_id}",
+        "name": f"{label} {kind} {session_id}",
         "schedule": {"kind": "at", "at": fire_at.isoformat()},
         "agentId": delivery_target["agent_id"],
         "deleteAfterRun": True,
         "toolsAllow": ["exec"],
-        "prompt": (f"BODY_DOUBLE_CHECKIN session={session_id} task={task_id} "
-                   f"elapsed={elapsed_min}m final={is_final}"),
+        "prompt": prompt or (f"BODY_DOUBLE_CHECKIN session={session_id} task={task_id} "
+                             f"elapsed={elapsed_min}m final={is_final}"),
         "delivery": {"mode": "announce", "channel": "telegram", "to": to},
     }
 
@@ -308,68 +322,127 @@ def handle_body_double(
     nothing. A backend failure raises ``CronBackendError`` and is reported as a
     structured error (no half-started session is recorded).
     """
-    minutes = parse_duration_minutes(duration)
-    if minutes <= 0:
-        return {"ok": False, "error": {
-            "code": "invalid-duration",
-            "message": f"Body-double duration must be like 90m/1h; got {duration!r}.",
-        }}
-    if _active_record(task_id, personal=personal) is None:
-        return {"ok": False, "error": {
-            "code": "task-not-active",
-            "message": "I can't body-double a task that isn't on your active board.",
-        }}
-    active_session = nag_state.active_body_double_session(nag_state.read_state().get(task_id))
-    if active_session is not None:
-        return _session_active_error(task_id, active_session.get("started_at"))
+    started = _open_focus_session(
+        task_id, duration,
+        personal=personal,
+        id_prefix="bd_",
+        label="body-double",
+        invalid_duration_msg=f"Body-double duration must be like 90m/1h; got {duration!r}.",
+        unproven_msg="Cannot prove a check-in delivery target; body-double not started.",
+        create_cron=create_cron,
+    )
+    if not started["ok"]:
+        return started["error"]
 
-    proof = nag_delivery.resolve_target()
-    if not proof["ok"]:
-        return {"ok": False, "error": {
-            "code": "delivery-target-unproven",
-            "message": "Cannot prove a check-in delivery target; body-double not started.",
-            "reason": proof["reason"],
-        }}
-
-    session_id = f"bd_{uuid.uuid4().hex[:12]}"
-    started_at = _now()
-    created = _create_checkin_crons(session_id, task_id, minutes, started_at,
-                                    proof["delivery_target"],
-                                    create=create_cron or cron_backend.create_cron)
-    if not created["ok"]:
-        return created["error"]
-
-    session = {"session_id": session_id, "cron_ids": created["cron_ids"],
-               "started_at": started_at.isoformat(), "duration_min": minutes,
-               "delivery_target": proof["delivery_target"], "ended_at": None, "outcome": None}
-    # The append re-validates the one-session-per-task invariant UNDER the lock; if
-    # a concurrent /body-double won the race it returns None and we roll back the
-    # crons we just created (the early pre-check above is only fast feedback).
-    if nag_state.transition(lambda s: nag_state.add_body_double_session(s, task_id, session)) is None:
-        for cron_id in created["cron_ids"]:
-            _safe_delete(cron_id)
-        return _session_active_error(task_id)
-
+    session_id = started["session_id"]
     _log("body_double_started", task_id=task_id, session_id=session_id,
-         duration_min=minutes, cron_ids=created["cron_ids"])
+         duration_min=started["duration_min"], cron_ids=started["cron_ids"])
     return {"ok": True, "task_id": task_id, "session_id": session_id,
-            "cron_ids": created["cron_ids"], "duration_min": minutes,
+            "cron_ids": started["cron_ids"], "duration_min": started["duration_min"],
             "ack": "Session started. I'll check in at the halfway and end points. "
                    "What are you aiming to finish?"}
 
 
+def _open_focus_session(
+    task_id: str,
+    duration: str | None,
+    *,
+    personal: bool,
+    id_prefix: str,
+    label: str,
+    invalid_duration_msg: str,
+    unproven_msg: str,
+    create_cron: Callable[[dict[str, Any]], str] | None,
+    default_minutes: int | None = None,
+    cue: str | None = None,
+    final_prompt: Callable[[str], str] | None = None,
+    extra_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Shared focus-session core for ``/body-double`` and ``/start`` (DRY).
+
+    Validates duration + active board + one-session-per-task, proves the delivery
+    target, schedules the ephemeral check-in cron pair (each with the explicit
+    proven ``delivery.to`` + ``agentId``), and appends the session under the lock
+    (rolling its crons back if a concurrent session won the race). Returns
+    ``{"ok": True, "session_id", "cron_ids", "duration_min", "session"}`` on success
+    or ``{"ok": False, "error": <handler-result>}``.
+
+    ``default_minutes`` lets ``/start`` accept an OMITTED duration and fall back to
+    the configured default; ``cue`` / ``extra_session`` are stored ON the session so
+    they survive a crash (in nag-state.json); ``final_prompt`` overrides the final
+    check-in cron's prompt (``/start``'s disposition text). ``/body-double`` passes
+    none of these, so its behaviour is unchanged.
+    """
+    minutes = parse_duration_minutes(duration)
+    if minutes <= 0 and default_minutes is not None and not (duration or "").strip():
+        minutes = default_minutes
+    if minutes <= 0:
+        return {"ok": False, "error": {"ok": False, "error": {
+            "code": "invalid-duration",
+            "message": invalid_duration_msg,
+        }}}
+    if _active_record(task_id, personal=personal) is None:
+        return {"ok": False, "error": {"ok": False, "error": {
+            "code": "task-not-active",
+            "message": "I can't body-double a task that isn't on your active board.",
+        }}}
+    active_session = nag_state.active_body_double_session(nag_state.read_state().get(task_id))
+    if active_session is not None:
+        return {"ok": False, "error": _session_active_error(task_id, active_session.get("started_at"))}
+
+    proof = nag_delivery.resolve_target()
+    if not proof["ok"]:
+        return {"ok": False, "error": {"ok": False, "error": {
+            "code": "delivery-target-unproven",
+            "message": unproven_msg,
+            "reason": proof["reason"],
+        }}}
+
+    session_id = f"{id_prefix}{uuid.uuid4().hex[:12]}"
+    started_at = _now()
+    final_prompt_text = final_prompt(session_id) if final_prompt is not None else None
+    created = _create_checkin_crons(session_id, task_id, minutes, started_at,
+                                    proof["delivery_target"],
+                                    create=create_cron or cron_backend.create_cron,
+                                    label=label, final_prompt=final_prompt_text)
+    if not created["ok"]:
+        return {"ok": False, "error": created["error"]}
+
+    session = {"session_id": session_id, "cron_ids": created["cron_ids"],
+               "started_at": started_at.isoformat(), "duration_min": minutes,
+               "delivery_target": proof["delivery_target"], "ended_at": None,
+               "outcome": None, "cue": cue}
+    if extra_session:
+        session.update(extra_session)
+    # The append re-validates the one-session-per-task invariant UNDER the lock; if
+    # a concurrent session won the race it returns None and we roll back the crons
+    # we just created (the early pre-check above is only fast feedback).
+    if nag_state.transition(lambda s: nag_state.add_body_double_session(s, task_id, session)) is None:
+        for cron_id in created["cron_ids"]:
+            _safe_delete(cron_id)
+        return {"ok": False, "error": _session_active_error(task_id)}
+
+    return {"ok": True, "session_id": session_id, "cron_ids": created["cron_ids"],
+            "duration_min": minutes, "session": session}
+
+
 def _session_active_error(task_id: str, started_at: str | None = None) -> dict[str, Any]:
-    """The 'a session is already active' refusal (early pre-check + under-lock race)."""
+    """The 'a session is already active' refusal (early pre-check + under-lock race).
+
+    Shared by ``/body-double`` and ``/start`` -- one focus/body-double session per
+    task at a time (``active_body_double_session``'s guard)."""
     when = f" (started at {started_at})" if started_at else ""
     return {"ok": False, "error": {
         "code": "session-already-active",
-        "message": (f"There's already an active body-double session for this task{when}. "
+        "message": (f"There's already an active focus session for this task{when}. "
                     f"Reply /cancel-session {task_id} to end it first."),
     }}
 
 
 def _create_checkin_crons(session_id, task_id, minutes, started_at, delivery_target,
-                          *, create: Callable[[dict[str, Any]], str]) -> dict[str, Any]:
+                          *, create: Callable[[dict[str, Any]], str],
+                          label: str = "body-double",
+                          final_prompt: str | None = None) -> dict[str, Any]:
     """Create the check-in cron pair; roll back partial creation on failure.
 
     Returns ``{"ok": True, "cron_ids": [...]}`` on success, or ``{"ok": False,
@@ -377,14 +450,20 @@ def _create_checkin_crons(session_id, task_id, minutes, started_at, delivery_tar
     caller returns. A backend failure deletes any cron already created so no
     half-started session is left behind (the caller must not record a session or
     report "started").
+
+    ``label`` names the cron kind; ``final_prompt`` overrides the FINAL check-in
+    cron's prompt (H7's ``/start`` disposition). Both default to the body-double
+    behaviour so ``/body-double`` is unchanged.
     """
     cron_ids: list[str] = []
     try:
         for fraction in _CHECKIN_FRACTIONS:
             elapsed = int(round(minutes * fraction))
+            is_final = fraction == 1.0
             descriptor = _checkin_cron(
                 session_id, task_id, elapsed, started_at + timedelta(minutes=elapsed),
-                delivery_target, is_final=(fraction == 1.0),
+                delivery_target, is_final=is_final, label=label,
+                prompt=final_prompt if (is_final and final_prompt) else None,
             )
             cron_ids.append(create(descriptor))
     except cron_backend.CronBackendError as exc:
@@ -398,18 +477,164 @@ def _create_checkin_crons(session_id, task_id, minutes, started_at, delivery_tar
     return {"ok": True, "cron_ids": cron_ids}
 
 
+# --- /start: the initiation loop (reuses the focus-session machinery) -------
+
+# The end-of-session disposition prompt (H7 step 4). It becomes the FINAL check-in
+# cron's text, so the gateway fires the structured done/continue/blocked/redefine
+# choice at the session end -- directing to the EXISTING commands (no new /continue
+# or /redefine commands: continue == /start again, redefine == a plain reply).
+def _disposition_prompt(session_id: str, task_id: str, cue: str) -> str:
+    return (
+        f"START_SESSION_END session={session_id} task={task_id}\n"
+        f"Focus block done. Resume cue was: {cue!r}.\n"
+        "How did it go? Pick one:\n"
+        f"  done -> /done {task_id}\n"
+        f"  continue -> /start {task_id} (another block)\n"
+        f"  blocked -> /reschedule {task_id} <date>\n"
+        "  redefine -> just reply with the new next action."
+    )
+
+
+def handle_start(
+    task_id: str,
+    duration: str | None = None,
+    cue: str | None = None,
+    *,
+    personal: bool = False,
+    create_cron: Callable[[dict[str, Any]], str] | None = None,
+) -> dict[str, Any]:
+    """``/start <task> [<minutes>] [next: <cue>]`` -- the initiation loop (H7).
+
+    A task list surfaces tasks but doesn't help you START. ``/start`` reuses the
+    body-double focus-session machinery (DRY: ``_open_focus_session`` -- same
+    session record, same ephemeral check-in crons each carrying the explicit proven
+    ``delivery.to`` + ``agentId``) and LAYERS on:
+
+    * a resumption CUE stored ON the session (so it survives a crash via
+      nag-state.json): the user's ``next:`` text, else ``Work on: <task title>``;
+    * a QUIET window for the session duration (``quiet_state.set_quiet``) so the nag
+      is muted while the user focuses -- recorded on the session (``quiet_set``,
+      ``quiet_until``) so ``/cancel-session`` can clear ONLY this session's quiet and
+      never clobber a longer manual ``/quiet``;
+    * an end-of-session check-in whose text is the structured
+      done/continue/blocked/redefine DISPOSITION (the final check-in cron's prompt).
+
+    A duration default of ``cos_config.start_session_minutes()`` (25, floored at 1)
+    applies when the user omits it. ``/body-double`` is untouched.
+    """
+    record = _active_record(task_id, personal=personal)
+    if cue is None:
+        title = record.title if record is not None else task_id
+        cue = f"Work on: {title}"
+
+    started = _open_focus_session(
+        task_id, duration,
+        personal=personal,
+        id_prefix="st_",
+        label="start",
+        invalid_duration_msg=(f"Start duration must be like 25 / 45m / 1h; got {duration!r}. "
+                              "Omit it for the default block."),
+        unproven_msg="Cannot prove a check-in delivery target; focus session not started.",
+        create_cron=create_cron,
+        default_minutes=cos_config.start_session_minutes(),
+        cue=cue,
+        final_prompt=lambda sid: _disposition_prompt(sid, task_id, cue),
+        extra_session={"kind": "start"},
+    )
+    if not started["ok"]:
+        return started["error"]
+
+    session_id = started["session_id"]
+    minutes = started["duration_min"]
+    started_at = datetime.fromisoformat(started["session"]["started_at"])
+
+    # Mute the nag for the focus block (H5 reuse). Record on the session that THIS
+    # /start set quiet + the exact deadline, so /cancel-session can clear ONLY this
+    # session's quiet and never cut a longer manual /quiet short (the guard below).
+    quiet_set = False
+    session_deadline = started_at + timedelta(minutes=minutes)
+    quiet_until_iso = session_deadline.isoformat()
+    existing_quiet = quiet_state.quiet_until(_now())
+    if existing_quiet is None or existing_quiet <= session_deadline:
+        # No manual quiet, or a manual quiet that ends no later than this session --
+        # set the session window (extending a shorter manual quiet is harmless and
+        # the deadline match below still lets cancel clear it).
+        quiet_state.set_quiet(session_deadline)
+        quiet_set = True
+    nag_state.transition(lambda s: _annotate_quiet(s, task_id, session_id,
+                                                   quiet_set, quiet_until_iso))
+
+    _log("start_session_started", task_id=task_id, session_id=session_id,
+         duration_min=minutes, cron_ids=started["cron_ids"], cue=cue,
+         quiet_set=quiet_set)
+    return {"ok": True, "task_id": task_id, "session_id": session_id,
+            "cron_ids": started["cron_ids"], "duration_min": minutes, "cue": cue,
+            "quiet_set": quiet_set, "quiet_until": quiet_until_iso if quiet_set else None,
+            "ack": (f"Started a {minutes}-min focus block on {task_id}. Nag muted until "
+                    f"then. Next action: {cue}. I'll check in at the halfway and end "
+                    "points and ask done/continue/blocked/redefine.")}
+
+
+def _annotate_quiet(state: dict[str, Any], task_id: str, session_id: str,
+                    quiet_set: bool, quiet_until_iso: str) -> None:
+    """Stamp ``quiet_set`` + ``quiet_until`` onto the just-created session (under lock).
+
+    Stored ON the session so a crash-restart still knows whether to clear quiet on
+    cancel, and which deadline must match before clearing (so /start's auto-quiet
+    never clobbers a longer manual /quiet)."""
+    entry = state.get(task_id)
+    if not isinstance(entry, dict):
+        return
+    for session in entry.get("body_double_sessions") or []:
+        if isinstance(session, dict) and session.get("session_id") == session_id:
+            session["quiet_set"] = quiet_set
+            session["quiet_until"] = quiet_until_iso
+            return
+
+
+def handle_start_status(*, personal: bool = False) -> dict[str, Any]:
+    """``/start`` (no task) / ``/start status`` -- show the active session + its cue.
+
+    A context-switched user has lost the thread; this surfaces the live focus
+    session and its resumption cue (``Resume: <cue>``) so they can pick back up. It
+    is read-only over nag-state.json -- no board read, no target proof, no push.
+    Scans every task's entry because the cue/session live keyed by task_id.
+    """
+    state = nag_state.read_state()
+    for task_id, entry in state.items():
+        session = nag_state.active_body_double_session(entry)
+        if session is None:
+            continue
+        cue = session.get("cue")
+        resume = f"Resume: {cue}" if cue else "No resumption cue saved for this session."
+        return {"ok": True, "active": True, "task_id": task_id,
+                "session_id": session.get("session_id"), "cue": cue,
+                "started_at": session.get("started_at"),
+                "duration_min": session.get("duration_min"),
+                "message": (f"Active focus session on {task_id} "
+                            f"(started {session.get('started_at')}). {resume}")}
+    return {"ok": True, "active": False,
+            "message": "No active focus session. /start <task_id> to begin one."}
+
+
 def handle_cancel_session(
     task_id: str,
     *,
     delete_cron: Callable[[str], Any] | None = None,
 ) -> dict[str, Any]:
-    """End the active body-double session for ``task_id`` + delete its pending crons.
+    """End the active body-double / focus session for ``task_id`` + delete its crons.
 
     ``delete_cron`` is injectable (a test passes a recording stub); it DEFAULTS to
     the real gateway backend (``cron_backend.delete_cron``). The ephemeral crons
     are ``deleteAfterRun`` so a fired one is already gone; deleting cancels the
     ones that have NOT yet fired. A delete failure is swallowed (best-effort) so a
     transient gateway hiccup cannot block ending the session in state.
+
+    H7: if THIS session set a quiet window (``/start``'s auto-mute), clear it on
+    cancel -- but ONLY when the live quiet deadline still matches the session's
+    ``quiet_until``. A user who ran a longer ``/quiet 24h`` independently (or after
+    the session started) keeps it: ending a 25-min focus block must never cut a
+    manual day-long quiet short.
     """
     existing = nag_state.read_state().get(task_id)
     session = nag_state.active_body_double_session(existing)
@@ -423,14 +648,42 @@ def handle_cancel_session(
     for cron_id in session.get("cron_ids") or []:
         _safe_delete(cron_id, delete=delete)
 
+    quiet_cleared = _clear_session_quiet(session)
+
     ended = nag_state.transition(
         lambda state: nag_state.end_body_double_session(
             state, task_id, session["session_id"], outcome="cancelled")
     )
     _log("body_double_ended", task_id=task_id, session_id=session["session_id"],
-         outcome="cancelled")
+         outcome="cancelled", quiet_cleared=quiet_cleared)
     return {"ok": True, "task_id": task_id, "session_id": session["session_id"],
-            "outcome": "cancelled", "ended": ended is not None}
+            "outcome": "cancelled", "ended": ended is not None,
+            "quiet_cleared": quiet_cleared}
+
+
+def _clear_session_quiet(session: dict[str, Any]) -> bool:
+    """Clear quiet IFF this session set it AND the live deadline still matches it.
+
+    The guard that stops /start's auto-quiet from clobbering a longer manual
+    /quiet: clears only when ``session["quiet_set"]`` is true and the current live
+    ``quiet_until`` equals the session's stored ``quiet_until``. A user who set a
+    LONGER /quiet (different/later deadline) keeps it; a window that already
+    expired/was-cleared is a no-op. Returns True only when it actually cleared.
+    """
+    if not session.get("quiet_set"):
+        return False
+    stored = session.get("quiet_until")
+    if not stored:
+        return False
+    try:
+        session_deadline = datetime.fromisoformat(str(stored))
+    except (TypeError, ValueError):
+        return False
+    live = quiet_state.quiet_until(_now())
+    if live is not None and live == session_deadline:
+        quiet_state.clear_quiet()
+        return True
+    return False
 
 
 # --- CLI surface (routed via telegram-commands.sh) -------------------------
@@ -469,10 +722,20 @@ def main(argv: list[str] | None = None) -> int:
     p_bd.add_argument("task_id")
     p_bd.add_argument("duration", help="e.g. 90m / 1h")
 
-    p_cancel = sub.add_parser("cancel-session", help="end a body-double session")
+    p_start = sub.add_parser("start", help="begin a focus block: cue + timer + muted nag")
+    # Everything after `start` is free-form so we can accept the optional
+    # `[<minutes>] [next: <cue text>]` tail (and the no-arg / `status` form).
+    p_start.add_argument("rest", nargs="*", help="[<task_id>] [<minutes>] [next: <cue>]")
+
+    p_cancel = sub.add_parser("cancel-session", help="end a focus/body-double session")
     p_cancel.add_argument("task_id")
 
     args = parser.parse_args(argv)
+
+    if args.command == "start":
+        result = _dispatch_start(args.rest, personal=args.personal)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if result.get("ok") else 2
 
     blocked = _require_id(getattr(args, "task_id", ""))
     if blocked is not None:
@@ -490,6 +753,58 @@ def main(argv: list[str] | None = None) -> int:
 
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result.get("ok") else 2
+
+
+def parse_start_tail(rest: list[str]) -> dict[str, Any]:
+    """Parse ``/start`` args into ``{task_id, duration, cue}`` (or a status request).
+
+    Grammar: ``[<task_id>] [<minutes>] [next: <cue words...>]``.
+
+    * No tokens, or a lone ``status`` token -> ``{"status": True}`` (the no-arg /
+      ``/start status`` form that shows the active session's cue).
+    * First token is the task_id. An optional second token that looks like a
+      duration (``25`` / ``45m`` / ``1h``) is the minutes. Everything from a ``next:``
+      token onward is the resumption cue text (joined back into one line).
+    """
+    tokens = [t for t in rest if t != ""]
+    if not tokens or (len(tokens) == 1 and tokens[0].lower() == "status"):
+        return {"status": True}
+
+    task_id = tokens[0]
+    duration: str | None = None
+    cue: str | None = None
+    idx = 1
+    # Find a `next:` marker (the cue), so the words after it are not mistaken for a
+    # duration. Accept `next:` as its own token or as a `next:foo` prefix.
+    next_at = None
+    for i, tok in enumerate(tokens[1:], start=1):
+        if tok.lower() == "next:" or tok.lower().startswith("next:"):
+            next_at = i
+            break
+    cue_end = next_at if next_at is not None else len(tokens)
+    # An optional duration sits between the task_id and the cue (or end).
+    if idx < cue_end and parse_duration_minutes(tokens[idx]) > 0:
+        duration = tokens[idx]
+    if next_at is not None:
+        cue_tokens = tokens[next_at:]
+        # Strip the leading `next:` marker (whole token or prefix).
+        first = cue_tokens[0]
+        remainder = first[len("next:"):] if len(first) > len("next:") else ""
+        cue_words = ([remainder] if remainder else []) + cue_tokens[1:]
+        cue = " ".join(cue_words).strip() or None
+    return {"status": False, "task_id": task_id, "duration": duration, "cue": cue}
+
+
+def _dispatch_start(rest: list[str], *, personal: bool) -> dict[str, Any]:
+    """Route a parsed ``/start`` invocation to status-show or session-start."""
+    parsed = parse_start_tail(rest)
+    if parsed.get("status"):
+        return handle_start_status(personal=personal)
+    blocked = _require_id(parsed["task_id"])
+    if blocked is not None:
+        return blocked
+    return handle_start(parsed["task_id"], parsed.get("duration"), parsed.get("cue"),
+                        personal=personal)
 
 
 if __name__ == "__main__":
