@@ -386,7 +386,14 @@ def _open_focus_session(
             "code": "task-not-active",
             "message": "I can't body-double a task that isn't on your active board.",
         }}}
-    active_session = nag_state.active_body_double_session(nag_state.read_state().get(task_id))
+    # ``now`` makes an ELAPSED prior session (its block already over -- the final
+    # check-in cron fired and was reaped, but nothing marked the session ended)
+    # auto-expire here, so a new /start on that task is no longer blocked until a
+    # manual /cancel-session. A genuinely ACTIVE (not-yet-elapsed) session still
+    # refuses below.
+    now = _now()
+    active_session = nag_state.active_body_double_session(
+        nag_state.read_state().get(task_id), now=now)
     if active_session is not None:
         return {"ok": False, "error": _session_active_error(task_id, active_session.get("started_at"))}
 
@@ -408,16 +415,25 @@ def _open_focus_session(
     if not created["ok"]:
         return {"ok": False, "error": created["error"]}
 
+    # ends_at marks when the block elapses (started_at + the parsed duration). It
+    # lets active_body_double_session(now=...) auto-expire a session whose final
+    # check-in cron has already fired (the cron only delivers text, it never marks
+    # the session ended), so the task frees up for a fresh /start without a manual
+    # /cancel-session.
+    ends_at = (started_at + timedelta(minutes=minutes)).isoformat()
     session = {"session_id": session_id, "cron_ids": created["cron_ids"],
-               "started_at": started_at.isoformat(), "duration_min": minutes,
+               "started_at": started_at.isoformat(), "ends_at": ends_at,
+               "duration_min": minutes,
                "delivery_target": proof["delivery_target"], "ended_at": None,
                "outcome": None, "cue": cue}
     if extra_session:
         session.update(extra_session)
     # The append re-validates the one-session-per-task invariant UNDER the lock; if
-    # a concurrent session won the race it returns None and we roll back the crons
-    # we just created (the early pre-check above is only fast feedback).
-    if nag_state.transition(lambda s: nag_state.add_body_double_session(s, task_id, session)) is None:
+    # a concurrent (or stale-elapsed, via now) session won the race it returns None
+    # and we roll back the crons we just created (the early pre-check above is only
+    # fast feedback).
+    if nag_state.transition(
+            lambda s: nag_state.add_body_double_session(s, task_id, session, now=now)) is None:
         for cron_id in created["cron_ids"]:
             _safe_delete(cron_id)
         return {"ok": False, "error": _session_active_error(task_id)}
@@ -599,10 +615,15 @@ def handle_start_status(*, personal: bool = False) -> dict[str, Any]:
     session and its resumption cue (``Resume: <cue>``) so they can pick back up. It
     is read-only over nag-state.json -- no board read, no target proof, no push.
     Scans every task's entry because the cue/session live keyed by task_id.
+
+    ``now`` is passed so an ELAPSED session (its block already over) is treated as
+    not active -- we don't advertise a stale ``Resume:`` cue for a block that has
+    already ended; it reports "no active session" instead.
     """
+    now = _now()
     state = nag_state.read_state()
     for task_id, entry in state.items():
-        session = nag_state.active_body_double_session(entry)
+        session = nag_state.active_body_double_session(entry, now=now)
         if session is None:
             continue
         cue = session.get("cue")

@@ -161,6 +161,89 @@ def test_start_and_body_double_share_the_one_session_guard(env):
     assert bd["error"]["code"] == "session-already-active"
 
 
+# --- elapsed-session auto-expire (P2): an ended block frees the task ---------
+
+REF = datetime(2026, 6, 19, 9, 0, tzinfo=timezone.utc)
+
+
+def test_start_after_block_elapsed_succeeds_so_continue_works(env, monkeypatch):
+    """The advertised "continue -> /start <id>" must work after the block ends.
+
+    A /start block ELAPSES (its final check-in cron fires + is reaped -- nothing
+    marks the session ended). A second /start on the same task, with the clock
+    advanced PAST the session's ends_at, AUTO-EXPIRES the stale session and SUCCEEDS
+    -- the new session is created. Before the fix this was refused
+    "session-already-active" until a manual /cancel-session."""
+    board, state = env
+    monkeypatch.setattr(nag_commands, "_now", lambda: REF)
+    first = nag_commands.handle_start("tsk_abc123", "25m", create_cron=lambda d: "c")
+    assert first["ok"] is True
+    first_id = first["session_id"]
+    # The block has fully elapsed (25 min < the +1h advance); the prior session is
+    # still on disk, non-ended -- only the clock makes it elapsed.
+    monkeypatch.setattr(nag_commands, "_now", lambda: REF + timedelta(hours=1))
+    second = nag_commands.handle_start("tsk_abc123", "25m", create_cron=lambda d: "c")
+    assert second["ok"] is True
+    assert second["session_id"] != first_id  # a genuinely new session
+    # Both session records are on disk (the elapsed one is lazily expired, not
+    # deleted) -- the new one was appended past the auto-expired prior block.
+    ids = [s["session_id"] for s in _state(state)["tsk_abc123"]["body_double_sessions"]]
+    assert ids == [first_id, second["session_id"]]
+    # Judged at the advanced clock, the new (not-yet-elapsed) session is the active
+    # one and the prior block is expired.
+    active = nag_state.active_body_double_session(
+        _state(state)["tsk_abc123"], now=REF + timedelta(hours=1))
+    assert active is not None and active["session_id"] == second["session_id"]
+
+
+def test_start_while_block_still_active_refuses(env, monkeypatch):
+    """The live one-per-task guard holds: a second /start while the first block is
+    STILL within its window (clock inside the duration) is REFUSED."""
+    board, state = env
+    monkeypatch.setattr(nag_commands, "_now", lambda: REF)
+    nag_commands.handle_start("tsk_abc123", "25m", create_cron=lambda d: "c")
+    # Only 10 min in -- the block is still active, so the guard refuses.
+    monkeypatch.setattr(nag_commands, "_now", lambda: REF + timedelta(minutes=10))
+    second = nag_commands.handle_start("tsk_abc123", "25m", create_cron=lambda d: "c")
+    assert second["ok"] is False
+    assert second["error"]["code"] == "session-already-active"
+
+
+def test_active_body_double_session_back_compat_no_ends_at(env):
+    """Back-compat: a legacy session with NO ends_at is still active with no `now`
+    (old rule: only ended_at ends it), and a passed `now` never auto-expires what
+    it cannot date -- a missing/garbage ends_at is treated as still active (never
+    crashes)."""
+    legacy = {"session_id": "bd_legacy", "cron_ids": [],
+              "started_at": "2026-06-19T09:00:00+00:00", "ended_at": None}
+    entry = {"body_double_sessions": [legacy]}
+    # No now -> back-compat rule, active.
+    assert nag_state.active_body_double_session(entry) is legacy
+    # A passed now does NOT auto-expire a session it cannot date.
+    assert nag_state.active_body_double_session(entry, now=REF) is legacy
+    # Garbage ends_at is treated as active (not crashed, not expired).
+    garbage = {"session_id": "bd_garbage", "cron_ids": [],
+               "started_at": "x", "ends_at": "not-a-date", "ended_at": None}
+    entry2 = {"body_double_sessions": [garbage]}
+    assert nag_state.active_body_double_session(entry2, now=REF) is garbage
+
+
+def test_start_status_after_elapse_shows_no_active_session(env, monkeypatch):
+    """/start status after the block elapsed reports "no active session" -- it must
+    not advertise a stale Resume: cue for a block that already ended."""
+    board, state = env
+    monkeypatch.setattr(nag_commands, "_now", lambda: REF)
+    nag_commands.handle_start("tsk_abc123", "25m", "draft the list",
+                              create_cron=lambda d: "c")
+    # While active, status shows the cue.
+    assert nag_commands.handle_start_status()["active"] is True
+    # After the block elapses, status reports no active session.
+    monkeypatch.setattr(nag_commands, "_now", lambda: REF + timedelta(hours=1))
+    status = nag_commands.handle_start_status()
+    assert status["active"] is False
+    assert "No active focus session" in status["message"]
+
+
 # --- /start status / no-arg shows the active session's cue ------------------
 
 def test_start_status_shows_active_session_cue(env):

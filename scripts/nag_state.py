@@ -252,6 +252,8 @@ def add_body_double_session(
     state: dict[str, Any],
     task_id: str,
     session: dict[str, Any],
+    *,
+    now: datetime | None = None,
 ) -> dict[str, Any] | None:
     """Append a body-double session IFF no other session is active (one-per-task).
 
@@ -261,23 +263,64 @@ def add_body_double_session(
     ``None`` and appends nothing, so the caller can roll back its just-created
     crons. On success it returns the entry. A body-double is independent of an open
     nag loop, so the entry is created if the task has none yet.
+
+    ``now`` is threaded to the under-lock active-session check so an ELAPSED prior
+    session (its block already over) auto-expires here too, letting the new session
+    append. ``now`` defaults to None to preserve the pre-existing guard exactly.
     """
     entry = state.get(task_id)
-    if active_body_double_session(entry) is not None:
+    if active_body_double_session(entry, now=now) is not None:
         return None
     entry = state.setdefault(task_id, default_nag_entry(new_nag_loop_id()))
     entry.setdefault("body_double_sessions", []).append(session)
     return entry
 
 
-def active_body_double_session(entry: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Return the first non-ended body-double session for the task, or None."""
+def active_body_double_session(
+    entry: dict[str, Any] | None, *, now: datetime | None = None
+) -> dict[str, Any] | None:
+    """Return the first ACTIVE body-double/focus session for the task, or None.
+
+    A session is ACTIVE iff it is not explicitly ended (``ended_at`` unset) AND it
+    has not ELAPSED. Elapsing is judged only when the caller supplies ``now``: a
+    session is elapsed when it carries a parseable ``ends_at`` and ``ends_at <=
+    now``. So a focus/body-double block whose final check-in cron has fired (the
+    cron just delivers text and is reaped -- it never marks the session ended) is
+    auto-expired here, freeing the task for a fresh ``/start`` without a manual
+    ``/cancel-session``.
+
+    ``now`` defaults to None to preserve EVERY existing caller's behaviour: with no
+    ``now`` the old rule holds (only ``ended_at`` ends a session). A session with no
+    parseable ``ends_at`` (legacy/body-double sessions predating this field) is
+    NEVER auto-expired -- we never expire a session we cannot date, so a missing or
+    garbage ``ends_at`` is treated as still active.
+    """
     if not isinstance(entry, dict):
         return None
     for session in entry.get("body_double_sessions") or []:
-        if isinstance(session, dict) and not session.get("ended_at"):
-            return session
+        if not isinstance(session, dict) or session.get("ended_at"):
+            continue
+        if now is not None and _session_elapsed(session, now):
+            continue
+        return session
     return None
+
+
+def _session_elapsed(session: dict[str, Any], now: datetime) -> bool:
+    """Has this session's block ended by ``now`` (a parseable ``ends_at <= now``)?
+
+    A missing/garbage ``ends_at`` returns False: we never auto-expire a session we
+    cannot date (back-compat with sessions that predate the ``ends_at`` field)."""
+    raw = session.get("ends_at")
+    if not raw:
+        return False
+    try:
+        ends_at = datetime.fromisoformat(str(raw))
+    except (TypeError, ValueError):
+        return False
+    if ends_at.tzinfo is None:
+        ends_at = ends_at.replace(tzinfo=timezone.utc)
+    return ends_at <= now
 
 
 def end_body_double_session(
