@@ -170,6 +170,64 @@ def test_on_demand_ledger_works_any_day(env, monkeypatch):
     assert result["delivery_target"] is not None
 
 
+def test_reactive_ledger_does_not_preempt_friday_auto_digest(env, monkeypatch):
+    """P3: a mid-week reactive /ledger pushes, but the headline Friday AUTO digest
+    must STILL fire for the SAME ISO week (kind-aware dedup) -- a reactive pull never
+    silently cancels the weekly Friday brag digest. Each kind dedups independently."""
+    _set_productivity_env(monkeypatch)
+    # Mid-week: a reactive /ledger pushes the week's evidence so far.
+    _stub_sources(monkeypatch, gh_payload=PR_PAYLOAD)
+    reactive = _run(monkeypatch, auto=False, now=MONDAY)
+    assert reactive["draft_pushed"] is True
+
+    # Friday (same ISO week): NEW evidence has landed; the AUTO digest must fire,
+    # NOT be blocked by the same-window reactive push.
+    new_pr = [{"title": "Close the Acme migration", "number": 9,
+               "repository": {"nameWithOwner": "kesslerio/acme"},
+               "url": "https://example.test/pr/9"}]
+    _stub_sources(monkeypatch, gh_payload=new_pr)
+    friday = _run(monkeypatch, auto=True, now=FRIDAY)
+    assert friday["draft_pushed"] is True
+    assert "Close the Acme migration" in friday["draft"]
+
+    # A SECOND reactive run with fresh content is still deduped (reactive already
+    # pushed this window) -- kind-aware dedup only frees the OTHER kind.
+    _stub_sources(monkeypatch, gh_payload=[{"title": "Another", "number": 11,
+        "repository": {"nameWithOwner": "kesslerio/x"}, "url": "https://example.test/pr/11"}])
+    second_reactive = _run(monkeypatch, auto=False, now=MONDAY)
+    assert second_reactive["draft_pushed"] is False
+    assert second_reactive["reason"] == "already_pushed"
+
+    # And a SECOND Friday auto run is itself deduped (auto already pushed this window).
+    _stub_sources(monkeypatch, gh_payload=[{"title": "Yet another", "number": 13,
+        "repository": {"nameWithOwner": "kesslerio/y"}, "url": "https://example.test/pr/13"}])
+    second_auto = _run(monkeypatch, auto=True, now=FRIDAY)
+    assert second_auto["draft_pushed"] is False
+    assert second_auto["reason"] == "already_pushed"
+
+
+def test_legacy_draft_pushed_flag_blocks_a_same_window_reactive(env, monkeypatch):
+    """Back-compat: a pre-kind state file with the old single ``draft_pushed`` flag
+    is honored as a REACTIVE push for its window (so a reactive re-run is deduped),
+    while the Friday auto digest is still free to fire."""
+    _set_productivity_env(monkeypatch)
+    window_id = harvest_state.window_id("week")
+    legacy = harvest_state.new_window_state(window_id)
+    legacy["draft_pushed"] = True  # the retired single-flag shape
+    legacy.pop("reactive_pushed_window", None)
+    harvest_state.save_state(legacy, "week")
+
+    _stub_sources(monkeypatch, gh_payload=PR_PAYLOAD)
+    reactive = _run(monkeypatch, auto=False, now=MONDAY)
+    assert reactive["draft_pushed"] is False
+    assert reactive["reason"] == "already_pushed"
+
+    # The Friday auto digest is NOT blocked by the legacy reactive flag.
+    _stub_sources(monkeypatch, gh_payload=PR_PAYLOAD)
+    friday = _run(monkeypatch, auto=True, now=FRIDAY)
+    assert friday["draft_pushed"] is True
+
+
 def test_suppressed_auto_run_consumes_no_evidence(env, monkeypatch):
     """A suppressed (non-Friday) auto run must NOT mark evidence seen -- the same PR
     is delivered when Friday's fire is allowed (accomplishments never silently lost)."""

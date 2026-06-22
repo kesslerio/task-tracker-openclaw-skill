@@ -584,8 +584,19 @@ def run_harvest(window: str, *, since_override: str | None, dry_run: bool, trigg
 
     push: dict[str, Any] = {"ok": False, "reason": "dry_run"}
     if not dry_run:
-        if state.get("draft_pushed") and state.get("harvest_window_id") == harvest_window_id:
-            # Duplicate-push guard: a draft is already out for this window.
+        # Kind-aware duplicate-push guard. The SCHEDULED Friday digest (``auto``) and
+        # a reactive ``/ledger`` pull track their last-pushed window SEPARATELY, so a
+        # mid-week reactive run never preempts the headline weekly Friday digest (and
+        # a Friday digest never blocks a later reactive pull). Back-compat: a pre-kind
+        # state recorded a single ``draft_pushed`` flag -- treat that as a REACTIVE
+        # push for its window (bias toward letting the Friday auto digest still fire),
+        # so the upgrade never silently suppresses a digest.
+        kind = "auto" if auto else "reactive"
+        pushed_key = f"{kind}_pushed_window"
+        legacy_reactive = (kind == "reactive" and bool(state.get("draft_pushed"))
+                           and state.get("harvest_window_id") == harvest_window_id)
+        if state.get(pushed_key) == harvest_window_id or legacy_reactive:
+            # Duplicate-push guard: a draft of THIS kind is already out for this window.
             return {
                 "ok": True,
                 "draft_pushed": False,
@@ -609,7 +620,7 @@ def run_harvest(window: str, *, since_override: str | None, dry_run: bool, trigg
         # the draft can be re-emitted from the logged ledger_draft_pushed event --
         # proof success, not Telegram receipt, is what marks evidence consumed.)
         if push["ok"]:
-            state["draft_pushed"] = True
+            state[pushed_key] = harvest_window_id
             state["draft_pushed_at"] = datetime.now(timezone.utc).isoformat()
             state["delivery_target"] = push["delivery_target"]
             state["pending_task_ids"] = pending_task_ids

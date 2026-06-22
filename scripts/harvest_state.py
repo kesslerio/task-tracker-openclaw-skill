@@ -116,11 +116,17 @@ def save_state(state: dict[str, Any], window: str = WINDOW_WEEK) -> dict[str, An
 
 
 def new_window_state(harvest_window_id: str) -> dict[str, Any]:
-    """Build a fresh harvest-window document (no draft pushed yet)."""
+    """Build a fresh harvest-window document (no draft pushed yet).
+
+    The scheduled Friday digest (``auto``) and a reactive ``/ledger`` pull dedup
+    INDEPENDENTLY -- each records the window id it last pushed in -- so a mid-week
+    reactive run can never silently suppress the headline weekly Friday digest.
+    """
     return {
         "schema_version": SCHEMA_VERSION,
         "harvest_window_id": harvest_window_id,
-        "draft_pushed": False,
+        "auto_pushed_window": None,
+        "reactive_pushed_window": None,
         "draft_pushed_at": None,
         "delivery_target": None,
         "pending_task_ids": [],
