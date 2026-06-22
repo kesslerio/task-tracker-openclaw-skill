@@ -1,9 +1,12 @@
-"""U3 write-time cap gate (I-CAP denied path) + standup capacity display.
+"""U3 write-time cap gate + H6 capture-never-blocks + standup capacity display.
 
-The gate at ``add_task()`` is the Layer-2 enforcement point: an add that would
-push the active board past ~1 week of capacity is blocked BEFORE the board write,
-so the board stays byte-identical. The cap NEVER force-evicts; ``--force-parking``
-routes the over-cap add to the parking lot instead.
+The gate at ``add_task()`` is the Layer-2 enforcement point. H6 changed what
+HAPPENS when the active set is full: capture NEVER blocks. An over-cap add now
+ALWAYS succeeds and is routed to the parking lot (the inbox) instead of landing on
+the active board, so a commitment is never pushed out of the system. The cap now
+gates PROMOTION onto the active board (see ``test_focus_promote_swap.py``), not
+capture. These tests pin that an over-cap add does NOT bloat the active set -- it
+lands in parking -- and that a real capture FAILURE (lot full) still exits nonzero.
 """
 
 import json
@@ -43,10 +46,13 @@ def _ledger_events(tmp_path):
     return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
 
 
-# --- I-CAP DENIED PATH (the invariant test) --------------------------------
+# --- H6 CAPTURE-NEVER-BLOCKS (the invariant test) --------------------------
 
-def test_add_blocked_at_cap_board_byte_identical(tmp_path):
-    # 28h of estimated active work > 25h WEEKLY_CAPACITY_HOURS.
+def test_over_cap_add_captured_to_parking_not_active_set(tmp_path):
+    # 28h of estimated active work > 25h WEEKLY_CAPACITY_HOURS. H6: the add is NOT
+    # rejected -- it SUCCEEDS (exit 0) and is captured to the parking lot, so the
+    # committed active set does not bloat past the cap. Intent preserved: an
+    # over-cap task does not become an active commitment.
     board = tmp_path / "Work Tasks.md"
     board.write_text(
         "# Work\n\n"
@@ -57,27 +63,30 @@ def test_add_blocked_at_cap_board_byte_identical(tmp_path):
         "- [ ] **T3** estimate:: 8h task_id::tsk_cccccccccccccccc\n"
         "## 🅿️ Parking Lot\n"
     )
-    before = board.read_bytes()
 
     proc = _run_add(tmp_path, board, "Urgent new thing")
 
-    assert proc.returncode != 0
-    # Board byte-for-byte identical: a blocked write changed nothing.
-    assert board.read_bytes() == before
-    # Friendly denial, NOT a raw traceback.
-    assert "cap reached" in proc.stdout.lower()
+    # Capture SUCCEEDS -- never blocks.
+    assert proc.returncode == 0
+    text = board.read_text()
+    # The task lands in the Parking Lot, NOT as a new active task.
+    pl_index = text.index("Parking Lot")
+    assert text.index("Urgent new thing") > pl_index
+    # Non-punitive, "saved not lost" capture message; NOT a raw traceback.
+    assert "captured to the parking lot" in proc.stdout.lower()
+    assert "saved, not lost" in proc.stdout.lower()
     assert "Traceback" not in proc.stdout
     assert "Traceback" not in proc.stderr
-    # A wip_cap_enforced event was appended.
+    # The wip_cap_enforced ledger event is kept, routed to parking_lot.
     events = _ledger_events(tmp_path)
-    assert any(e["event_type"] == "wip_cap_enforced" for e in events)
+    routed = next(e for e in events if e["event_type"] == "wip_cap_enforced")
+    assert routed["metadata"]["proposed_routing"] == "parking_lot"
 
 
-def test_denial_message_has_no_contradictory_capacity_ok_line(tmp_path):
-    # Boundary case: current load is exactly at the hard cap (not strictly over),
-    # so the current-state display would read "Capacity OK" -- but the projected
-    # add breaches it. The denial must NOT splice an "✅ Capacity OK" line into
-    # the "❌ cap reached" block.
+def test_over_cap_capture_message_is_non_punitive(tmp_path):
+    # Boundary case: current load is exactly at the hard cap. H6: the over-cap add
+    # is captured to parking with a non-punitive message that points at /promote
+    # and /swap -- never a punitive "cap reached" rejection block.
     board = tmp_path / "Work Tasks.md"
     board.write_text(
         "# Work\n\n"
@@ -91,9 +100,14 @@ def test_denial_message_has_no_contradictory_capacity_ok_line(tmp_path):
         tmp_path, board, "Fourth",
         env_overrides={"ACTIVE_TASK_HARD_CAP": "3", "WEEKLY_CAPACITY_HOURS": "1000"},
     )
-    assert proc.returncode != 0
-    assert "cap reached" in proc.stdout.lower()
-    assert "Capacity OK" not in proc.stdout  # no self-contradiction
+    assert proc.returncode == 0
+    out = proc.stdout.lower()
+    assert "captured to the parking lot" in out
+    assert "/promote" in proc.stdout
+    assert "/swap" in proc.stdout
+    # The Fourth task is parked, not added to the active set.
+    text = board.read_text()
+    assert text.index("Fourth") > text.index("Parking Lot")
 
 
 def test_add_passes_under_cap(tmp_path):
@@ -108,7 +122,10 @@ def test_add_passes_under_cap(tmp_path):
     assert not any(e["event_type"] == "wip_cap_enforced" for e in _ledger_events(tmp_path))
 
 
-def test_force_parking_routes_over_cap_add_to_parking_lot(tmp_path):
+def test_force_parking_flag_is_harmless_alias_of_default(tmp_path):
+    # H6: over-cap adds route to parking by DEFAULT. --force-parking is kept as a
+    # harmless alias so existing callers don't break; it routes to parking exactly
+    # like the no-flag path.
     board = tmp_path / "Work Tasks.md"
     board.write_text(
         "# Work\n\n"
@@ -126,6 +143,36 @@ def test_force_parking_routes_over_cap_add_to_parking_lot(tmp_path):
     events = _ledger_events(tmp_path)
     routed = next(e for e in events if e["event_type"] == "wip_cap_enforced")
     assert routed["metadata"]["proposed_routing"] == "parking_lot"
+
+
+def test_over_cap_capture_fails_nonzero_when_lot_full_no_flag(tmp_path):
+    # H6 capture FAILURE path (no flag): if the parking lot itself is full, the
+    # over-cap add cannot be captured. It must NOT report "saved" -- it exits
+    # nonzero, the board is unchanged, and no parking-routing is logged, so a
+    # truly-uncapturable task is never reported as captured.
+    board = tmp_path / "Work Tasks.md"
+    board.write_text(
+        "# Work\n\n"
+        "## 🔴 Q1\n"
+        "- [ ] **T1** estimate:: 13h task_id::tsk_aaaaaaaaaaaaaaaa\n"
+        "- [ ] **T2** estimate:: 13h task_id::tsk_bbbbbbbbbbbbbbbb\n"
+        "## 🅿️ Parking Lot\n"
+        "- [ ] **P1** created::2026-06-01 task_id::tsk_cccccccccccccccc\n"
+    )
+    before = board.read_bytes()
+    proc = _run_add(
+        tmp_path, board, "Overflow",
+        env_overrides={"PARKING_LOT_CAP": "1"},
+    )
+    assert proc.returncode != 0
+    assert board.read_bytes() == before  # nothing added anywhere
+    assert "captured to the parking lot" not in proc.stdout.lower()
+    routed = [
+        e for e in _ledger_events(tmp_path)
+        if e["event_type"] == "wip_cap_enforced"
+        and e["metadata"].get("proposed_routing") == "parking_lot"
+    ]
+    assert routed == []
 
 
 def test_force_parking_full_lot_exits_nonzero_and_logs_no_routing(tmp_path):
@@ -159,7 +206,9 @@ def test_force_parking_full_lot_exits_nonzero_and_logs_no_routing(tmp_path):
 
 def test_section_none_tasks_counted_toward_hard_cap(tmp_path):
     # 1 Q1 + 2 "All Tasks" (section=None) = 3 active; hard cap 3 means a 4th add
-    # would breach, so the add is blocked. Proves section=None is counted.
+    # would breach. H6: the 4th is CAPTURED to parking (not blocked), proving
+    # section=None is still counted toward the cap that triggers the capture --
+    # the COUNTING logic is unchanged, only the over-cap OUTCOME changed.
     board = tmp_path / "Work Tasks.md"
     board.write_text(
         "# Work\n\n"
@@ -171,15 +220,19 @@ def test_section_none_tasks_counted_toward_hard_cap(tmp_path):
         "- [ ] **All two** task_id::tsk_cccccccccccccccc\n"
         "## 🅿️ Parking Lot\n"
     )
-    before = board.read_bytes()
     proc = _run_add(
         tmp_path,
         board,
         "Fourth",
         env_overrides={"ACTIVE_TASK_HARD_CAP": "3", "WEEKLY_CAPACITY_HOURS": "1000"},
     )
-    assert proc.returncode != 0
-    assert board.read_bytes() == before
+    assert proc.returncode == 0
+    text = board.read_text()
+    # The 4th task is parked (it tripped the cap), not added to the active set.
+    assert text.index("Fourth") > text.index("Parking Lot")
+    assert any(
+        e["event_type"] == "wip_cap_enforced" for e in _ledger_events(tmp_path)
+    )
 
 
 def test_personal_add_exempt_from_work_capacity_cap(tmp_path):
@@ -230,8 +283,10 @@ def test_low_priority_add_to_backlog_not_blocked_by_cap(tmp_path):
 
 def test_low_priority_add_gated_when_no_backlog_section(tmp_path):
     # With NO ## ⚪ Backlog section, a --priority low add falls back to the active
-    # All Tasks area, so it MUST be gated (the writer's real fallback, not the
-    # nominal priority->section map, decides cap scope).
+    # All Tasks area, so it IS gated (the writer's real fallback, not the nominal
+    # priority->section map, decides cap scope). H6: "gated" now means CAPTURED to
+    # parking (not blocked) -- the low add does not bloat the over-cap active set,
+    # it lands in the inbox instead.
     board = tmp_path / "Work Tasks.md"
     board.write_text(
         "# Work\n\n"
@@ -242,10 +297,11 @@ def test_low_priority_add_gated_when_no_backlog_section(tmp_path):
         "### Dev\n"
         "## 🅿️ Parking Lot\n"
     )
-    before = board.read_bytes()
     proc = _run_add(tmp_path, board, "Sneaky low", "--priority", "low")
-    assert proc.returncode != 0  # gated: it would land in the active All Tasks area
-    assert board.read_bytes() == before
+    assert proc.returncode == 0  # captured, not blocked
+    text = board.read_text()
+    # It lands in parking (the gated active fallback was over-cap), not All Tasks.
+    assert text.index("Sneaky low") > text.index("Parking Lot")
 
 
 def test_force_parking_logged_as_user_command(tmp_path):

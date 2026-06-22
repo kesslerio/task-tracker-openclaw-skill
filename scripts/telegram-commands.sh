@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Telegram slash command wrapper for task-tracker skill
-# Usage: telegram-commands.sh {daily|weekly|done|reschedule|snooze|body-double|cancel-session|
+# Usage: telegram-commands.sh {daily|weekly|promote|swap|done|reschedule|snooze|body-double|cancel-session|
 #                              done24h|done7d|ledger|approve|nag-check|nag|quiet|unquiet|audit|undo}
 #
 # U1 NO-RAW-ERROR-LEAK boundary: every python3 invocation goes through
@@ -102,6 +102,18 @@ case "$1" in
     shift
     run_with_envelope "undo" python3 "$SCRIPT_DIR/autonomy_cli.py" undo "$@"
     ;;
+  promote)
+    # H6 capture+promote-gate: move a parked task onto the active board. The cap
+    # gates PROMOTION (not capture) -- a full committed set refuses with a /swap
+    # hint. Reactive board mutation; reply lands in the originating topic.
+    run_with_envelope "promote" python3 "$SCRIPT_DIR/tasks.py" promote "$2"
+    ;;
+  swap)
+    # H6 swap: park out_id (active->parking) AND promote in_id (parking->active) so
+    # a full committed set can take a new task without going over-cap. Park-out runs
+    # first to free a slot; a bad out/in id refuses with no partial move.
+    run_with_envelope "swap" python3 "$SCRIPT_DIR/tasks.py" swap "$2" "$3"
+    ;;
   done|reschedule|snooze|body-double|cancel-session)
     # U4 reactive nag commands. Each mutates the board (where applicable) and then
     # closes/pauses the nag loop SYNCHRONOUSLY in the same turn (origin-proven, no
@@ -149,7 +161,7 @@ case "$1" in
     run_with_envelope "manifest" python3 "$SCRIPT_DIR/cos_manifest.py" manifest
     ;;
   *)
-    echo "Usage: $0 {daily|weekly|done|reschedule|snooze|body-double|cancel-session|done24h|done7d|ledger|approve|nag-check|nag|quiet|unquiet|health|manifest|audit|undo}"
+    echo "Usage: $0 {daily|weekly|promote|swap|done|reschedule|snooze|body-double|cancel-session|done24h|done7d|ledger|approve|nag-check|nag|quiet|unquiet|health|manifest|audit|undo}"
     exit 1
     ;;
 esac
