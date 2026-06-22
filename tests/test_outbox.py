@@ -206,3 +206,54 @@ def test_openclaw_sender_raises_on_unparseable_stdout(monkeypatch):
                         _fake_run(stdout="no json here at all"))
     with pytest.raises(outbox.OpenclawSendError):
         outbox.openclaw_sender(TARGET, "x")
+
+
+# --- review finding 4: bounded send (no unbounded hang under the lock) ------
+
+def test_openclaw_sender_passes_a_positive_timeout(monkeypatch):
+    """The send must be BOUNDED: subprocess.run is called with a positive timeout so
+    a hung gateway cannot block forever while the nag-state lock is held."""
+    captured = {}
+
+    def _run(args, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        return types.SimpleNamespace(returncode=0, stdout='{"messageId":"7"}', stderr="")
+
+    monkeypatch.setattr(outbox.subprocess, "run", _run)
+    outbox.openclaw_sender(TARGET, "x")
+    assert isinstance(captured["timeout"], (int, float)) and captured["timeout"] >= 1
+
+
+def test_openclaw_sender_raises_on_timeout(monkeypatch):
+    """A subprocess timeout (hung gateway) becomes an OpenclawSendError -- a delivery
+    FAILURE the caller treats as a loop-stays-open block, never a phantom send. This
+    is the reliability guard: the send runs under the nag-state lock that /done needs."""
+    def _raise_timeout(args, **kwargs):
+        raise outbox.subprocess.TimeoutExpired(cmd="openclaw", timeout=kwargs.get("timeout", 20))
+
+    monkeypatch.setattr(outbox.subprocess, "run", _raise_timeout)
+    with pytest.raises(outbox.OpenclawSendError):
+        outbox.openclaw_sender(TARGET, "x")
+
+
+# --- review finding 5: outbox.json stays flat (stale periods pruned) --------
+
+def test_deliver_once_prunes_stale_periods(state, monkeypatch):
+    """A delivered-receipt key older than the retention window is dropped on the next
+    write, so outbox.json (and the per-run read-modify-write) never grows unbounded;
+    recent keys and the new one survive."""
+    from datetime import datetime, timedelta, timezone
+    monkeypatch.setenv("OUTBOX_RETENTION_DAYS", "7")
+    state.mkdir(parents=True, exist_ok=True)
+    old_ts = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    recent_ts = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    (state / "outbox.json").write_text(json.dumps({
+        "nag:old:2026-05-01-11": {"message_id": "1", "target": TARGET, "ts": old_ts},
+        "nag:recent:2026-06-21-11": {"message_id": "2", "target": TARGET, "ts": recent_ts},
+    }))
+    outbox.deliver_once(TARGET, "new", outbox.make_idem_key("nag", "newtask", "2026-06-22-11"),
+                        sender=lambda t, x: {"message_id": "3"})
+    box = _outbox(state)
+    assert "nag:old:2026-05-01-11" not in box       # stale dropped
+    assert "nag:recent:2026-06-21-11" in box         # recent kept
+    assert "nag:newtask:2026-06-22-11" in box        # new recorded

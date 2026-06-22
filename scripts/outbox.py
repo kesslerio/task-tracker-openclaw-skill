@@ -36,7 +36,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -45,7 +45,7 @@ try:
 except ImportError:  # pragma: no cover - non-POSIX fallback
     fcntl = None
 
-from cos_config import state_dir
+from cos_config import nag_send_timeout_seconds, outbox_retention_days, state_dir
 from utils import _atomic_write
 
 # The only outbox key kind today. A frozen set so a typo'd kind is caught at the
@@ -104,6 +104,33 @@ def _write_outbox(state: dict[str, Any]) -> None:
     _atomic_write(outbox_path(), json.dumps(state, indent=2, sort_keys=True) + "\n")
 
 
+def _entry_before(ts: str | None, cutoff: datetime) -> bool:
+    """True if a receipt's timestamp is older than ``cutoff``.
+
+    A missing/garbage ts is treated as NOT-stale (kept) -- we never drop an entry we
+    cannot confidently age out, since a wrongly-pruned key would re-send.
+    """
+    if not ts:
+        return False
+    try:
+        return datetime.fromisoformat(ts) < cutoff
+    except ValueError:
+        return False
+
+
+def _prune_outbox(state: dict[str, Any]) -> None:
+    """Drop entries older than the retention window so ``outbox.json`` stays flat.
+
+    The outbox only needs RECENT periods to dedupe a same-cycle retry; a key from
+    days ago can never collide with a current ``(task_id, date+hour)`` key, so it is
+    dead weight on every read-modify-write. Pruned in place on write.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=outbox_retention_days())
+    for key in [k for k, v in state.items()
+                if isinstance(v, dict) and _entry_before(v.get("ts"), cutoff)]:
+        del state[key]
+
+
 def deliver_once(
     delivery_target: dict[str, Any],
     text: str,
@@ -155,6 +182,7 @@ def deliver_once(
                 "ts": _now_iso(),
             }
             state[idem_key] = entry
+            _prune_outbox(state)  # drop stale periods so outbox.json stays flat
             _write_outbox(state)
             return {**entry, "idempotent": False}
         finally:
@@ -218,7 +246,15 @@ def openclaw_sender(delivery_target: dict[str, Any], text: str) -> dict[str, Any
         "--json",
     ]
     try:
-        result = subprocess.run(args, capture_output=True, text=True, check=False)
+        result = subprocess.run(args, capture_output=True, text=True, check=False,
+                                timeout=nag_send_timeout_seconds())
+    except subprocess.TimeoutExpired as exc:
+        # The send runs UNDER the nag-state lock; reactive /done takes the same lock,
+        # so an unbounded hang would wedge the user's ability to ack (the exact trust
+        # window the design protects). A timeout is a delivery FAILURE: raise so the
+        # caller leaves the loop OPEN and the lock is released.
+        raise OpenclawSendError(
+            f"openclaw send timed out after {nag_send_timeout_seconds()}s") from exc
     except (OSError, ValueError) as exc:
         raise OpenclawSendError(f"openclaw send could not be launched: {exc}") from exc
     if result.returncode != 0:

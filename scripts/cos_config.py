@@ -137,6 +137,28 @@ def nag_display_limit() -> int:
     return max(1, _int_env("NAG_DISPLAY_LIMIT", 3))
 
 
+def nag_send_timeout_seconds() -> int:
+    """Hard bound on a single ``openclaw message send`` (default 20s, floored at 1).
+
+    H3 makes the nag send in-process, UNDER the nag-state lock; an unbounded hang
+    would wedge the cron run AND reactive ``/done`` (which takes the same lock). A
+    timeout turns a hung gateway into a clean delivery FAILURE that leaves the loop
+    open and releases the lock, instead of blocking forever.
+    """
+    return max(1, _int_env("NAG_SEND_TIMEOUT_SECONDS", 20))
+
+
+def outbox_retention_days() -> int:
+    """Days of delivered-receipt idem-keys to keep in ``outbox.json`` (default 7).
+
+    The outbox only needs RECENT periods to dedupe a same-cycle retry; an entry from
+    days ago can never collide with a current ``(task_id, date+hour)`` key. Old
+    entries are pruned on write so the file and the per-run read-modify-write cost
+    stay flat. Floored at 1 so a typo cannot disable dedupe within the day.
+    """
+    return max(1, _int_env("OUTBOX_RETENTION_DAYS", 7))
+
+
 # --- Proactive layer knobs (U6) -------------------------------------------
 
 def focus_block_day_start_hour() -> int:
