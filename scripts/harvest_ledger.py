@@ -320,10 +320,6 @@ def _pending_match_index(matches: list[dict[str, Any]]) -> dict[str, dict[str, A
 # --- draft assembly --------------------------------------------------------
 
 
-def _bucket(matches: list[dict[str, Any]], decision: str) -> list[dict[str, Any]]:
-    return [m for m in matches if m["decision"] == decision]
-
-
 # H8 four-bucket digest. The Oracle finding: the auto-harvest over-counts code +
 # comms (PR + email) while missing strategy / hiring / decisions / relationships.
 # So harvested evidence is CLASSIFIED into shipped / advanced / maintenance (it can
@@ -381,11 +377,6 @@ def bucketise(matches: list[dict[str, Any]], wins: list[dict[str, Any]]) -> dict
         buckets[bucket].append({"line": win.get("text", ""), "decision": "manual_win",
                                 "matched_task_id": None, "score": None})
     return buckets
-
-
-def digest_has_content(buckets: dict[str, list[dict[str, Any]]]) -> bool:
-    """True iff ANY bucket holds at least one item (the empty-silent gate input)."""
-    return any(buckets.values())
 
 
 def build_draft(matches: list[dict[str, Any]], harvest_window_id: str,
