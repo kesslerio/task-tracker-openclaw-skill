@@ -623,8 +623,20 @@ def run_harvest(window: str, *, since_override: str | None, dry_run: bool, trigg
             state[pushed_key] = harvest_window_id
             state["draft_pushed_at"] = datetime.now(timezone.utc).isoformat()
             state["delivery_target"] = push["delivery_target"]
-            state["pending_task_ids"] = pending_task_ids
-            state["pending_matches"] = _pending_match_index(matches)
+            # Kind-aware dedup allows a reactive + a Friday auto push in one window, so
+            # the pending-approval state must be MERGED across same-window pushes, never
+            # overwritten: an id the reactive digest advertised as approvable ("/approve
+            # A") must survive the Friday push (whose fresh matches differ, or are
+            # wins-only -> empty). Carry forward every still-un-approved pending id.
+            approved = set(state.get("approved_task_ids") or [])
+            merged_ids = (set(state.get("pending_task_ids") or []) | set(pending_task_ids)) - approved
+            state["pending_task_ids"] = sorted(merged_ids)
+            state["pending_matches"] = {
+                tid: match for tid, match in {
+                    **(state.get("pending_matches") or {}),
+                    **_pending_match_index(matches),
+                }.items() if tid not in approved
+            }
             harvest_state.mark_seen(state, [item["evidence_hash"] for item in fresh])
             harvest_state.save_state(state, window)
             # Consume the wins on the SAME success condition as the evidence: a win

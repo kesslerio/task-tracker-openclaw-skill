@@ -228,6 +228,31 @@ def test_legacy_draft_pushed_flag_blocks_a_same_window_reactive(env, monkeypatch
     assert friday["draft_pushed"] is True
 
 
+def test_dual_push_preserves_reactive_approvable_task(env, monkeypatch):
+    """Kind-aware dual push must MERGE pending-approval state, not overwrite it: a
+    task the reactive digest advertised as approvable ('/approve tsk_abc123') stays
+    approvable after the Friday auto digest fires for the same window with different
+    evidence. (Round-3 regression guard: the Friday push used to overwrite pending.)"""
+    _set_productivity_env(monkeypatch)
+    # Reactive push: PR #7 matches board task tsk_abc123, so it is approvable.
+    _stub_sources(monkeypatch, gh_payload=PR_PAYLOAD)
+    reactive = _run(monkeypatch, auto=False, now=MONDAY)
+    assert reactive["draft_pushed"] is True
+    assert "tsk_abc123" in harvest_state.load_state("week")["pending_task_ids"]
+
+    # Friday auto push, SAME window, DIFFERENT (unmatched) evidence -> this run's
+    # pending is empty; pre-fix that overwrote and dropped tsk_abc123.
+    _stub_sources(monkeypatch, gh_payload=[{"title": "Close the Acme migration", "number": 9,
+        "repository": {"nameWithOwner": "kesslerio/acme"}, "url": "https://example.test/pr/9"}])
+    friday = _run(monkeypatch, auto=True, now=FRIDAY)
+    assert friday["draft_pushed"] is True
+    # tsk_abc123 SURVIVES the Friday push and is still one-tap approvable.
+    assert "tsk_abc123" in harvest_state.load_state("week")["pending_task_ids"]
+    approved = harvest_ledger.approve("tsk_abc123", inbound_topic_id=DONE_TOPIC)
+    assert approved["ok"] is True
+    assert approved.get("reason") != "stale-approval"
+
+
 def test_suppressed_auto_run_consumes_no_evidence(env, monkeypatch):
     """A suppressed (non-Friday) auto run must NOT mark evidence seen -- the same PR
     is delivered when Friday's fire is allowed (accomplishments never silently lost)."""
