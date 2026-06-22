@@ -348,8 +348,9 @@ def _fire_locked(live, task_id, record, section, overdue, *, ref, sender):
     sender raises) returns ``delivery_failed`` having mutated ``live`` not at all, so
     ``nag_state.transition`` persists nothing -- the loop stays exactly as it was
     (OPEN), never a phantom "sent". An ``idempotent`` short-circuit (the key was
-    already recorded) still records the loop as sent so its nag_count/last_nag_ts and
-    the ledger receipt are written once.
+    already recorded this cycle -- a same-cycle retry) returns ``already_delivered``
+    having ALSO mutated nothing: no message was delivered, so nag_count is not bumped
+    and no second receipt is written. nag_count counts DELIVERED nags.
     """
     current = live.get(task_id)
     if (isinstance(current, dict) and current.get("ack")) or \
@@ -366,18 +367,24 @@ def _fire_locked(live, task_id, record, section, overdue, *, ref, sender):
     # threshold/delivery_target metadata and emits nag_opened -- rather than
     # silently promoting a stub to a firing loop with delivery_target:null.
     opened = not (nag_state.is_open(current) and nag_state.is_genuine_nag(current))
-    # The loop id is chosen BEFORE the send because it keys the receipt idem-key:
-    # an existing genuine loop reuses its id (a re-fire is the SAME logical nag),
-    # a fresh loop mints one that open_loop will then persist.
+    # The loop id is for the loop STATE + ledger only -- an existing genuine loop
+    # reuses its id (a re-fire is the SAME logical nag), a fresh loop mints one that
+    # open_loop will then persist. It is DELIBERATELY NOT part of the idem-key: a
+    # fresh loop mints a RANDOM id BEFORE the loop is persisted, so keying on it means
+    # a process death between the outbox write and the state persist mints a new id
+    # next run -> a new key -> a missed dedup -> a double-send. The idem-key keys only
+    # on DURABLE identity instead (see below).
     nag_loop_id = (current.get("nag_loop_id") if not opened and isinstance(current, dict)
                    else nag_state.new_nag_loop_id())
-    # The idem-key PERIOD is the scheduled cron cycle = local date + hour (ref is
+    # The idem-key identity is (task_id, period) -- DURABLE facts that survive a crash.
+    # PERIOD is the scheduled cron cycle = local date + hour (ref is
     # cos_config.local_now() in production; the nag fires at 11/14/17 Pacific). So
     # each distinct cycle is its OWN delivery -- the re-nag cadence is PRESERVED --
-    # while a same-cycle retry (a re-run within the hour) dedupes to a single send.
-    # A fresh loop or a later cycle is always a new delivery. Cadence itself is H5's
-    # job; H3 only suppresses a duplicate of the SAME fire, never a scheduled re-nag.
-    idem_key = outbox.make_idem_key("nag", task_id, nag_loop_id, ref.strftime("%Y-%m-%d-%H"))
+    # while a same-cycle retry (a re-run within the hour) dedupes to a single send
+    # REGARDLESS of whether the loop was persisted, closing the first-fire double-send
+    # window. A later cycle is always a new delivery. Cadence itself is H5's job; H3
+    # only suppresses a duplicate of the SAME fire, never a scheduled re-nag.
+    idem_key = outbox.make_idem_key("nag", task_id, ref.strftime("%Y-%m-%d-%H"))
 
     target = authorised["delivery_target"]
     try:
@@ -386,6 +393,14 @@ def _fire_locked(live, task_id, record, section, overdue, *, ref, sender):
         # not a run crash: leave the loop OPEN (state untouched), log it, move on.
         return {"status": "delivery_failed", "reason": type(exc).__name__,
                 "message": str(exc)}
+
+    # An idempotent short-circuit means deliver_once did NOT call the sender: the
+    # message was already delivered THIS cycle, so this duplicate fire must not
+    # inflate nag_count or write a phantom second receipt. nag_count counts DELIVERED
+    # nags; a same-cycle retry is a no-op -- no open_loop, no record_sent, no ledger
+    # event. State is left untouched (transition persists nothing new).
+    if receipt.get("idempotent"):
+        return {"status": "already_delivered"}
 
     if opened:
         nag_state.open_loop(
@@ -396,14 +411,21 @@ def _fire_locked(live, task_id, record, section, overdue, *, ref, sender):
     entry = nag_state.record_sent(live, task_id)
     return {"status": "sent", "entry": entry, "opened": opened,
             "delivery_target": target, "overdue": overdue,
-            "message_id": receipt.get("message_id"), "idem_key": idem_key,
-            "idempotent": receipt.get("idempotent")}
+            "message_id": receipt.get("message_id"), "idem_key": idem_key}
 
 
 def _apply_fire_result(result, task_id, section, counts) -> None:
     """Translate the under-lock fire result into ledger events + counters."""
     status = result["status"]
     if status == "skipped":
+        return
+    if status == "already_delivered":
+        # A same-cycle retry: deliver_once short-circuited on the recorded receipt
+        # WITHOUT calling the sender, so no message went out this fire. The genuine
+        # delivery already logged its one nag_sent; logging again would write a
+        # phantom second receipt for a single delivery and inflate the delivered
+        # count. So the ledger is untouched -- only an observability counter ticks.
+        counts["idempotent"] = counts.get("idempotent", 0) + 1
         return
     if status == "blocked":
         _log("nag_delivery_blocked", task_id=task_id, reason=result["reason"],

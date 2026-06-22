@@ -126,14 +126,19 @@ def test_t1_board_mtime_unchanged(harness):
 
 # --- T2: nag does NOT close without ack (invariant) ------------------------
 
-def test_t2_nag_refires_without_ack(harness):
+def test_t2_nag_refires_without_ack(harness, monkeypatch):
+    from datetime import timedelta
     board, state = harness
     _run(harness)
+    # Advance to the NEXT scheduled cycle so the un-acked loop genuinely re-fires
+    # (a same-cycle re-run would be an idempotent no-op; the invariant under test is
+    # that the loop is NEVER closed without an ack, so it must re-deliver each cycle).
+    monkeypatch.setattr(nag_check, "_today", lambda: REF + timedelta(hours=3))
     counts2, sent2 = _run(harness)
     assert counts2["sent"] == 1
     nag = _state(state)["tsk_abc123"]
     assert nag["ack"] is False
-    assert nag["nag_count"] == 2  # fired twice, never closed
+    assert nag["nag_count"] == 2  # fired in two cycles, never closed
     sent_events = [e for e in _events(state) if e["event_type"] == "nag_sent"]
     assert len(sent_events) == 2
 
@@ -170,16 +175,19 @@ def test_h3_sender_receives_the_proven_gated_target(harness):
 def test_h3_same_cycle_retry_sender_called_once(harness):
     """Idempotency at the nag level: two fires of the SAME loop within the SAME cron
     cycle (same ref instant -- a retry) call the sender EXACTLY once (the outbox
-    idem-key dedupes the duplicate delivery), even though the loop legitimately
-    re-fires (nag_count climbs, loop stays open)."""
+    idem-key dedupes the duplicate delivery). nag_count counts DELIVERED nags, so the
+    same-cycle retry is a NO-OP: nag_count stays 1, exactly ONE nag_sent is logged,
+    and the loop stays open (it re-fires next CYCLE, not on a same-cycle retry)."""
     board, state = harness
     sent = []
     sender = fake_sender(sent)
     nag_check.run_nag_check(sender=sender)
-    nag_check.run_nag_check(sender=sender)  # same REF -> same cycle -> a retry
+    nag_check.run_nag_check(sender=sender)  # same REF -> same cycle -> a retry, no-op
     assert len(sent) == 1  # the real send happened ONCE -- no duplicate to the user
     nag = _state(state)["tsk_abc123"]
-    assert nag["nag_count"] == 2 and nag["ack"] is False  # loop still re-fires + open
+    assert nag["nag_count"] == 1 and nag["ack"] is False  # retry did NOT bump count
+    sent_events = [e for e in _events(state) if e["event_type"] == "nag_sent"]
+    assert len(sent_events) == 1  # the retry logged NO second receipt
 
 
 def test_h3_different_cycle_same_day_redelivers(harness, monkeypatch):
@@ -194,6 +202,55 @@ def test_h3_different_cycle_same_day_redelivers(harness, monkeypatch):
     monkeypatch.setattr(nag_check, "_today", lambda: REF + timedelta(hours=3))  # next cycle, same day
     nag_check.run_nag_check(sender=sender)
     assert len(sent) == 2  # each scheduled cycle delivers -- the re-nag cadence stands
+    nag = _state(state)["tsk_abc123"]
+    assert nag["nag_count"] == 2 and nag["ack"] is False  # each cycle is a delivered nag
+    sent_events = [e for e in _events(state) if e["event_type"] == "nag_sent"]
+    assert len(sent_events) == 2  # one receipt per delivered cycle
+
+
+def test_h3_first_fire_death_then_retry_no_double_send(harness):
+    """Fix 1 (durable idem-key): if the process dies AFTER the outbox records the
+    delivery but BEFORE the loop state is persisted, the next same-cycle run must NOT
+    double-send. The idem-key keys on DURABLE (task_id, period) -- not a per-loop
+    random id minted before persist -- so the recorded outbox entry dedupes the retry
+    even though nag-state.json was never written.
+
+    We simulate the crash window by firing once (which writes BOTH outbox.json and
+    nag-state.json), then wiping nag-state.json on disk while KEEPING outbox.json --
+    exactly the state a death between the two writes would leave. The same-period
+    re-run must find the durable idem-key already recorded and call the sender ZERO
+    more times."""
+    board, state = harness
+    sent = []
+    nag_check.run_nag_check(sender=fake_sender(sent))
+    assert len(sent) == 1  # first fire delivered to the outbox
+    # The loop state did NOT survive (process died before nag_state.transition wrote
+    # it); the outbox receipt DID. Reproduce that on disk.
+    (state / "nag-state.json").unlink()
+    assert (state / "outbox.json").exists()
+    # Same period (same REF) -> durable idem-key already recorded -> NO second send.
+    sent_retry = []
+    nag_check.run_nag_check(sender=fake_sender(sent_retry))
+    assert sent_retry == []  # the user is NOT double-messaged
+
+
+def test_h3_idempotent_retry_logs_no_second_receipt(harness):
+    """Fix 2 (idempotent short-circuit is a no-op): a same-cycle retry adds NO new
+    nag_sent ledger event and does NOT bump nag_count. nag_count counts DELIVERED
+    nags; the retry delivered nothing (deliver_once short-circuited on the recorded
+    receipt without calling the sender), so it must write neither a phantom second
+    receipt nor an inflated count."""
+    board, state = harness
+    sender = fake_sender([])
+    nag_check.run_nag_check(sender=sender)
+    sent_before = [e for e in _events(state) if e["event_type"] == "nag_sent"]
+    count_before = _state(state)["tsk_abc123"]["nag_count"]
+    assert len(sent_before) == 1 and count_before == 1
+
+    nag_check.run_nag_check(sender=sender)  # same cycle -> idempotent no-op
+    sent_after = [e for e in _events(state) if e["event_type"] == "nag_sent"]
+    assert len(sent_after) == 1  # NO second nag_sent receipt
+    assert _state(state)["tsk_abc123"]["nag_count"] == 1  # count NOT bumped
 
 
 def test_h3_sender_failure_leaves_loop_open_and_logs_block(harness):

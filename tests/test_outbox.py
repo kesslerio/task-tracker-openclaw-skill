@@ -133,6 +133,39 @@ def test_openclaw_sender_extracts_message_id_from_noisy_stdout(monkeypatch):
     assert receipt == {"message_id": "1915"}
 
 
+def test_openclaw_sender_extracts_message_id_before_trailing_object(monkeypatch):
+    """Fix 3: a SECOND JSON object after the receipt must not defeat extraction.
+
+    A greedy ``{.*}`` span would run from the first ``{`` to the LAST ``}`` (across
+    both objects) and fail to parse -- treating a DELIVERED message as a failure, so
+    the loop re-sends next cycle with no idempotency protection. The raw_decode scan
+    parses the FIRST complete object carrying messageId and stops there."""
+    stdout = '{"messageId":"1915","ok":true}\n{"summary":"sent 1 message"}'
+    monkeypatch.setattr(outbox.subprocess, "run", _fake_run(stdout=stdout))
+    receipt = outbox.openclaw_sender(TARGET, "x")
+    assert receipt == {"message_id": "1915"}
+
+
+def test_openclaw_sender_extracts_message_id_past_brace_warning_line(monkeypatch):
+    """Fix 3: a warning line that itself contains a ``{`` (but is not the receipt)
+    must be skipped; the scan tries each ``{`` until it finds the receipt object."""
+    stdout = ('WARN config { headroom } note\n'
+              'not-json {oops\n'
+              '{"messageId":"2020","payload":{"k":"v"}}')
+    monkeypatch.setattr(outbox.subprocess, "run", _fake_run(stdout=stdout))
+    receipt = outbox.openclaw_sender(TARGET, "x")
+    assert receipt == {"message_id": "2020"}
+
+
+def test_openclaw_sender_raises_when_no_object_carries_message_id(monkeypatch):
+    """Fix 3: multiple parseable objects but NONE carries messageId -> still a
+    failure (no receipt, no proof of delivery to record)."""
+    stdout = '{"warn":"x"}\n{"payload":{"messageId":"buried"}}'
+    monkeypatch.setattr(outbox.subprocess, "run", _fake_run(stdout=stdout))
+    with pytest.raises(outbox.OpenclawSendError):
+        outbox.openclaw_sender(TARGET, "x")
+
+
 def test_openclaw_sender_builds_listform_args_no_shell(monkeypatch):
     captured = {}
 

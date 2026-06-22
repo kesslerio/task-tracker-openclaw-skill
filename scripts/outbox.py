@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,10 +52,6 @@ from utils import _atomic_write
 # call site rather than silently producing an un-deduped key.
 _KNOWN_KINDS: frozenset[str] = frozenset({"nag"})
 
-# The gateway prints config warnings / headroom lines before the JSON object, so we
-# can't json.loads the whole stdout. Grab the first {...} object non-greedily.
-_JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
-
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -71,14 +66,17 @@ def outbox_lock_path() -> Path:
 
 
 def make_idem_key(kind: str, *parts: str) -> str:
-    """Stable idempotency key, e.g. ``nag:tsk_x:loop_y:2026-06-22-11``.
+    """Stable idempotency key, e.g. ``nag:tsk_x:2026-06-22-11``.
 
     ``kind`` must be a known kind (today only ``"nag"``); ``parts`` are the
     identity that makes one logical delivery unique -- for a nag that is
-    ``(task_id, nag_loop_id, period)`` where ``period`` is the scheduled cron cycle
-    (local date+hour). So a SAME-cycle retry dedupes to one send, while a fresh loop
-    (new ``nag_loop_id``) or a later cycle is a NEW delivery -- the 11/14/17 re-nag
-    cadence is preserved; only a duplicate of the SAME fire is suppressed.
+    ``(task_id, period)`` where ``period`` is the scheduled cron cycle (local
+    date+hour). The identity is deliberately DURABLE: it omits the random
+    ``nag_loop_id`` (which is minted before the loop is persisted), so a same-cycle
+    retry dedupes to one send EVEN IF the loop state was never written -- closing the
+    first-fire double-send window. A later cycle (new ``period``) is a NEW delivery,
+    so the 11/14/17 re-nag cadence is preserved; only a duplicate of the SAME fire
+    (same task, same cycle) is suppressed.
     """
     if kind not in _KNOWN_KINDS:
         raise ValueError(f"unknown outbox idem-key kind {kind!r}")
@@ -175,22 +173,31 @@ class OpenclawSendError(RuntimeError):
 def _extract_message_id(stdout: str) -> str:
     """Pull ``messageId`` out of the gateway's possibly-noisy JSON stdout.
 
-    The gateway prefixes the JSON object with warning/headroom lines, so we locate
-    the first ``{...}`` object and parse THAT. A missing/unparseable object or an
-    absent ``messageId`` raises -- there is no receipt, so there is no proof of
-    delivery to record.
+    The gateway prefixes the receipt with warning/headroom lines (which can contain
+    ``{``) and may print further objects AFTER it (a second JSON object, a trailing
+    summary). A greedy ``{.*}`` span would run from the first ``{`` to the LAST ``}``
+    across all of that and fail to parse. Instead we walk the TOP-LEVEL ``{`` starts
+    and use ``json.JSONDecoder().raw_decode`` to parse the FIRST complete object that
+    is a dict carrying a top-level ``messageId`` -- tolerating noisy prefixes AND
+    trailing objects. When an object parses, we skip PAST its end (not into its
+    interior) so a ``messageId`` nested in some object's ``payload`` is never mistaken
+    for the receipt; when a ``{`` does not start a valid object (a warning brace), we
+    advance one char. A run yielding no such object (no JSON, garbage, or no top-level
+    ``messageId`` anywhere) raises -- no receipt, no proof of delivery to record.
     """
-    match = _JSON_OBJECT.search(stdout or "")
-    if match is None:
-        raise OpenclawSendError("openclaw send produced no JSON object on stdout")
-    try:
-        parsed = json.loads(match.group(0))
-    except json.JSONDecodeError as exc:
-        raise OpenclawSendError(f"openclaw send stdout was not valid JSON: {exc}") from exc
-    message_id = parsed.get("messageId")
-    if message_id is None:
-        raise OpenclawSendError("openclaw send response carried no messageId")
-    return str(message_id)
+    text = stdout or ""
+    decoder = json.JSONDecoder()
+    index = text.find("{")
+    while index != -1:
+        try:
+            obj, end = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            index = text.find("{", index + 1)  # a brace that starts no object (noise)
+            continue
+        if isinstance(obj, dict) and obj.get("messageId") is not None:
+            return str(obj["messageId"])
+        index = text.find("{", end)  # skip PAST this object -- don't probe its interior
+    raise OpenclawSendError("openclaw send response carried no messageId")
 
 
 def openclaw_sender(delivery_target: dict[str, Any], text: str) -> dict[str, Any]:
