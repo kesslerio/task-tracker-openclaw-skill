@@ -85,10 +85,16 @@ case "$1" in
     run_with_envelope "ledger_harvest" python3 "$SCRIPT_DIR/harvest_ledger.py" harvest --window week
     ;;
   ledger-cron)
-    # H8: the SCHEDULED weekly brag digest (the U5 cron points here). --auto engages
-    # the Friday+content gate (silent on non-Friday and when empty) AND records
+    # H8 + V2: the SCHEDULED weekly brag digest (the U5 cron points here). --auto
+    # engages the Friday+content gate (silent on non-Friday and when empty) AND records
     # ledger_harvest health, so a silently-broken weekly harvest shows up in the
-    # manifest instead of false-greening. Every reactive path stays un-auto'd.
+    # manifest instead of false-greening. V2 (O3 HIGH 1): the --auto digest now OWNS its
+    # delivery through the receipt-backed outbox (openclaw message send -> message-id
+    # receipt) and consumes evidence/wins ONLY on a real receipt -- a transport failure
+    # records a health FAILURE and re-attempts next fire (never lost-and-false-greened).
+    # Because the script owns the send, stdout carries ONLY a compact status line (no
+    # draft), so this cron's announce of stdout delivers nothing and cannot double-send.
+    # Every reactive path stays un-auto'd (it consumes on proof + relays the draft).
     run_with_envelope "ledger_harvest" python3 "$SCRIPT_DIR/harvest_ledger.py" harvest --window week --auto
     ;;
   approve)

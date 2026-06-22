@@ -29,10 +29,24 @@ Hard seams enforced here:
 * **NO RAW ERROR LEAK.** Every harvest subprocess failure is caught, classified,
   and logged through ``error_envelope`` (the canonical error log) -- never echoed.
 
-The script does NOT call the Telegram ``message`` tool itself; it emits the proven
-``delivery_target`` + draft text as structured output and the agent relays it. The
-push proof (gate + assert) is exercised here so a buggy relay cannot send to an
-unproven target.
+Delivery split (auto vs reactive):
+
+* The SCHEDULED (``--auto``) Friday digest OWNS its delivery through the
+  receipt-backed outbox (``ledger_delivery.deliver_auto_digest`` ->
+  ``outbox.deliver_once`` -> ``openclaw_sender``). It consumes NOTHING -- no evidence
+  marked seen, no wins consumed, no ``ledger_draft_pushed``, no ``auto_pushed_window``,
+  no health SUCCESS -- until the transport returns a RECEIPT (a message id). A
+  transport failure consumes nothing and records a health FAILURE so a lost digest can
+  never false-green the ritual (V2 / O3 HIGH 1: receipt, not proof, marks consumed).
+  The auto path therefore prints only a small status line (NOT the draft), so the
+  cron's blind ``announce`` of stdout delivers nothing and cannot double-send.
+* The REACTIVE ``/ledger`` pull emits the proven ``delivery_target`` + draft text as
+  structured output and the agent relays it to the user's DYNAMIC originating topic
+  (interactive, immediately visible). That delivery model is acceptable -- there is no
+  fixed proven target to receipt-back -- so the reactive path consumes on PROOF.
+
+The push proof (gate + assert) is exercised on both paths so a buggy relay cannot send
+to an unproven target.
 """
 
 from __future__ import annotations
@@ -55,6 +69,7 @@ import cos_config
 import delivery_target
 import error_envelope
 import harvest_state
+import ledger_delivery
 import redaction
 import win_store
 from evidence_matching import extract_done_lines, match_evidence_content
@@ -435,9 +450,11 @@ def prove_and_gate_push(
 
     DELIVERY-TARGET-PROOF: the target is proven from env, bound through the gate
     (which re-proves it and rejects a Work-group/unknown/unset target), and the
-    returned ``act_id`` is the SOLE token a later ``message()`` send may use. The
-    push is logged as a ``ledger_draft_pushed`` ledger event with the proven
-    target -- so a replay can verify the original destination was correct.
+    returned ``act_id`` is the SOLE token a later ``message()`` send may use.
+
+    This proves + gates ONLY; the ``ledger_draft_pushed`` event (the proof-of-DELIVERY
+    record) is logged by ``ledger_delivery.log_draft_pushed`` ONLY after delivery is
+    confirmed -- logging it on proof here would re-introduce the O3 HIGH 1 false-green.
 
     Returns ``{"ok": True, "delivery_target", "act_id"}`` or
     ``{"ok": False, "reason"}`` (nothing is sent on a False result).
@@ -463,20 +480,6 @@ def prove_and_gate_push(
     if not send_ok["ok"]:
         return {"ok": False, "reason": send_ok.get("reason", "target-mismatch")}
 
-    append_event(
-        new_event(
-            "ledger_draft_pushed",
-            actor=ACTOR,
-            source=LEDGER_SOURCE,
-            metadata={
-                "harvest_window_id": harvest_window_id,
-                "delivery_target": target,
-                "pending_task_ids": pending_task_ids,
-                "evidence_count": evidence_count,
-                "act_id": gated["act_id"],
-            },
-        )
-    )
     return {"ok": True, "delivery_target": target, "act_id": gated["act_id"]}
 
 
@@ -515,15 +518,22 @@ def _auto_send_allowed(*, auto: bool, has_content: bool, now: datetime | None) -
 
 
 def run_harvest(window: str, *, since_override: str | None, dry_run: bool, trigger: str,
-                auto: bool = False, now: datetime | None = None) -> dict[str, Any]:
+                auto: bool = False, now: datetime | None = None,
+                sender: Callable[[dict[str, Any], str], dict[str, Any]] | None = None
+                ) -> dict[str, Any]:
     """Harvest, dedup, match, fold in manual wins, and (unless dry-run) push a digest.
 
-    ``auto`` marks the SCHEDULED (cron) path: it is gated to Friday-with-content, so
-    a non-Friday auto-run -- or a Friday auto-run with an empty digest -- pushes
-    NOTHING (no blank message). A reactive ``/ledger`` (``auto=False``) works any day
-    and only needs content of its own. Returns the structured result + draft text +
-    the proven ``delivery_target`` (or a blocked reason). NEVER raises -- the
-    ``main`` wrapper classifies any unhandled exception into the friendly fallback.
+    ``auto`` marks the SCHEDULED (cron) path: gated to Friday-with-content (a non-Friday
+    or empty Friday run pushes NOTHING). The auto digest OWNS its delivery and consumes
+    NOTHING until the transport returns a RECEIPT (see the module docstring + the
+    ``ledger_delivery.push_and_consume`` consume-gate). A reactive ``/ledger``
+    (``auto=False``) works any day and delivers via the agent relay (consumes on proof).
+    ``sender`` is the receipt-returning transport the AUTO send uses (default
+    ``outbox.openclaw_sender``; tests inject a fake); unused on the reactive path.
+
+    Returns the structured result + draft text + the proven ``delivery_target`` (or a
+    blocked reason). NEVER raises -- the ``main`` wrapper classifies any unhandled
+    exception into the friendly fallback.
     """
     harvest_window_id = harvest_state.window_id(window)
     state, expired = harvest_state.load_or_reset(harvest_window_id, window)
@@ -603,44 +613,24 @@ def run_harvest(window: str, *, since_override: str | None, dry_run: bool, trigg
                 "source_error": source_error,
                 "message": "Ledger draft already sent for this window.",
             }
-        push = prove_and_gate_push(
+        proof = prove_and_gate_push(
             pending_task_ids=pending_task_ids,
             evidence_count=len(fresh),
             harvest_window_id=harvest_window_id,
         )
-        # Evidence is consumed (marked seen) ONLY once the push target is PROVEN
-        # and the draft is logged -- never on a BLOCKED push (env unset /
-        # Work-group / gate rejection), where the dedup set is left untouched so
-        # the next fire re-attempts delivery once the target is fixed. (The final
-        # Telegram send is performed by the agent relay; if that relay step fails
-        # the draft can be re-emitted from the logged ledger_draft_pushed event --
-        # proof success, not Telegram receipt, is what marks evidence consumed.)
-        if push["ok"]:
-            state[pushed_key] = harvest_window_id
-            state["draft_pushed_at"] = datetime.now(timezone.utc).isoformat()
-            state["delivery_target"] = push["delivery_target"]
-            # Kind-aware dedup allows a reactive + a Friday auto push in one window, so
-            # the pending-approval state must be MERGED across same-window pushes, never
-            # overwritten: an id the reactive digest advertised as approvable ("/approve
-            # A") must survive the Friday push (whose fresh matches differ, or are
-            # wins-only -> empty). Carry forward every still-un-approved pending id.
-            approved = set(state.get("approved_task_ids") or [])
-            merged_ids = (set(state.get("pending_task_ids") or []) | set(pending_task_ids)) - approved
-            state["pending_task_ids"] = sorted(merged_ids)
-            state["pending_matches"] = {
-                tid: match for tid, match in {
-                    **(state.get("pending_matches") or {}),
-                    **_pending_match_index(matches),
-                }.items() if tid not in approved
-            }
-            harvest_state.mark_seen(state, [item["evidence_hash"] for item in fresh])
-            harvest_state.save_state(state, window)
-            # Consume the wins on the SAME success condition as the evidence: a win
-            # is marked seen ONLY when it was included in a digest that actually
-            # PUSHED, so a win captured after this push stays unseen for the next
-            # one, and a delivered win never repeats. (A suppressed/blocked/no-push
-            # run never reaches here, so it consumes no wins -- never silently lost.)
-            win_store.mark_wins_seen([win["id"] for win in wins])
+        # Consume-gate split (O3 HIGH 1): the AUTO digest consumes ONLY on a receipt
+        # (it owns the receipt-backed send); the REACTIVE pull consumes on proof (the
+        # relay delivers to the dynamic originating topic). See push_and_consume.
+        push = ledger_delivery.push_and_consume(
+            proof,
+            ledger_delivery.DigestPush(
+                state=state, window=window, pushed_key=pushed_key,
+                harvest_window_id=harvest_window_id,
+                match_index=_pending_match_index(matches),
+                pending_task_ids=pending_task_ids, fresh=fresh, wins=wins, draft=draft,
+            ),
+            auto=auto, actor=ACTOR, source=LEDGER_SOURCE, sender=sender,
+        )
 
     return {
         "ok": True,
@@ -873,7 +863,14 @@ def _record_ledger_health(result: dict[str, Any]) -> None:
 # --- CLI -------------------------------------------------------------------
 
 
-def _emit(payload: dict[str, Any], *, as_json: bool) -> None:
+def _emit(payload: dict[str, Any], *, as_json: bool, auto: bool = False) -> None:
+    # SCHEDULED (--auto): the digest already delivered itself (receipt-backed outbox),
+    # so stdout carries ONLY a compact status line (no draft) -- the cron's blind
+    # announce then delivers nothing and CANNOT double-send. The REACTIVE path still
+    # emits the draft for the agent relay to deliver.
+    if auto:
+        print(ledger_delivery.auto_status_line(payload))
+        return
     if as_json:
         print(json.dumps(payload, indent=2, sort_keys=True, default=str))
         return
@@ -912,7 +909,7 @@ def _run_harvest_cli(args: argparse.Namespace) -> int:
         raise
     if record_health:
         _record_ledger_health(result)
-    _emit(result, as_json=args.json)
+    _emit(result, as_json=args.json, auto=args.auto)
     return 0
 
 
