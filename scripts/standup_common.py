@@ -11,6 +11,7 @@ from datetime import date, datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import cos_config
 import error_envelope
 
 
@@ -153,8 +154,13 @@ def format_time(iso_time: str) -> str:
 
 
 def resolve_standup_date(date_str: str | None) -> date:
-    """Parse standup date from YYYY-MM-DD, defaulting to today."""
-    today = datetime.now().date()
+    """Parse standup date from YYYY-MM-DD, defaulting to today.
+
+    "Today" is the LOCAL (Pacific) calendar day: this date feeds the standup's
+    overdue/effective-priority regrouping, so a UTC day (rolled over by the
+    17:00/17:30 Pacific cron) would mis-classify due-today tasks as overdue.
+    """
+    today = cos_config.local_today()
     if not date_str:
         return today
 

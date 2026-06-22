@@ -18,6 +18,13 @@ from datetime import datetime, timedelta, date
 from pathlib import Path
 import sys
 
+# Local-time "today" lives in cos_config (DRY single source of truth): the
+# cron fires in Pacific while the container clock is UTC, so a naive
+# datetime.now()/date.today() reads the UTC day and mis-classifies a
+# due-today task as overdue at Pacific evening. cos_config has no project
+# imports, so importing it here introduces no cycle.
+import cos_config
+
 # Configurable paths with sensible defaults
 # Users should set these environment variables for their own setup
 OBSIDIAN_WORK = Path(os.getenv(
@@ -274,8 +281,8 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
     current_department = None  # Track department from ### lines
     current_task = None
     current_objective = None
-    today = datetime.now().date()
-    
+    today = cos_config.local_today()  # local (Pacific) day for the due-today check below
+
     for line_number, line in enumerate(content.split('\n'), start=1):
         # Detect section headers
         if line.startswith('## '):
@@ -533,8 +540,8 @@ def check_due_date(due: str, check_type: str = 'today') -> bool:
     """Check if a due date matches the given type."""
     if not due:
         return False  # Tasks without due dates don't match any filter
-    
-    today = datetime.now().date()
+
+    today = cos_config.local_today()  # local (Pacific) day: this is the overdue/today/this-week classifier
     week_end = today + timedelta(days=(6 - today.weekday()))
     
     try:
@@ -671,10 +678,10 @@ def get_missed_tasks(tasks_data: dict, lookback_days: int = 1, reference_date: s
         try:
             today = datetime.strptime(reference_date, '%Y-%m-%d').date()
         except ValueError:
-            today = datetime.now().date()
+            today = cos_config.local_today()
     else:
-        today = datetime.now().date()
-    
+        today = cos_config.local_today()
+
     start_date = today - timedelta(days=lookback_days)
     end_date = today - timedelta(days=1)
 
@@ -711,9 +718,9 @@ def get_missed_tasks_bucketed(tasks_data: dict, reference_date: str = None) -> d
         try:
             today = datetime.strptime(reference_date, '%Y-%m-%d').date()
         except ValueError:
-            today = datetime.now().date()
+            today = cos_config.local_today()
     else:
-        today = datetime.now().date()
+        today = cos_config.local_today()
 
     yesterday = today - timedelta(days=1)
     last_week = today - timedelta(days=7)
@@ -780,14 +787,16 @@ def effective_priority(task: dict, reference_date=None) -> dict:
     due_str = task.get('due')
     original_section = section
 
-    # Resolve reference date
+    # Resolve reference date. The default "today" is the local (Pacific) day:
+    # this drives the overdue-escalation thresholds below, which a UTC day
+    # (rolled over by the Pacific-evening cron) would trigger a day early.
     if reference_date is None:
-        ref = _dt.now().date()
+        ref = cos_config.local_today()
     elif isinstance(reference_date, str):
         try:
             ref = _dt.strptime(reference_date, '%Y-%m-%d').date()
         except ValueError:
-            ref = _dt.now().date()
+            ref = cos_config.local_today()
     else:
         ref = reference_date
 

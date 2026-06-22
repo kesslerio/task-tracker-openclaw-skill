@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -47,7 +47,10 @@ def _now_iso() -> str:
 
 
 def today_str() -> str:
-    return date.today().isoformat()
+    # Local (Pacific) calendar day, not the container's UTC day: this stamps the
+    # focus-state ``date`` and drives the stale-date "re-propose each morning"
+    # check, which a UTC day would roll a day early at Pacific evening.
+    return cos_config.local_today().isoformat()
 
 
 def _rename_corrupt_aside(path: Path) -> Path | None:

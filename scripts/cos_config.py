@@ -9,7 +9,9 @@ unit invents its own variant of a knob.
 from __future__ import annotations
 
 import os
+from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 def _int_env(name: str, default: int) -> int:
@@ -25,6 +27,51 @@ def _int_env(name: str, default: int) -> int:
         return int(raw.strip())
     except ValueError:
         return default
+
+
+# --- Local-time canonical helpers -----------------------------------------
+#
+# WHY: the cron jobs fire in America/Los_Angeles, but the container clock runs in
+# UTC. A naive ``datetime.now()`` / ``date.today()`` therefore reads the UTC
+# calendar day, which has ALREADY rolled to tomorrow by the 17:00 / 17:30 Pacific
+# runs. That makes a task due *today* (Pacific) look 1 day overdue and nags a Q1
+# task a day early. Every "today" / "overdue" comparison must derive its calendar
+# day from these helpers so the whole skill agrees on one local day.
+
+DEFAULT_TIMEZONE = "America/Los_Angeles"
+
+
+def local_tz() -> ZoneInfo:
+    """The user's local timezone from ``COS_TIMEZONE`` (default US Pacific).
+
+    Mirrors ``_int_env`` robustness: an unknown/garbage tz name degrades to the
+    documented default rather than crashing a ritual.
+    """
+    name = (os.getenv("COS_TIMEZONE") or "").strip() or DEFAULT_TIMEZONE
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return ZoneInfo(DEFAULT_TIMEZONE)
+
+
+def local_now() -> datetime:
+    """Tz-aware ``now`` in the user's local zone.
+
+    Use this instead of ``datetime.now(timezone.utc)`` wherever a calendar-day
+    comparison against a due date follows: at Pacific evening the UTC day is
+    already tomorrow, so a UTC ``now`` mis-classifies due-today as overdue.
+    """
+    return datetime.now(local_tz())
+
+
+def local_today() -> date:
+    """Today's calendar date in the user's local zone.
+
+    The single source of truth for "today" in due-date / overdue logic. Replaces
+    naive ``date.today()`` / ``datetime.now().date()``, both of which read the UTC
+    day inside the container and roll a day early at Pacific evening.
+    """
+    return local_now().date()
 
 
 # --- Focus / capacity knobs (Contract 6, Decision #7) ---------------------
