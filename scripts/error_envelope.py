@@ -407,7 +407,17 @@ def log_subprocess_error(
     stderr: str,
     trigger: str,
 ) -> None:
-    """Log a failed subprocess. Never echo raw stderr to stdout (U1 §6a)."""
+    """Log a failed subprocess. Never echo raw stderr to stdout (U1 §6a).
+
+    R1 Fix 3: a failed subprocess is also a machine-visible health FAILURE. The shell
+    wrapper (``run_with_envelope``) is the boundary for the cron rituals that do NOT go
+    through ``run_main`` (``nag_check``, ``ledger_harvest``): when one exits non-zero,
+    this is the only place the failure is recorded, so it must stamp ``cos_health`` too
+    -- otherwise a ritual that soft-fails via its return code (R1 Fix 2) false-greens in
+    the health surface. Best-effort + wrapped: a health-write failure here can never
+    escalate a subprocess log into a new failure (the friendly notice is already owned
+    by the shell wrapper).
+    """
     error_class = classify(None, stderr=stderr)
     log_error(
         component,
@@ -419,6 +429,7 @@ def log_subprocess_error(
         level="error",
         action_taken="abort+notify",
     )
+    _record_health_failure(component, error_class, trigger)
 
 
 def log_degraded(
@@ -457,9 +468,26 @@ def log_degraded(
 def run_main(component: str, main_func, trigger: str | None = None) -> int:
     """Run a script's ``main()`` inside the envelope. Returns the exit code.
 
-    On success: returns 0 (or whatever ``main`` returns, defaulting to 0).
-    On any uncaught exception: logs it, prints ONE friendly line to stdout, and
-    returns 0 so the agent relay never sees a non-zero exit or raw output.
+    On a clean run: records health SUCCESS and returns ``main``'s code (0/None == 0).
+    On any uncaught exception: logs it, records a health FAILURE, prints ONE friendly
+    line to stdout, and returns 0 so the agent relay never sees a non-zero exit or raw
+    output.
+
+    R1 Fix 1 -- health is recorded from the RESULT CODE, not merely exception-vs-not.
+    A ritual can FAIL without raising: it can catch the failure itself and ``return 1``
+    (the nag engine does exactly this when a per-task transport failure was swallowed
+    into a ``blocked`` count). A handled-but-failed ritual is NOT healthy, so a NONZERO
+    int result records a ``record_failure`` (error_class ``nonzero_exit``) just as a
+    raised exception would -- otherwise H4's health substrate false-greens on a soft
+    failure. A ``0``/``None`` result records ``record_success``.
+
+    CRITICAL exit-0 contract (UNCHANGED): a soft failure must NOT make the cron relay
+    see a non-zero exit and forward raw output. So in the nonzero case we record the
+    health failure and STILL ``return 0`` to the OS -- the health signal is the
+    machine-visible failure, the exit code stays the friendly exit-0. (A raised
+    exception likewise records a failure and returns 0.) Health recording is best-effort
+    throughout: a raising recorder is swallowed and can never change the exit code or
+    stdout -- the H4 wrap.
 
     ``SystemExit`` from argparse (``--help``, bad args) is re-raised untouched so
     CLI ergonomics are preserved; only genuine exceptions are enveloped.
@@ -484,9 +512,15 @@ def run_main(component: str, main_func, trigger: str | None = None) -> int:
         _record_health_failure(component, classify(exc), resolved_trigger)
         print(line)
         return 0
-    # H4: a CLEAN ritual run (no exception) is recorded as a success so a watchdog
-    # can tell a healthy cron from a silently-stuck one. Best-effort, post-main, so
-    # it can never alter what main() returned or printed.
+    # R1 Fix 1: inspect the RESULT CODE. A handled-but-failed ritual returns a NONZERO
+    # int (it caught its own failure rather than raising); that is NOT healthy, so it
+    # records a health FAILURE -- but we STILL return 0 to the OS so the cron relay sees
+    # the unchanged exit-0 contract (the health signal, not the exit code, carries the
+    # failure). A 0/None result is a clean run -> record_success. Both recorders are
+    # best-effort (post-main, wrapped) so they can never alter what main() returned/printed.
+    if isinstance(result, int) and result != 0:
+        _record_health_failure(component, "nonzero_exit", resolved_trigger)
+        return 0
     _record_health_success(component)
     return int(result) if isinstance(result, int) else 0
 

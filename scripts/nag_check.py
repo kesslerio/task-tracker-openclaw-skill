@@ -614,6 +614,18 @@ def main(argv: list[str] | None = None) -> int:
                   f"{counts['closed']} closed, {counts['blocked']} blocked, "
                   f"{counts['deferred']} deferred")
         print(footer, file=sys.stdout if args.dry_run else sys.stderr)
+        # R1 Fix 2: surface a SWALLOWED delivery failure. run_nag_check absorbs every
+        # per-task transport failure into ``counts['blocked']`` (the loops are left OPEN,
+        # never crashed) and the run otherwise looks clean -- so a real run that blocked
+        # one or more nags returns a NONZERO code. The shell wrapper (run_with_envelope)
+        # then records a health FAILURE for ``nag_check`` (via log_subprocess_error -> Fix
+        # 3) while STILL relaying exit-0 semantics to the cron (Fix 1's contract): the
+        # failure is machine-visible, the cron is not tripped. A fully clean run returns 0.
+        # Only the return CODE changes here; stdout/footer behaviour is untouched. A
+        # dry-run never delivers, so its ``blocked`` count is a preview, not a real
+        # delivery failure -- it always returns 0.
+        if not args.dry_run and counts["blocked"] > 0:
+            return 1
         return 0
     except Exception as exc:  # noqa: BLE001 -- top-level NO-RAW-ERROR-LEAK boundary
         error_envelope.log_error(

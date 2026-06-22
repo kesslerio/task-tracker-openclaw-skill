@@ -46,6 +46,23 @@ ENABLED_UNITS: list[dict[str, Any]] = [
 # flagged STALE. 36h spans a full daily cadence plus a missed run before alarming.
 _DEFAULT_STALE_HOURS = 36
 
+# R1 Fix 4: the expected-ritual registry -- the rituals that SHOULD run, with each
+# one's max-age cadence in HOURS. A registered ritual that has NEVER recorded any
+# health (no entry in cos-health.json at all) is flagged MISSING (a kind of STALE):
+# "absent" is now LOUD, not silent. The ``health`` view iterates the registry UNION the
+# recorded rituals, so a ritual that has never started is visible rather than simply not
+# printed. The component names are the ones the rituals pass to run_main / the shell
+# ``run_with_envelope`` label (and thus to cos_health.record_*): ``standup``,
+# ``weekly_review``, ``nag_check``, ``ledger_harvest``, ``eod_review`` (grep:
+# error_envelope.run_main(...) + telegram-commands.sh run_with_envelope labels).
+_EXPECTED_RITUALS: dict[str, int] = {
+    "standup": 24,            # daily cadence
+    "weekly_review": 24 * 8,  # weekly cadence + a missed run of slack
+    "nag_check": 24,          # fires every ~3h in work hours; daily is a loose ceiling
+    "ledger_harvest": 24 * 8, # the done/ledger harvest is run on demand + weekly
+    "eod_review": 24,         # end-of-day cadence
+}
+
 # Stamp files checked (in order) for the deployed skill version. Best-effort: the
 # first that exists wins; absent -> "unknown" (a worktree has no deploy stamp).
 _STAMP_FILES = ("VERSION", "DEPLOY_STAMP")
@@ -98,8 +115,15 @@ def write_manifest() -> dict[str, Any]:
     return manifest
 
 
-def _age_hours(ts: str | None) -> float | None:
-    """Hours between ``ts`` (local ISO) and now, or None if absent/unparseable."""
+def _parse_ts(ts: str | None):
+    """Parse a local-ISO timestamp into an aware ``datetime``, or None if absent/garbage.
+
+    A naive timestamp is pinned to the local tz so two timestamps compare apples-to-apples
+    (the same clock the rituals/cron stamp in). Used both by ``_age_hours`` and by the
+    DEGRADED freshness check, which compares the two PARSED timestamps DIRECTLY -- never
+    two independently-computed ``now``-relative ages, whose two ``local_now()`` snapshots
+    drift apart and would mis-order an EQUAL failure/success pair.
+    """
     if not ts:
         return None
     try:
@@ -108,32 +132,97 @@ def _age_hours(ts: str | None) -> float | None:
         return None
     if when.tzinfo is None:
         when = when.replace(tzinfo=cos_config.local_tz())
+    return when
+
+
+def _age_hours(ts: str | None) -> float | None:
+    """Hours between ``ts`` (local ISO) and now, or None if absent/unparseable."""
+    when = _parse_ts(ts)
+    if when is None:
+        return None
     delta = cos_config.local_now() - when
     return delta.total_seconds() / 3600.0
 
 
-def health_lines(*, stale_hours: int = _DEFAULT_STALE_HOURS) -> list[str]:
-    """Render the per-ritual health summary, flagging stale rituals.
+def _ritual_flag(entry: dict[str, Any] | None, *, stale_hours: int, registered: bool) -> str:
+    """Classify ONE ritual's health into a status flag.
 
-    A ritual whose ``last_success_ts`` is older than ``stale_hours`` (or has none) is
-    flagged STALE; a recent success is OK. The last failure (class + ts) is shown when
-    present so a watchdog/operator sees both the last good run and the last bad one.
+    R1 Fix 4 precedence (loudest comparable failure wins, documented):
+
+    * MISSING -- a REGISTERED ritual with NO health entry at all (never ran). A kind of
+      STALE: "absent" is loud, not silent. (Outermost: there is nothing to compare.)
+    * DEGRADED -- a FRESH failure that is comparable to a recorded success:
+      ``last_failure_ts`` is newer than OR EQUAL TO ``last_success_ts``. A failure at
+      least as recent as the last good run means the ritual's most recent outcome is a
+      failure -- the loudest signal -- so it OUTRANKS OK and STALE: a ritual that ran and
+      BROKE must not read OK just because the (older) success is still inside the stale
+      window. (An OLDER failure already followed by a NEWER success is a RECOVERED ritual
+      -- failure newer-than success is false -- so it is NOT degraded.)
+    * STALE -- ``last_success_ts`` is absent or older than ``stale_hours`` and there is
+      no fresh comparable failure to upgrade it to DEGRADED. A failure with NO recorded
+      success is STALE-by-absent-success, NOT degraded: there is no good run to be newer
+      than, so "the ritual never succeeded" is the staleness story, not a regression.
+    * OK -- a recent success and no fresh failure.
+    """
+    if entry is None:
+        # A registered ritual that has never recorded any health: never ran -> MISSING.
+        # (An unregistered ritual never reaches here -- it always has a recorded entry.)
+        return "MISSING" if registered else "STALE"
+
+    last_success = entry.get("last_success_ts")
+    success_when = _parse_ts(last_success)
+    failure_ts = entry.get("last_failure_ts")
+    if failure_ts is None:
+        failure = entry.get("last_failure")
+        failure_ts = failure.get("ts") if isinstance(failure, dict) else None
+    failure_when = _parse_ts(failure_ts)
+
+    # FRESH FAILURE (loudest, but only when COMPARABLE to a recorded success): a failure
+    # at least as recent as the last good run means the most recent outcome is a failure
+    # -> DEGRADED, regardless of how fresh that (older) success is. The two PARSED
+    # timestamps are compared DIRECTLY (not two now-relative ages, whose separate
+    # local_now() snapshots drift and would mis-order an EQUAL pair): failure >= success
+    # is the documented rule. A failure with no recorded/parseable success has nothing to
+    # be newer-than, so it stays STALE-by-absent-success below, not DEGRADED.
+    if failure_when is not None and success_when is not None and failure_when >= success_when:
+        return "DEGRADED"
+
+    success_age = _age_hours(last_success)
+    if success_age is None or success_age > stale_hours:
+        return "STALE"
+    return "OK"
+
+
+def health_lines(*, stale_hours: int = _DEFAULT_STALE_HOURS) -> list[str]:
+    """Render the per-ritual health summary, flagging stale/degraded/missing rituals.
+
+    R1 Fix 4: the view iterates the EXPECTED-RITUAL registry UNION the recorded rituals,
+    so a registered ritual that has never run shows up as MISSING rather than being
+    silently absent. Per ritual (see ``_ritual_flag`` for the precedence):
+
+    * DEGRADED -- a fresh failure (``last_failure_ts`` >= ``last_success_ts``);
+    * MISSING  -- a registered ritual with no health entry at all (never ran);
+    * STALE    -- ``last_success_ts`` absent/older than ``stale_hours`` (no fresh failure);
+    * OK       -- a recent success and no fresh failure.
+
+    The last failure (class + ts) is shown when present so a watchdog/operator sees both
+    the last good run and the last bad one.
     """
     rituals = cos_health.read_health()
-    if not rituals:
+    # Union: every registered ritual is visible even with no recorded entry (MISSING),
+    # plus any recorded ritual not in the registry (an ad-hoc / future ritual still gets
+    # its STALE/DEGRADED/OK status). Sorted for a stable, deterministic surface.
+    names = sorted(set(_EXPECTED_RITUALS) | set(rituals))
+    if not names:
         return ["No ritual health recorded yet."]
 
     lines: list[str] = []
-    for ritual in sorted(rituals):
-        entry = rituals[ritual] if isinstance(rituals[ritual], dict) else {}
-        last_success = entry.get("last_success_ts")
-        age = _age_hours(last_success)
-        if age is None or age > stale_hours:
-            flag = "STALE"
-        else:
-            flag = "OK"
-        success_part = last_success or "never"
-        failure = entry.get("last_failure")
+    for ritual in names:
+        raw = rituals.get(ritual)
+        entry = raw if isinstance(raw, dict) else None
+        flag = _ritual_flag(entry, stale_hours=stale_hours, registered=ritual in _EXPECTED_RITUALS)
+        success_part = (entry or {}).get("last_success_ts") or "never"
+        failure = (entry or {}).get("last_failure")
         if isinstance(failure, dict):
             fail_part = f" | last_failure: {failure.get('error_class')} @ {failure.get('ts')}"
         else:
