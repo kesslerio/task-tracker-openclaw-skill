@@ -385,12 +385,12 @@ def test_run_nag_check_requires_transport_for_real_run(harness):
 
 # --- R1 Fix 2: a swallowed delivery failure surfaces as a NONZERO main() code -----
 
-def test_r1_blocked_run_returns_nonzero(tmp_path, monkeypatch, capsys):
-    """R1 Fix 2: run_nag_check absorbs a per-task transport failure into counts['blocked']
-    and leaves the loop OPEN -- the run otherwise looks clean. main() must NOT report that
-    as success: on a non-dry-run with blocked>0 it returns a NONZERO code so the envelope
-    (Fix 1/Fix 3) records a health FAILURE for nag_check. Here the env is unset so the nag
-    is delivery-blocked at the prove stage (env_missing) without any real send."""
+def test_r1_blocked_run_records_health_failure_returns_zero(tmp_path, monkeypatch, capsys):
+    """A swallowed per-task transport failure (counts['blocked']>0, loop left OPEN) is
+    recorded as a health FAILURE for nag_check DIRECTLY, and main() returns 0 -- so the
+    cron's shell wrapper never turns it into a user-facing "unavailable" announce. Env
+    unset => the nag is delivery-blocked at the prove stage without any real send."""
+    import cos_health  # noqa: PLC0415
     board = tmp_path / "Work Tasks.md"
     board.write_text(BOARD, encoding="utf-8")
     state = tmp_path / "state"
@@ -399,41 +399,49 @@ def test_r1_blocked_run_returns_nonzero(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(nag_check, "_today", lambda: REF)
     rc = nag_check.main([])
     err = capsys.readouterr().err
-    assert rc != 0  # the swallowed delivery failure is surfaced as a nonzero code
+    assert rc == 0  # NO nonzero -> the shell wrapper does not announce "unavailable"
     assert "1 blocked" in err  # the footer still reports the blocked count (unchanged)
-    # The loop is still OPEN -- Fix 2 changed ONLY the return code, not the fire logic.
+    entry = cos_health.read_health()["nag_check"]
+    assert entry["last_failure"]["error_class"] == "nag_delivery_blocked"
+    assert "last_success_ts" not in entry  # a blocked run is NOT recorded healthy
     on_disk = _state(state)
-    assert "tsk_abc123" not in on_disk or on_disk["tsk_abc123"]["ack"] is False
+    assert "tsk_abc123" not in on_disk or on_disk["tsk_abc123"]["ack"] is False  # loop OPEN
 
 
-def test_r1_sender_failure_run_returns_nonzero(harness, monkeypatch, capsys):
-    """A transport FAILURE (the sender raises) is swallowed into counts['blocked'] with
-    the loop left OPEN; main() must return nonzero so the failure is health-visible.
-    Reuses the boom-sender pattern: main() wires the production sender, so we patch it."""
+def test_r1_sender_failure_records_health_failure_returns_zero(harness, monkeypatch, capsys):
+    """A transport FAILURE (the sender raises) is swallowed into counts['blocked'] with the
+    loop OPEN; main() records a health failure directly and returns 0 (no user-facing
+    'unavailable' announce on the cron path)."""
+    import cos_health  # noqa: PLC0415
     board, state = harness
     def boom(target, text):
         raise nag_check.outbox.OpenclawSendError("gateway unreachable")
     monkeypatch.setattr(nag_check.outbox, "openclaw_sender", boom)
     rc = nag_check.main([])
     err = capsys.readouterr().err
-    assert rc != 0
+    assert rc == 0
     assert "0 sent" in err and "1 blocked" in err
+    assert cos_health.read_health()["nag_check"]["last_failure"]["error_class"] == "nag_delivery_blocked"
 
 
-def test_r1_clean_run_returns_zero(harness, monkeypatch, capsys):
-    """A fully clean run (a nag delivered, nothing blocked) still returns 0 -- Fix 2 only
-    flips the code on a BLOCKED run, never on success."""
+def test_r1_clean_run_records_health_success_returns_zero(harness, monkeypatch, capsys):
+    """A clean real run (a nag delivered, nothing blocked) records a health SUCCESS and
+    returns 0."""
+    import cos_health  # noqa: PLC0415
     board, state = harness
     monkeypatch.setattr(nag_check.outbox, "openclaw_sender", fake_sender([]))
     rc = nag_check.main([])
     err = capsys.readouterr().err
     assert rc == 0
     assert "1 sent" in err and "0 blocked" in err
+    entry = cos_health.read_health()["nag_check"]
+    assert "last_success_ts" in entry and "last_failure" not in entry
 
 
-def test_r1_idle_run_returns_zero(tmp_path, monkeypatch, capsys):
-    """An idle cycle (nothing overdue, nothing blocked) returns 0 -- not every empty run
-    is a failure, only a blocked one."""
+def test_r1_idle_run_records_health_success(tmp_path, monkeypatch, capsys):
+    """An idle cycle (nothing overdue) is a HEALTHY run -- record success, return 0 (the
+    cron fired fine, there was just nothing to nag)."""
+    import cos_health  # noqa: PLC0415
     board = tmp_path / "Work Tasks.md"
     board.write_text(
         "# Work\n\n## 🟡 Q2\n- [ ] **Soon** task_id::tsk_future 🗓️2026-07-15 area:: Ops\n",
@@ -442,41 +450,20 @@ def test_r1_idle_run_returns_zero(tmp_path, monkeypatch, capsys):
     _set_env(monkeypatch, board, state)
     monkeypatch.setattr(nag_check, "_today", lambda: REF)
     rc = nag_check.main([])
+    capsys.readouterr()
     assert rc == 0
+    assert "last_success_ts" in cos_health.read_health()["nag_check"]
 
 
-def test_r1_dry_run_blocked_preview_still_returns_zero(harness, monkeypatch):
-    """A --dry-run NEVER delivers, so its blocked count is a PREVIEW, not a real delivery
-    failure: it must still return 0 even when the preview would be blocked. Fix 2 keys
-    the nonzero code on a non-dry-run only."""
+def test_r1_dry_run_records_no_health(harness, monkeypatch):
+    """A --dry-run NEVER delivers, so it records NO health (neither success nor failure)
+    and returns 0 -- a preview is not a real cron outcome."""
+    import cos_health  # noqa: PLC0415
     board, state = harness
     monkeypatch.delenv("TELEGRAM_CHAT_ID_PRODUCTIVITY", raising=False)  # preview is blocked
     rc = nag_check.main(["--dry-run"])
     assert rc == 0
-
-
-def test_r1_blocked_run_through_run_main_records_health_failure_exits_zero(
-        tmp_path, monkeypatch, capsys):
-    """R1 Fix 1 + Fix 2 wired together: feeding nag_check.main (which returns nonzero on a
-    blocked run) THROUGH error_envelope.run_main records a health FAILURE for nag_check
-    (error_class nonzero_exit) while run_main STILL returns 0 to the OS -- the cron sees
-    exit 0, the watchdog sees the failure. This mirrors what the shell wrapper achieves
-    via log_subprocess_error (Fix 3); here we assert the run_main half of the contract."""
-    import cos_health  # noqa: PLC0415
-    board = tmp_path / "Work Tasks.md"
-    board.write_text(BOARD, encoding="utf-8")
-    state = tmp_path / "state"
-    _set_env(monkeypatch, board, state)
-    monkeypatch.delenv("TELEGRAM_CHAT_ID_PRODUCTIVITY", raising=False)
-    monkeypatch.setenv("TASK_TRACKER_ERROR_LOG", str(state / "errors.jsonl"))
-    monkeypatch.setattr(nag_check, "_today", lambda: REF)
-
-    rc = error_envelope.run_main("nag_check", lambda: nag_check.main([]), trigger="cron:nag")
-    capsys.readouterr()  # drain the footer
-    assert rc == 0  # exit-0 contract: the blocked run does NOT trip the cron
-    entry = cos_health.read_health()["nag_check"]
-    assert entry["last_failure"]["error_class"] == "nonzero_exit"
-    assert "last_success_ts" not in entry  # the blocked run is NOT recorded healthy
+    assert "nag_check" not in cos_health.read_health()  # dry-run records nothing
 
 
 # --- Background recycle: no-longer-overdue clears (never terminally acks) ------
