@@ -496,3 +496,155 @@ def test_dry_run_does_not_append_to_autonomy_audit_log(harness):
 def read_autonomy_log_for(state, autonomy_gate):
     path = autonomy_gate.autonomy_log_path()
     return autonomy_gate.read_autonomy_log() if path.exists() else []
+
+
+# --- U4.1: top-N display cap + /nag all read-only escape hatch --------------
+
+# Five Q1 tasks (threshold 1 day) at DISTINCT overdue ages so the worst-first
+# order is deterministic: a(18d) > b(14d) > c(9d) > d(5d) > e(2d) at REF.
+MULTI_BOARD = """# Work
+
+## 🔴 Q1
+- [ ] **Alpha** task_id::tsk_a 🗓️2026-06-01 area:: Ops
+- [ ] **Bravo** task_id::tsk_b 🗓️2026-06-05 area:: Ops
+- [ ] **Charlie** task_id::tsk_c 🗓️2026-06-10 area:: Ops
+- [ ] **Delta** task_id::tsk_d 🗓️2026-06-14 area:: Ops
+- [ ] **Echo** task_id::tsk_e 🗓️2026-06-17 area:: Ops
+"""
+
+
+@pytest.fixture
+def multi(tmp_path, monkeypatch):
+    board = tmp_path / "Work Tasks.md"
+    board.write_text(MULTI_BOARD, encoding="utf-8")
+    state = tmp_path / "state"
+    _set_env(monkeypatch, board, state)
+    monkeypatch.setattr(nag_check, "_today", lambda: REF)
+    return board, state
+
+
+def test_cap_fires_only_top_n_most_overdue(multi):
+    """limit=3 fires the 3 WORST-overdue tasks and DEFERS the rest -- the deferred
+    ones open no loop and push nothing this cycle."""
+    board, state = multi
+    sent = []
+    counts = nag_check.run_nag_check(limit=3, send=lambda t, x: sent.append(x))
+    assert counts["sent"] == 3 and counts["deferred"] == 2
+    fired_ids = " ".join(sent)
+    for worst in ("tsk_a", "tsk_b", "tsk_c"):
+        assert worst in fired_ids
+    for deferred in ("tsk_d", "tsk_e"):
+        assert deferred not in fired_ids
+    # A deferred task opens NO loop this cycle (cap is a firing bound).
+    on_disk = _state(state)
+    assert "tsk_d" not in on_disk and "tsk_e" not in on_disk
+
+
+def test_no_limit_fires_everything(multi):
+    """The default (limit=None) is uncapped -- every crossed task fires, deferred 0.
+    Preserves the pre-cap contract for direct run_nag_check callers."""
+    board, state = multi
+    sent = []
+    counts = nag_check.run_nag_check(send=lambda t, x: sent.append(x))
+    assert counts["sent"] == 5 and counts["deferred"] == 0
+
+
+def test_main_caps_and_appends_more_pointer(multi, capsys):
+    """The cron CLI path caps at NAG_DISPLAY_LIMIT (3) and rides a '+2 more … /nag all'
+    pointer on the announced stdout; the operational footer carries the deferred count."""
+    board, state = multi
+    rc = nag_check.main([])  # limit defaults to nag_display_limit() == 3
+    captured = capsys.readouterr()
+    out, err = captured.out, captured.err
+    assert rc == 0
+    assert "tsk_a" in out and "tsk_b" in out and "tsk_c" in out
+    assert "tsk_d" not in out and "tsk_e" not in out
+    assert "+2 more overdue" in out and "/nag all" in out
+    # NAG_CHECK_DONE footer (stderr, not announced) reports the deferred count.
+    assert "3 sent" in err and "2 deferred" in err
+
+
+def test_main_all_flag_fires_everything_no_pointer(multi, capsys):
+    """`--all` removes the cap: every overdue fires and there is NO '+more' pointer."""
+    board, state = multi
+    rc = nag_check.main(["--all"])
+    captured = capsys.readouterr()
+    out, err = captured.out, captured.err
+    assert rc == 0
+    for tid in ("tsk_a", "tsk_b", "tsk_c", "tsk_d", "tsk_e"):
+        assert tid in out
+    assert "more overdue" not in out
+    assert "5 sent" in err and "0 deferred" in err
+
+
+def test_nag_all_list_is_read_only_full_view(multi, capsys):
+    """`--list` (the /nag all reply) prints EVERY overdue nag worst-first but writes
+    NO state, sends nothing, gates nothing, and appends no ledger event."""
+    import autonomy_gate  # noqa: PLC0415
+    board, state = multi
+    before = board.stat().st_mtime_ns
+    rc = nag_check.main(["--list"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    # Full worst-first list, all five, with a total line.
+    for tid in ("tsk_a", "tsk_b", "tsk_c", "tsk_d", "tsk_e"):
+        assert tid in out
+    assert out.index("tsk_a") < out.index("tsk_e")  # worst-first order
+    assert "5 overdue tasks total" in out
+    # READ-ONLY: no nag state, no ledger, no autonomy log, board untouched.
+    assert not (state / "nag-state.json").exists()
+    assert not (state / "events.jsonl").exists()
+    assert read_autonomy_log_for(state, autonomy_gate) == []
+    assert board.stat().st_mtime_ns == before
+
+
+def test_snoozed_leaders_do_not_starve_lower_tasks(multi):
+    """D1 regression: snoozing the top-N must NOT mute the surface. A snoozed leader
+    yields its cap slot so the next-worst FIRABLE task fires -- the cap is a
+    top-N-FIRABLE bound, not top-N-CROSSED. Without this, snoozing the worst 3
+    would silently black-hole everything below them until the snoozes expire."""
+    from datetime import timedelta
+    board, state = multi
+    # Cycle 1: top-3 (a, b, c) fire and open loops.
+    nag_check.run_nag_check(limit=3, send=lambda t, x: None)
+    # The user snoozes all three leaders (ADHD breathing room) past the clock.
+    until = (REF + timedelta(days=11)).isoformat()
+    for tid in ("tsk_a", "tsk_b", "tsk_c"):
+        nag_state.transition(lambda s, tid=tid: nag_state.apply_snooze(
+            s, tid, snoozed_until=until, block_reason=None))
+    # Cycle 2: the snoozed leaders must NOT hold cap slots -- d and e fire instead.
+    sent = []
+    counts = nag_check.run_nag_check(limit=3, send=lambda t, x: sent.append(x))
+    fired = " ".join(sent)
+    assert "tsk_d" in fired and "tsk_e" in fired
+    for snoozed in ("tsk_a", "tsk_b", "tsk_c"):
+        assert snoozed not in fired  # paused leaders did not consume slots
+    assert counts["sent"] == 2  # only d and e were firable and within cap
+    assert counts["deferred"] == 0  # nothing FIRABLE was held back by the cap
+
+
+def test_nag_display_limit_floors_at_one(monkeypatch):
+    """D2: a 0/negative NAG_DISPLAY_LIMIT (misconfig) must not silently mute the
+    engine -- the knob can shrink the push but never switch it off."""
+    import cos_config  # noqa: PLC0415
+    for bad in ("0", "-1", "-9", "  -3 "):
+        monkeypatch.setenv("NAG_DISPLAY_LIMIT", bad)
+        assert cos_config.nag_display_limit() == 1
+    monkeypatch.setenv("NAG_DISPLAY_LIMIT", "5")
+    assert cos_config.nag_display_limit() == 5
+
+
+def test_nag_all_list_empty_board_says_caught_up(tmp_path, monkeypatch, capsys):
+    """`/nag all` on a board with nothing overdue past threshold is a clean 'caught up',
+    not an empty reply."""
+    board = tmp_path / "Work Tasks.md"
+    board.write_text(
+        "# Work\n\n## 🟡 Q2\n- [ ] **Soon** task_id::tsk_future 🗓️2026-07-15 area:: Ops\n",
+        encoding="utf-8")
+    state = tmp_path / "state"
+    _set_env(monkeypatch, board, state)
+    monkeypatch.setattr(nag_check, "_today", lambda: REF)
+    rc = nag_check.main(["--list"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "caught up" in out.lower()

@@ -238,8 +238,10 @@ out of the overdue window — never silently, never on a crash, and a `/snooze`
 pauses but does NOT close it.
 
 ```bash
-bash scripts/telegram-commands.sh nag-check            # cron pass (every ~3h, work hrs)
+bash scripts/telegram-commands.sh nag-check            # cron pass (top-N worst, every ~3h, work hrs)
 bash scripts/telegram-commands.sh nag-check --dry-run  # preview, no state write / push
+bash scripts/telegram-commands.sh nag-check --all      # cron pass with NO display cap (fire every overdue)
+bash scripts/telegram-commands.sh nag                  # `/nag all`: read-only full overdue list (no fire)
 bash scripts/telegram-commands.sh done <task_id>             # complete + close loop (same turn)
 bash scripts/telegram-commands.sh reschedule <task_id> <date># move due:: + close loop
 bash scripts/telegram-commands.sh snooze <task_id> <dur>     # pause loop (cap: 3 snoozes)
@@ -250,6 +252,12 @@ bash scripts/telegram-commands.sh cancel-session <task_id>   # end a body-double
 - Q1-aware: thresholds are `NAG_Q1_THRESHOLD_DAYS=1`, `NAG_Q2_THRESHOLD_DAYS=3`,
   `NAG_Q3_THRESHOLD_DAYS=7`, read off the scalar `overdue_days` because
   `effective_priority()` short-circuits non-q2/q3 tasks to `escalated=False`.
+- Display cap (`NAG_DISPLAY_LIMIT=3`): the cron push fires only the N worst-overdue
+  tasks and appends a `+K more … reply /nag all` pointer, so an ADHD surface gets
+  the top few instead of an unbounded dump. It is a FIRING bound, not a mute —
+  deferred tasks open no loop that cycle but keep their place and surface as the
+  leaders clear; the close/recycle resolve pass is never capped. `/nag` (`/nag all`)
+  is the read-only full list; `nag-check --all` fires every overdue with no cap.
 - Every nag push goes through `prove_delivery_target()` →
   `autonomy_gate.gate()` (act_id) → `assert_send_target()`. An unset
   `TELEGRAM_CHAT_ID_PRODUCTIVITY` / `OPENCLAW_TOPIC_PRODUCTIVITY_STANDUP` ⇒

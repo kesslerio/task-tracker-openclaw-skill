@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Telegram slash command wrapper for task-tracker skill
 # Usage: telegram-commands.sh {daily|weekly|done|reschedule|snooze|body-double|cancel-session|
-#                              done24h|done7d|ledger|approve|nag-check|audit|undo}
+#                              done24h|done7d|ledger|approve|nag-check|nag|audit|undo}
 #
 # U1 NO-RAW-ERROR-LEAK boundary: every python3 invocation goes through
 # run_with_envelope, which captures stdout AND stderr. On a non-zero exit the
@@ -112,12 +112,19 @@ case "$1" in
   nag-check)
     # U4 nag engine (cron). Proactive push: every nag goes through
     # prove_delivery_target + the gated act_id + assert_send_target. An unset env
-    # blocks the push and leaves the loop open (never silently clears).
+    # blocks the push and leaves the loop open (never silently clears). The push is
+    # capped at NAG_DISPLAY_LIMIT worst-overdue tasks (the rest defer to `/nag`).
     shift
     run_with_envelope "nag_check" python3 "$SCRIPT_DIR/nag_check.py" "$@"
     ;;
+  nag)
+    # U4 read-only escape hatch: `/nag` (or `/nag all`) prints the FULL overdue
+    # list the capped cron push points at. Reactive + read-only (rung 0) -- no
+    # fire, no push, no state write; the reply lands in the originating topic.
+    run_with_envelope "nag" python3 "$SCRIPT_DIR/nag_check.py" --list
+    ;;
   *)
-    echo "Usage: $0 {daily|weekly|done|reschedule|snooze|body-double|cancel-session|done24h|done7d|ledger|approve|nag-check|audit|undo}"
+    echo "Usage: $0 {daily|weekly|done|reschedule|snooze|body-double|cancel-session|done24h|done7d|ledger|approve|nag-check|nag|audit|undo}"
     exit 1
     ;;
 esac
