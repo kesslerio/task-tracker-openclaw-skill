@@ -217,14 +217,14 @@ def test_health_empty_shows_registry_rituals_as_missing(capsys):
     """R1 Fix 4: with NOTHING recorded, the expected-ritual registry is still iterated --
     every registered ritual that has never run is flagged MISSING (a kind of STALE), so
     a never-started ritual is LOUD, not silently absent. This replaces the pre-R1
-    'No ritual health recorded yet.' empty line (the registry is never empty)."""
+    'No ritual health recorded yet.' empty line (the registry is never empty).
+
+    H8: ledger_harvest is now REGISTERED (its weekly-digest cron records health), so it
+    too shows up MISSING until its first cron fire -- no longer a deliberate omission."""
     cos_manifest.main(["health"])
     out = capsys.readouterr().out
-    for ritual in ("standup", "nag_check", "weekly_review", "eod_review"):
+    for ritual in ("standup", "nag_check", "weekly_review", "eod_review", "ledger_harvest"):
         assert f"MISSING {ritual}: last_success never" in out
-    # ledger_harvest is intentionally NOT registered (no health-recording path yet), so
-    # it must NOT appear as a false-MISSING alarm.
-    assert "ledger_harvest" not in out
 
 
 # --- skill_version best-effort ----------------------------------------------
