@@ -76,6 +76,20 @@ def nag_snooze_max() -> int:
     return _int_env("NAG_SNOOZE_MAX", 3)
 
 
+def nag_display_limit() -> int:
+    """Most-overdue nags pushed per cron cycle; the rest defer to ``/nag all``.
+
+    An ADHD-focused surface drowns under an unbounded overdue dump, so the cron
+    push shows only the N worst and a one-line "+K more" pointer. The cap is a
+    DISPLAY/firing bound only: deferred tasks keep their place and surface as the
+    leaders are cleared. ``/nag all`` (read-only) always shows the full list.
+
+    Floored at 1: a 0 or negative value (a misconfig typo) would silently mute the
+    whole nag engine, so the knob can shrink the push but never switch it off.
+    """
+    return max(1, _int_env("NAG_DISPLAY_LIMIT", 3))
+
+
 # --- Proactive layer knobs (U6) -------------------------------------------
 
 def focus_block_day_start_hour() -> int:

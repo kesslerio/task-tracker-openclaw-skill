@@ -6,12 +6,16 @@ fire it:
 
 1. Reads the board (READ-ONLY -- it NEVER writes ``Weekly TODOs.md``; §3.4) and
    computes ``overdue_days`` per active task.
-2. For each task whose overdue age crosses its section threshold (Q1=1, Q2=3,
-   Q3=7 days -- Q1-aware off the SCALAR ``overdue_days`` because
-   ``effective_priority`` short-circuits non-q2/q3 to ``escalated=False``):
+2. For the WORST-overdue tasks (capped at ``cos_config.nag_display_limit()``, so the
+   ADHD surface gets the top few, not an 85-line dump) whose overdue age crosses its
+   section threshold (Q1=1, Q2=3, Q3=7 days -- Q1-aware off the SCALAR
+   ``overdue_days`` because ``effective_priority`` short-circuits non-q2/q3 to
+   ``escalated=False``):
    - opens a fresh nag loop if none is open,
    - re-fires an existing open loop (unless acked or snoozed),
    - closes a loop whose task is gone (verified_done) or no longer overdue.
+   Tasks past the cap defer (the push shows a "+K more" pointer; ``/nag all`` lists
+   them in full). The close/recycle resolve pass always runs over every loop.
 3. Every push goes through the delivery seam (``prove_delivery_target`` ->
    ``gate`` -> ``assert_send_target``).  An unset env => ``nag_delivery_blocked``
    with ``reason: env_missing`` and the nag STAYS OPEN -- it is never silently
@@ -115,6 +119,43 @@ def _crossed(record, *, ref: datetime) -> tuple[str, int] | None:
     return None
 
 
+# Worst-first tiebreak when two tasks are equally overdue: the more urgent
+# quadrant leads, then the canonical id for a stable, deterministic order.
+_SECTION_RANK: dict[str, int] = {"q1": 0, "q2": 1, "q3": 2}
+
+
+def _sorted_crossed(active: dict[str, Any], *, ref: datetime
+                    ) -> list[tuple[str, Any, str, int]]:
+    """All threshold-crossed tasks as ``(task_id, record, section, overdue)``,
+    worst-overdue first. The single source of crossing order for both the capped
+    cron fire and the read-only ``/nag all`` list, so the two never disagree."""
+    crossed = []
+    for task_id, record in active.items():
+        hit = _crossed(record, ref=ref)
+        if hit is not None:
+            section, overdue = hit
+            crossed.append((task_id, record, section, overdue))
+    # Every section here came from _crossed() returning a real q1/q2/q3, so the
+    # rank lookup is total -- no fallback needed.
+    crossed.sort(key=lambda t: (-t[3], _SECTION_RANK[t[2]], t[0]))
+    return crossed
+
+
+def _firable(entry: dict[str, Any] | None, *, ref: datetime) -> bool:
+    """Would this crossed task actually fire this cycle, or is it paused/closed?
+
+    False for an acked (terminal) or snoozed (paused) loop. Such tasks must NOT
+    consume a cap slot: if a snoozed leader held its slot, snoozing the worst-N
+    would starve every task below them -- the surface would go silent while real
+    work aged (the snooze-starvation hole). Mirrors the under-lock skip in
+    ``_fire_locked``; the lock stays the authority for the actual fire decision,
+    this is only slot allocation against a best-effort snapshot.
+    """
+    if isinstance(entry, dict) and entry.get("ack"):
+        return False
+    return not nag_state.is_snoozed(entry, now=ref)
+
+
 def _log(event_type: str, *, task_id: str | None = None, **metadata: Any) -> None:
     """Append a U4 ledger event (append-only, flocked by append_event)."""
     append_event(
@@ -171,12 +212,20 @@ def _push_nag(record, section: str, overdue: int, *, dry_run: bool,
             "delivery_target": gated["delivery_target"], "text": text}
 
 
-def run_nag_check(*, dry_run: bool = False,
-                  send: Callable[[dict[str, Any], str], Any] | None = None) -> dict[str, int]:
-    """One nag-check pass.  Returns counts ``{open, sent, closed, blocked}``.
+def run_nag_check(*, dry_run: bool = False, limit: int | None = None,
+                  send: Callable[[dict[str, Any], str], Any] | None = None
+                  ) -> dict[str, int]:
+    """One nag-check pass.  Returns counts ``{open, sent, closed, blocked, deferred}``.
 
     Board reads are READ-ONLY.  State writes go through ``nag_state.transition``
     (flock + atomic).  A delivery block leaves the loop open.
+
+    ``limit`` caps how many of the worst-overdue tasks fire this cycle (``None`` ==
+    no cap). The cap is a FIRING bound, not a mute: deferred tasks open no loop and
+    push nothing this cycle, but keep their place and surface as the leaders are
+    cleared -- ``counts['deferred']`` is how many were held back, which ``main``
+    turns into the "+K more" pointer and ``/nag all`` shows in full. The resolve
+    pass (close/recycle) always runs over every loop, uncapped.
 
     ``send`` is the transport every nag is delivered through; it is REQUIRED for a
     real run (a missing transport would gate + log nag_sent while delivering
@@ -189,7 +238,7 @@ def run_nag_check(*, dry_run: bool = False,
     ref = _today()
     _tasks_file, _content, records = load_records(personal=False)
     active = {r.canonical_id: r for r in active_records(records) if r.canonical_id}
-    counts = {"open": 0, "sent": 0, "closed": 0, "blocked": 0}
+    counts = {"open": 0, "sent": 0, "closed": 0, "blocked": 0, "deferred": 0}
 
     # 1. Resolve GENUINE open nag loops (those that have actually fired). No push
     #    on resolve. A body-double-only stub (nag_count==0) is NOT a nag loop and
@@ -216,12 +265,20 @@ def run_nag_check(*, dry_run: bool = False,
                 _recycle(task_id, entry)
             counts["closed"] += 1
 
-    # 2. Open / re-fire loops for tasks that crossed their threshold.
-    for task_id, record in active.items():
-        crossed = _crossed(record, ref=ref)
-        if crossed is None:
-            continue
-        section, overdue = crossed
+    # 2. Open / re-fire loops for the worst-overdue tasks that are actually FIRABLE
+    #    this cycle (not acked, not snoozed), capped at ``limit``. Filtering before
+    #    the slice is what makes the cap a top-N-FIRABLE bound rather than
+    #    top-N-CROSSED: a snoozed/acked leader yields its slot so the next real task
+    #    surfaces instead of the surface going silent (the snooze-starvation hole).
+    #    Tasks past the cap are deferred (counted for the "+K more" pointer); paused/
+    #    closed ones are simply not slotted (the user already snoozed/acked them).
+    #    ``max(0, ...)`` keeps a stray negative ``limit`` from slicing off the tail.
+    snapshot = nag_state.read_state()
+    firable = [c for c in _sorted_crossed(active, ref=ref)
+               if _firable(snapshot.get(c[0]), ref=ref)]
+    to_fire = firable if limit is None else firable[:max(0, limit)]
+    counts["deferred"] = len(firable) - len(to_fire)
+    for task_id, record, section, overdue in to_fire:
         _fire_one(task_id, record, section, overdue, counts,
                   ref=ref, dry_run=dry_run, send=send)
 
@@ -339,12 +396,40 @@ def _recycle(task_id: str, entry: dict[str, Any]) -> None:
          closed_by=nag_state.CLOSED_RESCHEDULED, recycled=True)
 
 
+def _print_full_list() -> None:
+    """``/nag all``: print EVERY overdue nag, worst first, READ-ONLY.
+
+    The escape hatch the capped cron push points at. It proves no target, opens no
+    loop, gates nothing, and writes no state -- it only echoes the same ``_nag_text``
+    bodies the cron would fire, in the same worst-first order, so the reactive reply
+    in-thread is a faithful full view of what the cap held back.
+    """
+    _tasks_file, _content, records = load_records(personal=False)
+    active = {r.canonical_id: r for r in active_records(records) if r.canonical_id}
+    crossed = _sorted_crossed(active, ref=_today())
+    if not crossed:
+        print("✅ No overdue tasks past their nag threshold. All caught up.")
+        return
+    for _task_id, record, section, overdue in crossed:
+        print(_nag_text(record, section, overdue))
+        print()
+    plural = "s" if len(crossed) != 1 else ""
+    print(f"{len(crossed)} overdue task{plural} total.")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="nag_check.py", description=__doc__)
     parser.add_argument("--dry-run", action="store_true",
                         help="report what would be pushed without writing state or sending")
+    parser.add_argument("--all", dest="all_nags", action="store_true",
+                        help="fire every overdue nag this cycle (no top-N display cap)")
+    parser.add_argument("--list", dest="list_only", action="store_true",
+                        help="read-only: print ALL overdue nags (the /nag all reply); no fire, no state")
     args = parser.parse_args(argv)
     try:
+        if args.list_only:
+            _print_full_list()
+            return 0
         # The cron job announces this script's stdout to its explicit delivery.to
         # (topic 2). So the transport is a collector: it accumulates each proven,
         # gated, asserted nag text, and main() PRINTS the collected payloads as the
@@ -352,8 +437,9 @@ def main(argv: list[str] | None = None) -> int:
         # no-op -- a nag is only counted as sent once its text is collected for
         # delivery, and the gate<->message seam still binds every payload to its
         # proven target before it is collected.
+        limit = None if args.all_nags else cos_config.nag_display_limit()
         payloads: list[str] = []
-        counts = run_nag_check(dry_run=args.dry_run,
+        counts = run_nag_check(dry_run=args.dry_run, limit=limit,
                                send=None if args.dry_run else
                                (lambda _target, text: payloads.append(text)))
         # STDOUT carries ONLY the deliverable nag text -- it is what the cron
@@ -365,8 +451,15 @@ def main(argv: list[str] | None = None) -> int:
         for text in payloads:
             print(text)
             print()  # blank line between nags in the announced output
+        # The "+K more" pointer rides the announce ONLY when some nags were shown
+        # and the cap held others back -- never on an idle cycle (no payloads => no
+        # pointer), so the habituation guard above is preserved.
+        if payloads and counts["deferred"] > 0:
+            plural = "s" if counts["deferred"] != 1 else ""
+            print(f"+{counts['deferred']} more overdue task{plural} — reply /nag all to see them.")
         footer = (f"NAG_CHECK_DONE: {counts['open']} open loops, {counts['sent']} sent, "
-                  f"{counts['closed']} closed, {counts['blocked']} blocked")
+                  f"{counts['closed']} closed, {counts['blocked']} blocked, "
+                  f"{counts['deferred']} deferred")
         print(footer, file=sys.stdout if args.dry_run else sys.stderr)
         return 0
     except Exception as exc:  # noqa: BLE001 -- top-level NO-RAW-ERROR-LEAK boundary
