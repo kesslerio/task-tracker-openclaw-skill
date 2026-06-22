@@ -41,7 +41,6 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-import cos_config
 import error_envelope
 import nag_delivery
 import nag_state
