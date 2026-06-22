@@ -51,15 +51,20 @@ _DEFAULT_STALE_HOURS = 36
 # health (no entry in cos-health.json at all) is flagged MISSING (a kind of STALE):
 # "absent" is now LOUD, not silent. The ``health`` view iterates the registry UNION the
 # recorded rituals, so a ritual that has never started is visible rather than simply not
-# printed. The component names are the ones the rituals pass to run_main / the shell
-# ``run_with_envelope`` label (and thus to cos_health.record_*): ``standup``,
-# ``weekly_review``, ``nag_check``, ``ledger_harvest``, ``eod_review`` (grep:
-# error_envelope.run_main(...) + telegram-commands.sh run_with_envelope labels).
+# printed.
+#
+# ONLY rituals that actually RECORD a health success on a clean run belong here, or a
+# healthy ritual would be permanently false-MISSING. ``standup``/``weekly_review``/
+# ``eod_review`` record via ``error_envelope.run_main`` (success on a 0 return);
+# ``nag_check`` records via ``_record_nag_health`` on the cron fire. ``ledger_harvest``
+# is deliberately NOT registered: ``harvest_ledger.py`` neither uses ``run_main`` nor
+# calls ``cos_health`` and always exits 0, so it has no success path -- registering it
+# would false-MISSING forever. Wiring its health is folded into H8 (the ledger rework);
+# add it here once it records success on a clean harvest + failure on ``ok:false``.
 _EXPECTED_RITUALS: dict[str, int] = {
     "standup": 24,            # daily cadence
     "weekly_review": 24 * 8,  # weekly cadence + a missed run of slack
     "nag_check": 24,          # fires every ~3h in work hours; daily is a loose ceiling
-    "ledger_harvest": 24 * 8, # the done/ledger harvest is run on demand + weekly
     "eod_review": 24,         # end-of-day cadence
 }
 
