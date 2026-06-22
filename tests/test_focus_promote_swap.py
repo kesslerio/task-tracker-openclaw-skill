@@ -53,6 +53,25 @@ def _ledger_events(tmp_path):
     return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
 
 
+def _active_estimated_minutes(board, title):
+    """Minutes a single active task by ``title`` contributes to the capacity cap.
+
+    Reads the board with the canonical capacity layer so the assertion pins what
+    ``focus_core`` actually COUNTS, not the raw token. A task whose ``estimate::``
+    survived the round-trip counts at its real duration; one that lost it counts
+    at the unestimated default (UNESTIMATED_TASK_HOURS).
+    """
+    from task_records import task_records, active_records
+    from focus_core import estimate_minutes_for
+
+    records = task_records(board.read_text(), personal=False, fmt="obsidian")
+    target = next(
+        r for r in active_records(records)
+        if r.title == title and not r.is_objective
+    )
+    return estimate_minutes_for(target)
+
+
 def _board_with_room(tmp_path):
     board = tmp_path / "Work Tasks.md"
     board.write_text(
@@ -232,3 +251,120 @@ def test_swap_unequal_estimate_that_fits_succeeds(tmp_path):
     assert active_part.count("- [ ] ") == 2
     swapped = next(e for e in _ledger_events(tmp_path) if e["event_type"] == "task_swapped")
     assert swapped["metadata"]["parked_out"] == "Big1"
+
+
+# --- H6 estimate: estimate survives park-out / capture -> promote -----------
+
+def _estimated_swap_board(tmp_path):
+    # One estimated active task (12h) carrying a due date + non-default owner, and
+    # a small parked filler to swap in. Cap 25h leaves room for either alone.
+    board = tmp_path / "Work Tasks.md"
+    board.write_text(
+        "# Work\n\n"
+        "## 🔴 Q1\n"
+        "## 🟡 Q2\n"
+        "- [ ] **Heavy job** 🗓️2026-09-01 estimate:: 12h owner:: alice "
+        "task_id::tsk_hhhhhhhhhhhhhhhh\n"
+        "## 🅿️ Parking Lot\n"
+        "- [ ] **Filler idea** #Dev task_id::tsk_ffffffffffffffff created::2026-06-01\n"
+    )
+    return board
+
+
+def test_swap_out_task_estimate_survives_to_promoted_in(tmp_path):
+    # Invariant: a swap-out of an ESTIMATED task (12h) carrying a due date + a
+    # non-default owner parks a self-describing copy (estimate + due + owner all
+    # retained), and a later /promote of it restores ALL THREE onto the active
+    # line. The restored task COUNTS at its real 12h, not the 2h unestimated
+    # default -- the capacity under-count is the bug this pins.
+    board = _estimated_swap_board(tmp_path)
+    # Swap: park out the 12h Heavy job, promote in the small Filler idea.
+    swap = _run(tmp_path, board, "swap", "tsk_hhhhhhhhhhhhhhhh", "1")
+    assert swap.returncode == 0, swap.stdout + swap.stderr
+    text = board.read_text()
+    pl_index = text.index("Parking Lot")
+    parked = text[pl_index:]
+    # The parked-out copy is self-describing: estimate + due + owner all survived.
+    assert "estimate:: 12h" in parked
+    assert "🗓️2026-09-01" in parked
+    assert "owner:: alice" in parked
+    assert "Heavy job" in parked
+    # Now promote the parked-out Heavy job back (Filler 2h + Heavy 12h = 14h <= 25h).
+    promo = _run(tmp_path, board, "promote", "1")
+    assert promo.returncode == 0, promo.stdout + promo.stderr
+    text = board.read_text()
+    pl_index = text.index("Parking Lot")
+    active = text[:pl_index]
+    # All three metadata fields restored onto the active line.
+    assert "Heavy job" in active
+    assert "estimate:: 12h" in active
+    assert "🗓️2026-09-01" in active
+    assert "owner:: alice" in active
+    # Capacity COUNTS it at 12h (720m), NOT the 2h unestimated default (120m).
+    assert _active_estimated_minutes(board, "Heavy job") == 12 * 60
+
+
+def test_repromote_of_estimated_parked_task_does_not_exceed_capacity(tmp_path):
+    # The under-count consequence: the swap pre-flight + a re-promote of a
+    # previously-estimated parked-out task must NOT silently let the board exceed
+    # capacity. A 12h task already active leaves 13h headroom under a 25h cap;
+    # trying to swap in a 20h parked task (which frees only the 12h out task)
+    # would project to 12h(remaining other) ... here we keep one 12h active task
+    # and a 20h parked task. Removing the 12h out frees 12h but the 20h in needs
+    # 20h, so the projected board (0h + 20h) actually FITS at 20h <= 25h -- so we
+    # instead pin the inverse: with TWO 12h active tasks (24h), swapping out one
+    # 12h for a 20h parked task projects 12h + 20h = 32h > 25h and MUST refuse,
+    # because the real 20h estimate (not the 2h default) is honoured.
+    board = tmp_path / "Work Tasks.md"
+    board.write_text(
+        "# Work\n\n"
+        "## 🔴 Q1\n"
+        "- [ ] **Keep job** estimate:: 12h task_id::tsk_aaaaaaaaaaaaaaaa\n"
+        "## 🟡 Q2\n"
+        "- [ ] **Out job** estimate:: 12h task_id::tsk_bbbbbbbbbbbbbbbb\n"
+        "## 🅿️ Parking Lot\n"
+        "- [ ] **Whale task** estimate:: 20h #Dev task_id::tsk_wwwwwwwwwwwwwwww "
+        "created::2026-06-01\n"
+    )
+    before = board.read_bytes()
+    proc = _run(tmp_path, board, "swap", "tsk_bbbbbbbbbbbbbbbb", "1")
+    # The 20h in-task's REAL estimate is honoured by the pre-flight: 12h kept +
+    # 20h in = 32h > 25h, so the swap is refused with the board byte-identical.
+    assert proc.returncode != 0
+    assert board.read_bytes() == before
+    assert "won't fit" in proc.stdout.lower()
+    assert "Nothing moved" in proc.stdout
+    assert not any(e["event_type"] == "task_swapped" for e in _ledger_events(tmp_path))
+
+
+def test_swap_due_and_owner_survive_to_promoted_in_and_parked_copy(tmp_path):
+    # P3: a swap whose out_id carries a due date AND a non-default owner -- both
+    # must survive onto the parked-out COPY and (after a re-promote) back onto the
+    # active line. Extends the due/owner round-trip coverage to the SWAP path, not
+    # just capture->promote.
+    board = tmp_path / "Work Tasks.md"
+    board.write_text(
+        "# Work\n\n"
+        "## 🔴 Q1\n"
+        "## 🟡 Q2\n"
+        "- [ ] **Owned job** 🗓️2026-10-15 owner:: carol "
+        "task_id::tsk_oooooooooooooooo\n"
+        "## 🅿️ Parking Lot\n"
+        "- [ ] **Filler idea** #Dev task_id::tsk_ffffffffffffffff created::2026-06-01\n"
+    )
+    swap = _run(tmp_path, board, "swap", "tsk_oooooooooooooooo", "1")
+    assert swap.returncode == 0, swap.stdout + swap.stderr
+    text = board.read_text()
+    pl_index = text.index("Parking Lot")
+    parked = text[pl_index:]
+    # Parked-out copy carries due + owner.
+    assert "🗓️2026-10-15" in parked
+    assert "owner:: carol" in parked
+    # Re-promote it and confirm due + owner land back on the active line.
+    promo = _run(tmp_path, board, "promote", "1")
+    assert promo.returncode == 0, promo.stdout + promo.stderr
+    text = board.read_text()
+    active = text[:text.index("Parking Lot")]
+    assert "Owned job" in active
+    assert "🗓️2026-10-15" in active
+    assert "owner:: carol" in active

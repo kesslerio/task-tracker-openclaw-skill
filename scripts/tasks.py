@@ -219,12 +219,19 @@ def _log_wip_cap_enforced(title: str, summary, routing: str | None) -> None:
 
 def _build_active_task_line(title: str, *, due: str | None = None,
                             area: str | None = None, owner: str | None = None,
-                            task_id: str | None = None) -> tuple[str, str]:
+                            task_id: str | None = None,
+                            estimate: str | None = None) -> tuple[str, str]:
     """Build a canonical active-board task line. Returns (task_line, task_id).
 
     The single home for the active task-line shape so ``add_task`` (capture) and
     the H6 ``promote``/``swap`` paths emit byte-identical lines -- a promoted task
     must look exactly like a directly-added one, never a parking-lot variant.
+
+    ``estimate`` is optional; when supplied it emits the SAME ``estimate:: <val>``
+    token ``parse_tasks`` reads for the capacity cap, so a promoted task restores
+    the original estimate and ``focus_core`` counts it at its real load rather than
+    the unestimated default. The under-cap add path passes no estimate (the CLI has
+    no ``--estimate`` arg), so its behavior is unchanged -- no stray token.
     """
     task_id = task_id or f"tsk_{uuid.uuid4().hex[:16]}"
     task_line = f'- [ ] **{title}**'
@@ -233,6 +240,8 @@ def _build_active_task_line(title: str, *, due: str | None = None,
     task_line += f' task_id::{task_id}'
     if area:
         task_line += f' area:: {area}'
+    if estimate:
+        task_line += f' estimate:: {estimate}'
     default_owner = os.getenv('TASK_TRACKER_DEFAULT_OWNER', 'me')
     if owner and owner not in ('me', default_owner):
         task_line += f' owner:: {owner}'
@@ -485,11 +494,14 @@ def _promote_parked_onto_board(tasks_file, fmt: str, item_id: int, *, personal: 
 
     title = parked['title']
     area = parked.get('department')
-    # Re-derive due/owner from the self-describing parked line so the restored
-    # active line carries them (H6 Fix 2: a captured task's due date / owner are
-    # "saved, not lost", not silently dropped on promote).
+    # Re-derive due/owner/estimate from the self-describing parked line so the
+    # restored active line carries them (H6 Fix 2: a captured task's due date /
+    # owner / estimate are "saved, not lost", not silently dropped on promote).
+    # Without the estimate the re-promoted task would count at the unestimated
+    # default (2h) instead of its real load -- a capacity under-count.
     due = parked.get('due')
     owner = parked.get('owner')
+    estimate = parked.get('estimate')
     # Preserve the parked task's canonical id through the promote so it round-trips
     # (capture -> promote, swap-out -> promote-in keep one stable identity).
     id_match = re.search(
@@ -516,7 +528,7 @@ def _promote_parked_onto_board(tasks_file, fmt: str, item_id: int, *, personal: 
 
     # Add to the active board FIRST (so a crash double-places, never loses).
     task_line, _ = _build_active_task_line(
-        title, due=due, area=area, owner=owner, task_id=carried_id
+        title, due=due, area=area, owner=owner, task_id=carried_id, estimate=estimate
     )
     new_content = _insert_active_task(content, "medium", area, task_line)
     if new_content is None:
@@ -580,12 +592,14 @@ def _park_active_task(tasks_file, fmt: str, out_id: str, *, personal: bool):
 
     # Add to the parking lot FIRST (so a crash double-places, never loses). Preserve
     # the task's canonical id so the parked copy keeps its identity, and carry the
-    # due date / owner onto the parked line so a swap-out is also "saved, not lost"
-    # and a later promote-in restores them (H6 Fix 2).
+    # due date / owner / estimate onto the parked line so a swap-out is also "saved,
+    # not lost" and a later promote-in restores them (H6 Fix 2). The estimate matters
+    # for capacity: without it a re-promoted task under-counts at the unestimated
+    # default. ``estimate`` is read from the SAME parsed active record as due/owner.
     add_result = add_item(
         tasks_file, target.title, dept=target.department or target.area,
         priority="low", task_id=target.canonical_id,
-        due=target.due, owner=target.owner,
+        due=target.due, owner=target.owner, estimate=target.estimate,
     )
     if add_result.startswith("❌"):
         return {"ok": False, "message": add_result, "exit_code": 2}
@@ -657,8 +671,6 @@ def swap_tasks(args):
     promote-in's gate passes) run, followed by the promote-in. A bad out/in id
     also refuses before any write.
     """
-    from focus_core import evaluate_add
-
     tasks_file, fmt = get_tasks_file(args.personal)
     if not tasks_file.exists():
         print(f"❌ Tasks file not found: {tasks_file}")
@@ -687,22 +699,37 @@ def swap_tasks(args):
         print("❌ No active section to promote into. Nothing moved.")
         sys.exit(2)
 
-    # Pre-flight the FULL post-swap CAPACITY in memory (no write): would promoting
-    # in_id fit AFTER out_id is removed from the committed-active set? Project the
-    # state by removing out_id's active line from the board text, then re-use the
-    # canonical evaluate_add gate against that projected board. The cap's COUNTING
-    # is unchanged -- this only asks the gate about a projected state. If it would
-    # NOT fit (the out task frees less room than the in task needs), refuse cleanly
-    # and leave the board BYTE-IDENTICAL. The promoted-in task is unestimated (the
-    # promote path supplies no estimate), exactly what evaluate_add projects.
+    # Pre-flight the FULL post-swap CAPACITY in memory (no write): would the board
+    # fit AFTER out_id is removed AND in_id is promoted in? Project the state by
+    # removing out_id's active line and SPLICING IN the in-task's real active line
+    # (carrying its preserved estimate), then summarise that projected board with
+    # the canonical capacity layer and check over_cap. The cap's COUNTING is
+    # unchanged -- this only asks the existing summarizer about a projected state.
+    # Using the in-task's REAL estimate (not the unestimated default) keeps an
+    # estimated parked-out task from being silently promoted back over capacity.
+    # If it would NOT fit, refuse cleanly and leave the board BYTE-IDENTICAL.
     if not args.personal:
+        from focus_core import summarize_capacity
+
         projected = remove_task_line(content, out_target.raw_line, out_target.line_number)
         if projected is not None:
-            projected_gate = evaluate_add(
-                projected, fmt, in_target["title"],
-                destination_active=True, personal=args.personal,
+            probe_line, _ = _build_active_task_line(
+                in_target["title"], due=in_target.get("due"),
+                area=in_target.get("department"), owner=in_target.get("owner"),
+                estimate=in_target.get("estimate"),
             )
-            if not projected_gate.allowed:
+            projected_with_in = _insert_active_task(
+                projected, "medium", in_target.get("department"), probe_line
+            )
+            over_cap = False
+            if projected_with_in is not None:
+                try:
+                    over_cap = summarize_capacity(
+                        task_records(projected_with_in, personal=args.personal, fmt=fmt)
+                    ).over_cap
+                except Exception:
+                    over_cap = False
+            if over_cap:
                 print(
                     f"❌ Swap won't fit: '{in_target['title']}' needs more room than "
                     f"'{out_target.title}' frees. /done another task first, or pick a "

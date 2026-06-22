@@ -112,11 +112,22 @@ def _parse_items(lines: list[str], start: int, end: int) -> list[dict]:
         )
         owner = owner_match.group(2).strip() if owner_match else None
 
+        # Extract estimate (estimate:: <value>) so a parked line carrying it
+        # (captured from an estimated active task, or parked-out by /swap) is
+        # self-describing -- /promote re-derives it from here to restore the
+        # active line's estimate, so the re-promoted task counts at its real
+        # estimate against the capacity cap (not the unestimated default).
+        estimate_match = re.search(
+            r'(?<!\w)estimate::\s*(?!(\s|\w+::))([^\n]+?)(?=\s+\w+::|\s*🗓️|\s*#|$)', body
+        )
+        estimate = estimate_match.group(2).strip() if estimate_match else None
+
         # Clean title: strip bold, inline fields, tags
         title = body
         title = re.sub(r'\*\*(.+?)\*\*', r'\1', title)  # strip bold
         title = re.sub(r'\s*🗓️\s*\d{4}-\d{2}-\d{2}', '', title)
         title = re.sub(r'\s*owner::\s*[^\n]+?(?=\s+\w+::|\s*#|$)', '', title)
+        title = re.sub(r'\s*estimate::\s*[^\n]+?(?=\s+\w+::|\s*🗓️|\s*#|$)', '', title)
         title = re.sub(r'\s*task_id::\s*\S+', '', title)
         title = re.sub(r'\s*id::\s*\S+', '', title)
         title = re.sub(r'\s*created::\S+', '', title)
@@ -135,6 +146,7 @@ def _parse_items(lines: list[str], start: int, end: int) -> list[dict]:
             'priority': priority,
             'due': due,
             'owner': owner,
+            'estimate': estimate,
             'raw_line': line,
         })
     return items
@@ -281,15 +293,18 @@ def audit_items(tasks_file: Path, *, cap: int | None = None) -> dict:
 
 def add_item(tasks_file: Path, title: str, dept: str | None = None,
              priority: str = 'low', task_id: str | None = None,
-             due: str | None = None, owner: str | None = None) -> str:
+             due: str | None = None, owner: str | None = None,
+             estimate: str | None = None) -> str:
     """Add an item to the parking lot. Returns status message.
 
-    ``due`` and ``owner`` are optional. When supplied they are STORED on the
-    parked line using the SAME ``🗓️<due>`` / ``owner:: <owner>`` tokens an active
-    task line uses, so a captured task's due date / owner are self-describing on
-    the parked line and survive a later ``/promote`` (H6 Fix 2: "saved, not lost"
-    must not silently drop the due date or owner). Existing callers that pass
-    neither are unaffected -- no stray tokens are emitted.
+    ``due``, ``owner`` and ``estimate`` are optional. When supplied they are
+    STORED on the parked line using the SAME ``🗓️<due>`` / ``owner:: <owner>`` /
+    ``estimate:: <estimate>`` tokens an active task line uses, so a captured or
+    parked-out task's due date / owner / estimate are self-describing on the
+    parked line and survive a later ``/promote`` (H6 Fix 2: "saved, not lost"
+    must not silently drop the due date, owner, or estimate -- dropping the
+    estimate also makes a re-promoted task under-count against the capacity cap).
+    Existing callers that pass none are unaffected -- no stray tokens are emitted.
     """
     content = tasks_file.read_text()
     lines = content.split('\n')
@@ -311,6 +326,8 @@ def add_item(tasks_file: Path, title: str, dept: str | None = None,
     task_line = _ensure_task_id(task_line, task_id)
     if owner:
         task_line += f' owner:: {owner}'
+    if estimate:
+        task_line += f' estimate:: {estimate}'
     if dept:
         task_line += f' #{dept}'
     if priority and priority != 'low':
