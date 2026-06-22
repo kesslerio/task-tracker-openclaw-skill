@@ -90,3 +90,47 @@ def test_undo_human_output_has_no_traceback(tmp_path, capsys):
     assert "Traceback" not in captured
     assert "Error" not in captured  # no exception class name leaked
     assert "act_missing" in captured
+
+
+def _gate_drifted_duplicate_act(tmp_path):
+    """Gate a board act, then drift the board so two lines share its task_id."""
+    import autonomy
+    board = tmp_path / "Weekly TODOs.md"
+    raw_line = "- [ ] Pay invoice task_id::tsk_dup"
+    at_act_time = f"# Board\n{raw_line}\n"
+    board.write_text(at_act_time, encoding="utf-8")
+    snapshot = autonomy.board_snapshot(board, raw_line, 2, content=at_act_time,
+                                       post_raw_line="- [x] Pay invoice task_id::tsk_dup")
+    board.write_text("# Board\n- [x] Pay invoice task_id::tsk_dup\n"
+                     "- [ ] Pay invoice AGAIN task_id::tsk_dup\n", encoding="utf-8")
+    config = autonomy_gate.ensure_autonomy_config()
+    config.setdefault("act_type_rungs", {})["task_marked_done"] = autonomy_gate.RUNG_APPROVE
+    autonomy_gate._atomic_write(
+        autonomy_gate.autonomy_config_path(),
+        json.dumps(config, indent=2, sort_keys=True) + "\n",
+    )
+    return board, autonomy_gate.gate("task_marked_done", task_id="tsk_dup", unit="U5",
+                                     snapshot_provider=lambda: snapshot)
+
+
+def test_undo_conflict_exit_nonzero_and_writes_nothing(tmp_path, capsys):
+    """A board-undo CONFLICT (duplicate id) is a non-zero exit with a human message,
+    and the board is left untouched."""
+    board, gated = _gate_drifted_duplicate_act(tmp_path)
+    before = board.read_text(encoding="utf-8")
+    rc = autonomy_cli.main(["undo", gated["act_id"], "--json"])
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert out["ok"] is False
+    assert out["reason"] == "conflict-duplicate"
+    assert board.read_text(encoding="utf-8") == before  # nothing written
+
+
+def test_undo_conflict_human_message_no_traceback(tmp_path, capsys):
+    """The conflict's default human line is reviewable and leaks no traceback."""
+    board, gated = _gate_drifted_duplicate_act(tmp_path)
+    rc = autonomy_cli.main(["undo", gated["act_id"]])
+    captured = capsys.readouterr().out
+    assert rc == 1
+    assert "Traceback" not in captured
+    assert "Cannot undo" in captured and "tsk_dup" in captured

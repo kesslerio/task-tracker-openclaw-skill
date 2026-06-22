@@ -15,11 +15,25 @@ by KIND:
   ``nag-state.json`` (``ack_type="user_undo"``) -- the Contract-3 stub
   ``autonomy_gate.ack_nag`` -- and recording the reversal in both ledgers.
 * A board mutation (an act carrying a ``pre_action_snapshot`` with a ``raw_line``)
-  is reversed by restoring that exact ``raw_line`` to its board file via
-  CONTENT SEARCH -- not a line-number guess. The board file shifts under other
-  edits between the act and the undo, so a stored ``line_number`` is stale; we
-  re-insert the line only if its exact text is not already present (idempotent),
-  near the recorded ``line_number`` when it still fits, else appended in-section.
+  is reversed by restoring the snapshotted line to its board file -- but NOT by
+  guessing on full-line text. Content search breaks on duplicate lines and on any
+  later edit (a 7-day undo window makes "the board drifted since the act" the
+  common case), and a wrong-line restore silently corrupts the board. So the
+  restore is re-keyed on TWO stable anchors captured at gate time (H9):
+
+  * a board-REVISION stamp (a sha256 of the board file at snapshot time). If the
+    board is byte-identical now, the stored ``line_number`` + ``raw_line`` still
+    agree and we restore directly -- the fast, unambiguous path.
+  * the affected task's STABLE id (the ``task_id::`` / ``id::`` inline marker the
+    board line carries). When the board has drifted, we locate the target by that
+    id, not by text. EXACTLY ONE match restores; ZERO or MORE-THAN-ONE candidates
+    REFUSE with a structured CONFLICT (``conflict-not-found`` /
+    ``conflict-duplicate`` / ``conflict-edited``) and write NOTHING -- the system
+    never guesses which of two ambiguous lines to overwrite.
+
+  ``raw_line``/``line_number`` are kept for back-compat and as a fallback hint: an
+  OLD snapshot lacking the revision/id fields still undoes through the legacy
+  content path (or refuses cleanly on ambiguity) -- it never crashes.
 
 Every reversal is gated by the tiered undo window (Decision #8): 4h for nag acts,
 7d for board mutations (both env-tunable via ``cos_config``). An act already
@@ -33,6 +47,7 @@ import os
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +58,7 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
 
 from cos_config import state_dir, undo_window_board_hours, undo_window_nag_hours
 from task_ledger import append_event, ledger_path, new_event
+from task_records import LEGACY_ID_RE, TASK_ID_RE
 from utils import _atomic_write
 
 from autonomy_gate import (
@@ -62,6 +78,74 @@ _NAG_ACT_PREFIX = "nag_"
 _KIND_NAG = "nag"
 _KIND_BOARD = "board"
 _KIND_NONE = "none"  # nothing reversible to do (e.g. a blocked act)
+
+
+# --- Board-revision + stable-id anchors (H9) -------------------------------
+
+def board_revision(content: str) -> str:
+    """A content-revision stamp for a board file: ``sha256:<hex>`` of its bytes.
+
+    Captured at snapshot time and compared at undo time. A byte-identical board
+    means the snapshot's ``line_number`` + ``raw_line`` still agree, so the restore
+    can take the direct fast path; any drift forces the stable-id resolution.
+    Mirrors the ``sha256:`` prefix convention used elsewhere (harvest_ledger).
+    """
+    return f"sha256:{sha256(content.encode('utf-8')).hexdigest()}"
+
+
+def task_id_in_line(raw_line: Any) -> str | None:
+    """Extract the stable ``task_id::`` / ``id::`` marker from a board line, or None.
+
+    Reuses the canonical task-identity regexes (``task_records``) so the id this
+    restore keys on is the SAME id ``tasks.py`` writes and the audit tooling reads.
+    A line with no inline id marker degrades to the content path -- it cannot be
+    resolved by id, so an ambiguous content match must REFUSE, not guess.
+    """
+    text = str(raw_line or "")
+    match = TASK_ID_RE.search(text) or LEGACY_ID_RE.search(text)
+    return match.group(1) if match else None
+
+
+def board_snapshot(
+    file: str | Path,
+    raw_line: str,
+    line_number: int | None,
+    *,
+    content: str | None = None,
+    post_raw_line: str | None = None,
+) -> dict[str, Any]:
+    """Build a board ``pre_action_snapshot`` stamped with the H9 undo anchors.
+
+    The forward (gate-time) helper every board writer should use to build the dict
+    handed to ``autonomy_gate.gate(snapshot_provider=...)``. It captures, alongside
+    the legacy ``file``/``raw_line``/``line_number``/``post_raw_line`` fields:
+
+    * ``board_revision`` -- a sha256 of the board file AT snapshot time (read here
+      if ``content`` is not supplied), so the undo path can tell "board unchanged"
+      from "board drifted" without guessing.
+    * ``task_id`` -- the stable id marker on the affected line, so a drifted board
+      is resolved by id rather than by ambiguous full-line text.
+
+    A board that cannot be read at snapshot time yields a snapshot with no
+    ``board_revision`` (None) -- the undo then falls back to the content path rather
+    than crashing the forward write.
+    """
+    path = Path(file)
+    if content is None:
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            content = None
+    snapshot: dict[str, Any] = {
+        "file": str(path),
+        "raw_line": raw_line,
+        "line_number": line_number,
+        "board_revision": board_revision(content) if content is not None else None,
+        "task_id": task_id_in_line(raw_line),
+    }
+    if post_raw_line is not None:
+        snapshot["post_raw_line"] = post_raw_line
+    return snapshot
 
 
 def _parse_iso(value: Any) -> datetime | None:
@@ -320,21 +404,25 @@ def _undo_nag(act_id: str, record: dict[str, Any]) -> dict[str, Any]:
 
 
 def _undo_board(act_id: str, record: dict[str, Any]) -> dict[str, Any]:
-    """Reverse a board mutation: restore the snapshot ``raw_line`` by CONTENT SEARCH.
+    """Reverse a board mutation by STABLE id + board revision -- never by guessing.
 
-    The board file shifts under other edits between the act and the undo, so the
-    stored ``line_number`` is only a HINT for placement -- the restore is keyed on
-    the exact line TEXT, not the number. Two mutation kinds are reversed correctly:
+    Full-line content search (the old behaviour) breaks on duplicate lines and on
+    any later edit, and a 7-day undo window makes board drift the common case. So
+    the target line is resolved like this (H9):
 
-    * If the snapshot carries ``post_raw_line`` (what the act WROTE -- e.g. a
-      ``[ ]`` -> ``[x]`` checkbox toggle), the undo REPLACES that post-action line
-      with the original ``raw_line`` in place, so the board never ends up with two
-      copies of the task.
-    * Otherwise the act removed a line; the undo RE-INSERTS the original
-      ``raw_line`` near the hinted position.
+    * If the board's CURRENT revision == the snapshot's ``board_revision`` (board
+      byte-identical since the act), the stored ``line_number`` + ``raw_line`` still
+      agree -> restore directly via the content path (safe, unambiguous, fast).
+    * If the board has DRIFTED (or carries no revision stamp), locate the target by
+      the snapshot's stable ``task_id`` marker. EXACTLY ONE matching line is
+      restored; ZERO or MORE-THAN-ONE candidates REFUSE with a structured CONFLICT
+      and write NOTHING -- the system never overwrites an ambiguous line.
+    * A snapshot with NO stable id (old data, or an id-less board line) degrades to
+      the content path but still REFUSES on ambiguity (the original text appears
+      more than once) rather than guessing.
 
-    Both are idempotent: if the board already shows the original line (and not the
-    post-action one), the restore is a no-op.
+    Idempotence is preserved across every path: if the original line is already
+    present and the post-action line gone, it is a no-op success.
     """
     snapshot = record["pre_action_snapshot"]
     raw_line = str(snapshot.get("raw_line") or "")
@@ -348,13 +436,15 @@ def _undo_board(act_id: str, record: dict[str, Any]) -> dict[str, Any]:
                        f"Board file for {act_id} is missing; cannot restore the line.")
 
     content = path.read_text(encoding="utf-8")
-    new_content, restored = restore_line_by_content(
-        content, raw_line,
-        post_raw_line=snapshot.get("post_raw_line"),
-        line_number_hint=snapshot.get("line_number"),
-    )
+    outcome = resolve_board_restore(content, snapshot)
+    if not outcome["ok"]:
+        # CONFLICT: the target line could not be identified unambiguously. Write
+        # NOTHING and surface a reviewable refusal naming the id + the candidates.
+        return _refuse_conflict(act_id, record, snapshot, outcome)
+
+    restored = outcome["restored"]
     if restored:
-        _atomic_write(path, new_content)
+        _atomic_write(path, outcome["new_content"])
 
     self_event = _append_ledger_revert(act_id, record, board_restored=restored,
                                         task_id=record.get("task_id"))
@@ -368,10 +458,69 @@ def _undo_board(act_id: str, record: dict[str, Any]) -> dict[str, Any]:
         "kind": _KIND_BOARD,
         "task_id": record.get("task_id"),
         "board_restored": restored,
+        "resolved_by": outcome["resolved_by"],
         "message": f"Undid {act_id}: task line {note}.",
         "ledger_event": self_event,
         "log_record": self_record,
     }
+
+
+def _refuse_conflict(
+    act_id: str,
+    record: dict[str, Any],
+    snapshot: dict[str, Any],
+    outcome: dict[str, Any],
+) -> dict[str, Any]:
+    """Refuse a board undo whose target could not be resolved unambiguously.
+
+    Writes NOTHING to the board and logs the refusal for the audit trail, then
+    returns a structured ``ok:False`` naming the act, the conflict reason, the
+    stable id (when known), the snapshot line, and how many candidates were found
+    -- enough for the user to resolve it manually. NO-RAW-ERROR-LEAK: the message is
+    human, never a traceback.
+    """
+    reason = outcome["reason"]
+    task_id = snapshot.get("task_id") or record.get("task_id")
+    candidates = outcome.get("candidates", 0)
+    snapshot_line = str(snapshot.get("raw_line") or "")
+    detail = {
+        "conflict": reason,
+        "snapshot_task_id": task_id,
+        "snapshot_line": snapshot_line,
+        "candidates": candidates,
+    }
+    self_record = _log_undo_outcome(act_id, "conflict", reason=reason,
+                                    task_id=record.get("task_id"), board_restored=False,
+                                    detail=str(detail))
+    message = _conflict_message(act_id, reason, task_id, snapshot_line, candidates)
+    return {
+        "ok": False,
+        "act_id": act_id,
+        "kind": _KIND_BOARD,
+        "reason": reason,
+        "task_id": task_id,
+        "snapshot_line": snapshot_line,
+        "candidates": candidates,
+        "board_restored": False,
+        "message": message,
+        "log_record": self_record,
+    }
+
+
+def _conflict_message(act_id: str, reason: str, task_id: str | None,
+                      snapshot_line: str, candidates: int) -> str:
+    """A human, reviewable one-liner for a board-undo CONFLICT (no traceback)."""
+    who = f" for task {task_id}" if task_id else ""
+    line_note = f" (snapshot line: {snapshot_line!r})" if snapshot_line else ""
+    if reason == "conflict-duplicate":
+        return (f"Cannot undo {act_id}{who}: {candidates} matching board lines -- "
+                f"ambiguous, so nothing was changed{line_note}. Resolve the duplicate manually.")
+    if reason == "conflict-not-found":
+        return (f"Cannot undo {act_id}{who}: the original line is no longer on the "
+                f"board and could not be located by id, so nothing was changed{line_note}. "
+                "Restore it manually if needed.")
+    return (f"Cannot undo {act_id}{who}: the board changed since the act and the "
+            f"target line could not be identified unambiguously, so nothing was changed{line_note}.")
 
 
 def _split_keep_trailing(content: str) -> tuple[list[str], bool]:
@@ -390,6 +539,130 @@ def _split_keep_trailing(content: str) -> tuple[list[str], bool]:
 def _join_keep_trailing(lines: list[str], had_trailing_newline: bool) -> str:
     text = "\n".join(lines)
     return text + "\n" if had_trailing_newline else text
+
+
+def resolve_board_restore(content: str, snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the board restore by revision + stable id; REFUSE on ambiguity (H9).
+
+    Returns a structured outcome dict, never raising:
+
+    * ``{"ok": True, "restored": bool, "new_content": str, "resolved_by": str}`` --
+      the line was identified unambiguously (or is already restored: a no-op
+      success with ``restored=False``).
+    * ``{"ok": False, "reason": "conflict-*", "candidates": int}`` -- the target
+      could not be identified unambiguously; the caller writes NOTHING.
+
+    Decision order:
+
+    1. ``board_revision`` present AND == the file's current revision -> the board is
+       byte-identical to act time, so the stored ``line_number``/``raw_line`` still
+       agree: take the legacy content path directly (``resolved_by="revision"``).
+    2. Otherwise the board drifted (or carries no revision). Resolve by the stable
+       ``task_id`` marker: count the lines whose id == the snapshot's id. ONE ->
+       restore that line in place (``resolved_by="task_id"``); ZERO ->
+       ``conflict-not-found``; MORE THAN ONE -> ``conflict-duplicate``.
+    3. No stable id at all -> fall back to the content path, but only if the target
+       text is UNIQUE. If ``raw_line``/``post_raw_line`` appears more than once it is
+       a ``conflict-duplicate`` (the old code would have guessed); a clean unique
+       match restores (``resolved_by="content"``).
+    """
+    raw_line = str(snapshot.get("raw_line") or "")
+    if not raw_line.strip():
+        return {"ok": True, "restored": False, "new_content": content,
+                "resolved_by": "empty"}
+
+    snap_revision = snapshot.get("board_revision")
+    if isinstance(snap_revision, str) and snap_revision == board_revision(content):
+        new_content, restored = restore_line_by_content(
+            content, raw_line,
+            post_raw_line=snapshot.get("post_raw_line"),
+            line_number_hint=snapshot.get("line_number"),
+        )
+        return {"ok": True, "restored": restored, "new_content": new_content,
+                "resolved_by": "revision"}
+
+    snap_task_id = snapshot.get("task_id") or task_id_in_line(raw_line)
+    if snap_task_id:
+        return _resolve_by_task_id(content, raw_line, snap_task_id,
+                                   post_raw_line=snapshot.get("post_raw_line"),
+                                   line_number_hint=snapshot.get("line_number"))
+
+    return _resolve_by_unique_content(content, raw_line,
+                                      post_raw_line=snapshot.get("post_raw_line"),
+                                      line_number_hint=snapshot.get("line_number"))
+
+
+def _resolve_by_task_id(
+    content: str,
+    raw_line: str,
+    task_id: str,
+    *,
+    post_raw_line: Any = None,
+    line_number_hint: Any = None,
+) -> dict[str, Any]:
+    """Resolve a drifted-board restore by the stable id marker; refuse on ambiguity.
+
+    Finds every line carrying ``task_id``. EXACTLY ONE -> replace it with
+    ``raw_line`` in place (or no-op if it already equals ``raw_line``: idempotent).
+    ZERO -> ``conflict-not-found`` (the line was deleted; if ``raw_line`` is already
+    on the board verbatim it is instead an idempotent no-op success). MORE THAN ONE
+    -> ``conflict-duplicate`` (two lines share the id; the system will not guess).
+    """
+    lines, had_nl = _split_keep_trailing(content)
+    matches = [i for i, line in enumerate(lines) if task_id_in_line(line) == task_id]
+
+    if len(matches) == 1:
+        idx = matches[0]
+        if lines[idx] == raw_line:
+            return {"ok": True, "restored": False, "new_content": content,
+                    "resolved_by": "task_id"}
+        lines[idx] = raw_line
+        return {"ok": True, "restored": True,
+                "new_content": _join_keep_trailing(lines, had_nl),
+                "resolved_by": "task_id"}
+
+    if len(matches) > 1:
+        return {"ok": False, "reason": "conflict-duplicate", "candidates": len(matches)}
+
+    # ZERO id matches. The act may have REMOVED the line entirely -- if the exact
+    # original is already back verbatim, it is an idempotent no-op; otherwise the
+    # id is gone and we will not blindly re-insert against a drifted board.
+    if raw_line in lines:
+        return {"ok": True, "restored": False, "new_content": content,
+                "resolved_by": "task_id"}
+    return {"ok": False, "reason": "conflict-not-found", "candidates": 0}
+
+
+def _resolve_by_unique_content(
+    content: str,
+    raw_line: str,
+    *,
+    post_raw_line: Any = None,
+    line_number_hint: Any = None,
+) -> dict[str, Any]:
+    """Fallback for an id-less snapshot: restore ONLY when the target text is unique.
+
+    Without a stable id the only anchor is text, so a duplicate is irresolvable.
+    If ``post_raw_line`` (the act's written line) appears more than once, or -- for a
+    re-insert -- ``raw_line`` would collide with multiple identical lines, refuse as
+    ``conflict-duplicate`` rather than guess. A clean, unique match (or an absent
+    line to re-insert) restores via the content path.
+    """
+    lines, _ = _split_keep_trailing(content)
+
+    post = str(post_raw_line) if post_raw_line is not None else ""
+    if post.strip():
+        post_count = lines.count(post)
+        if post_count > 1:
+            return {"ok": False, "reason": "conflict-duplicate", "candidates": post_count}
+
+    if lines.count(raw_line) > 1:
+        return {"ok": False, "reason": "conflict-duplicate", "candidates": lines.count(raw_line)}
+
+    new_content, restored = restore_line_by_content(
+        content, raw_line, post_raw_line=post_raw_line, line_number_hint=line_number_hint)
+    return {"ok": True, "restored": restored, "new_content": new_content,
+            "resolved_by": "content"}
 
 
 def restore_line_by_content(

@@ -260,6 +260,191 @@ def test_undo_board_replace_act_does_not_duplicate(tmp_path):
     assert after not in text.split("\n")  # toggled copy gone, no duplicate
 
 
+# --- H9: undo by STABLE id + board revision (not content guessing) ----------
+
+def _enriched_snapshot(tmp_path, board_content, raw_line, line_number, *,
+                       post_raw_line=None):
+    """A board snapshot stamped with the H9 anchors (revision + task_id), built the
+    way a real board writer would: from the board content AT act time."""
+    board = tmp_path / "Weekly TODOs.md"
+    board.write_text(board_content, encoding="utf-8")
+    snapshot = autonomy.board_snapshot(board, raw_line, line_number,
+                                       content=board_content, post_raw_line=post_raw_line)
+    return board, snapshot
+
+
+def test_undo_restores_correct_task_by_id_after_board_drift(tmp_path):
+    """Headline correctness: after the board DRIFTS (an unrelated edit changed other
+    lines + shifted line numbers), undo restores the RIGHT line by stable id -- the
+    others are untouched. Content/line-number guessing could not do this safely."""
+    raw_line = "- [ ] Migrate payments to Stripe task_id::tsk_pay estimate::4h"
+    at_act_time = (f"# Board\n- [ ] Other A task_id::tsk_a\n{raw_line}\n"
+                   "- [ ] Other B task_id::tsk_b\n")
+    board, snapshot = _enriched_snapshot(tmp_path, at_act_time, raw_line, line_number=3)
+    # The act toggled the target done; THEN the board drifted: an unrelated line was
+    # edited and a new one inserted, so line numbers no longer match the snapshot.
+    drifted = ("# Board\n- [ ] Other A EDITED task_id::tsk_a\n"
+               "- [ ] Brand new task_id::tsk_new\n"
+               "- [x] Migrate payments to Stripe task_id::tsk_pay estimate::4h\n"
+               "- [ ] Other B task_id::tsk_b\n")
+    board.write_text(drifted, encoding="utf-8")
+    snapshot["post_raw_line"] = "- [x] Migrate payments to Stripe task_id::tsk_pay estimate::4h"
+    _override_rung("task_marked_done", autonomy_gate.RUNG_APPROVE)
+    gated = autonomy_gate.gate("task_marked_done", task_id="tsk_pay", unit="U5",
+                               snapshot_provider=lambda: snapshot)
+    result = autonomy.undo_act(gated["act_id"])
+    assert result["ok"] is True
+    assert result["board_restored"] is True
+    assert result["resolved_by"] == "task_id"
+    text = board.read_text(encoding="utf-8")
+    assert raw_line in text.split("\n")  # the original (unchecked) line is back
+    assert "- [x] Migrate payments to Stripe task_id::tsk_pay" not in text  # toggle gone
+    # The drift to the OTHER lines is untouched -- undo restored only the target.
+    assert "- [ ] Other A EDITED task_id::tsk_a" in text
+    assert "- [ ] Brand new task_id::tsk_new" in text
+
+
+def test_undo_duplicate_task_id_is_conflict_writes_nothing(tmp_path):
+    """THE headline test: two board lines carry the SAME task_id as the snapshot's
+    target -> undo REFUSES with a CONFLICT, writes NOTHING, and names the candidates.
+    Never a wrong-line restore."""
+    raw_line = "- [ ] Pay invoice task_id::tsk_dup estimate::1h"
+    at_act_time = f"# Board\n{raw_line}\n"
+    board, snapshot = _enriched_snapshot(tmp_path, at_act_time, raw_line, line_number=2)
+    # Board drifts: the act's line was toggled AND a duplicate id snuck onto the board.
+    drifted = ("# Board\n- [x] Pay invoice task_id::tsk_dup estimate::1h\n"
+               "- [ ] Pay invoice AGAIN task_id::tsk_dup estimate::1h\n")
+    board.write_text(drifted, encoding="utf-8")
+    snapshot["post_raw_line"] = "- [x] Pay invoice task_id::tsk_dup estimate::1h"
+    _override_rung("task_marked_done", autonomy_gate.RUNG_APPROVE)
+    gated = autonomy_gate.gate("task_marked_done", task_id="tsk_dup", unit="U5",
+                               snapshot_provider=lambda: snapshot)
+    before = board.read_text(encoding="utf-8")
+    result = autonomy.undo_act(gated["act_id"])
+    assert result["ok"] is False
+    assert result["reason"] == "conflict-duplicate"
+    assert result["candidates"] == 2
+    assert result["board_restored"] is False
+    assert "tsk_dup" in result["message"] and "2" in result["message"]
+    # NOTHING was written: the board is byte-identical to before the undo.
+    assert board.read_text(encoding="utf-8") == before
+    # And the act is NOT marked reverted -> the user can fix it and retry.
+    assert autonomy._already_reverted(gated["act_id"]) is False
+
+
+def test_undo_duplicate_raw_line_no_id_is_conflict(tmp_path):
+    """The no-id path also refuses ambiguity: two IDENTICAL raw_lines (no stable id)
+    that match the snapshot -> CONFLICT, no wrong-line restore."""
+    after = "- [x] Buy milk"
+    before = "- [ ] Buy milk"
+    at_act_time = f"# Board\n{before}\n"
+    board, snapshot = _enriched_snapshot(tmp_path, at_act_time, before, line_number=2,
+                                         post_raw_line=after)
+    # Two identical toggled copies appear; with no stable id, neither is resolvable.
+    board.write_text(f"# Board\n{after}\n- [ ] something\n{after}\n", encoding="utf-8")
+    _override_rung("task_marked_done", autonomy_gate.RUNG_APPROVE)
+    gated = autonomy_gate.gate("task_marked_done", task_id="tsk_milk", unit="U5",
+                               snapshot_provider=lambda: snapshot)
+    before_text = board.read_text(encoding="utf-8")
+    result = autonomy.undo_act(gated["act_id"])
+    assert result["ok"] is False
+    assert result["reason"] == "conflict-duplicate"
+    assert result["board_restored"] is False
+    assert board.read_text(encoding="utf-8") == before_text  # nothing written
+
+
+def test_undo_unchanged_board_takes_revision_fast_path(tmp_path):
+    """Board UNCHANGED since the act (current revision == snapshot revision) -> the
+    direct content restore still works and is flagged resolved_by=revision."""
+    raw_line = "- [ ] Ship it task_id::tsk_ship"
+    after = "- [x] Ship it task_id::tsk_ship"
+    at_act_time = f"# Board\n{after}\n"
+    board, snapshot = _enriched_snapshot(tmp_path, at_act_time, raw_line, line_number=2,
+                                         post_raw_line=after)
+    # Board is byte-identical to act time (the toggled line is what the act wrote).
+    _override_rung("task_marked_done", autonomy_gate.RUNG_APPROVE)
+    gated = autonomy_gate.gate("task_marked_done", task_id="tsk_ship", unit="U5",
+                               snapshot_provider=lambda: snapshot)
+    result = autonomy.undo_act(gated["act_id"])
+    assert result["ok"] is True
+    assert result["resolved_by"] == "revision"
+    assert result["board_restored"] is True
+    text = board.read_text(encoding="utf-8").split("\n")
+    assert raw_line in text and after not in text
+
+
+def test_undo_edited_target_line_resolved_by_id_not_missed(tmp_path):
+    """A later edit to the TARGET line means post_raw_line is no longer present
+    verbatim, but the stable id still resolves it -> restored by id, not missed."""
+    raw_line = "- [ ] Draft Q3 plan task_id::tsk_q3 estimate::2h"
+    at_act_time = f"# Board\n{raw_line}\n"
+    board, snapshot = _enriched_snapshot(tmp_path, at_act_time, raw_line, line_number=2,
+                                         post_raw_line="- [x] Draft Q3 plan task_id::tsk_q3 estimate::2h")
+    # The target line was edited AFTER the act: the due date changed + it was toggled,
+    # so the snapshot's post_raw_line text no longer appears verbatim. Id still holds.
+    board.write_text("# Board\n- [x] Draft Q3 plan task_id::tsk_q3 estimate::2h 📅 2026-07-01\n",
+                     encoding="utf-8")
+    _override_rung("task_marked_done", autonomy_gate.RUNG_APPROVE)
+    gated = autonomy_gate.gate("task_marked_done", task_id="tsk_q3", unit="U5",
+                               snapshot_provider=lambda: snapshot)
+    result = autonomy.undo_act(gated["act_id"])
+    assert result["ok"] is True
+    assert result["resolved_by"] == "task_id"
+    assert result["board_restored"] is True
+    text = board.read_text(encoding="utf-8")
+    assert raw_line in text.split("\n")  # original line restored via id
+    # The edited/toggled variant is replaced in place -> no duplicate id on the board.
+    assert text.count("task_id::tsk_q3") == 1
+
+
+def test_undo_id_match_not_found_is_conflict(tmp_path):
+    """Drifted board where the target id is GONE and the original text is not present
+    -> conflict-not-found, nothing written (we will not blindly re-insert)."""
+    raw_line = "- [ ] Vanished task task_id::tsk_gone"
+    at_act_time = f"# Board\n{raw_line}\n"
+    board, snapshot = _enriched_snapshot(tmp_path, at_act_time, raw_line, line_number=2)
+    # Board drifted and the line (id and all) is simply gone.
+    board.write_text("# Board\n- [ ] Unrelated task_id::tsk_other\n", encoding="utf-8")
+    snapshot["post_raw_line"] = "- [x] Vanished task task_id::tsk_gone"
+    _override_rung("task_marked_done", autonomy_gate.RUNG_APPROVE)
+    gated = autonomy_gate.gate("task_marked_done", task_id="tsk_gone", unit="U5",
+                               snapshot_provider=lambda: snapshot)
+    before = board.read_text(encoding="utf-8")
+    result = autonomy.undo_act(gated["act_id"])
+    assert result["ok"] is False
+    assert result["reason"] == "conflict-not-found"
+    assert board.read_text(encoding="utf-8") == before  # nothing written
+
+
+def test_undo_old_snapshot_without_anchors_still_undoes(tmp_path):
+    """Back-compat: an OLD snapshot lacking board_revision/task_id still undoes via
+    the legacy content path (unique match) -- it never crashes."""
+    raw_line = "- [ ] Legacy line no id"
+    board, snapshot = _board_snapshot(tmp_path, raw_line, line_number=14)  # no anchors
+    assert "board_revision" not in snapshot and "task_id" not in snapshot
+    board.write_text("# Board\n- [ ] Other A\n- [ ] Other B\n", encoding="utf-8")
+    _override_rung("wip_cap_enforced", autonomy_gate.RUNG_APPROVE)
+    gated = autonomy_gate.gate("wip_cap_enforced", task_id="tsk_legacy", unit="U3",
+                               snapshot_provider=lambda: snapshot)
+    result = autonomy.undo_act(gated["act_id"])
+    assert result["ok"] is True
+    assert result["board_restored"] is True
+    assert result["resolved_by"] == "content"
+    assert raw_line in board.read_text(encoding="utf-8").split("\n")
+
+
+def test_board_snapshot_helper_stamps_revision_and_id(tmp_path):
+    """Unit: board_snapshot() captures sha256 revision + the line's stable id."""
+    board = tmp_path / "b.md"
+    content = "# Board\n- [ ] Do thing task_id::tsk_x\n"
+    board.write_text(content, encoding="utf-8")
+    snap = autonomy.board_snapshot(board, "- [ ] Do thing task_id::tsk_x", 2,
+                                   content=content)
+    assert snap["task_id"] == "tsk_x"
+    assert snap["board_revision"] == autonomy.board_revision(content)
+    assert snap["board_revision"].startswith("sha256:")
+
+
 def test_undo_survives_non_oserror_fault(tmp_path, monkeypatch):
     """P3b: a non-IO fault (e.g. ValueError) is caught -> structured error, no raise."""
     raw_line = "- [ ] Will hit a ValueError"
