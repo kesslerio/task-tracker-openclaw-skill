@@ -395,6 +395,10 @@ def test_undo_edited_target_line_resolved_by_id_not_missed(tmp_path):
     assert raw_line in text.split("\n")  # original line restored via id
     # The edited/toggled variant is replaced in place -> no duplicate id on the board.
     assert text.count("task_id::tsk_q3") == 1
+    # Transparency: the user's since-edit (the added date) was reverted, so the undo
+    # must SURFACE that -- never silently overwrite a since-edited line.
+    assert result["overwrote_edit"] is True
+    assert "edited since the act" in result["message"]
 
 
 def test_undo_id_match_not_found_is_conflict(tmp_path):

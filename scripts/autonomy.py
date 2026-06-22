@@ -452,6 +452,11 @@ def _undo_board(act_id: str, record: dict[str, Any]) -> dict[str, Any]:
                                     task_id=record.get("task_id"), board_restored=restored)
     note = ("restored to the board" if restored
             else "was already on the board (no change needed)")
+    overwrote_edit = bool(outcome.get("overwrote_edit"))
+    # Transparency: an id-keyed restore replaces the WHOLE line, so if the user edited
+    # that line since the act, their edit is reverted too. Surface it -- never silent.
+    edit_warning = (" ⚠️ this line had been edited since the act, so that edit was "
+                    "reverted too." if overwrote_edit else "")
     return {
         "ok": True,
         "act_id": act_id,
@@ -459,7 +464,8 @@ def _undo_board(act_id: str, record: dict[str, Any]) -> dict[str, Any]:
         "task_id": record.get("task_id"),
         "board_restored": restored,
         "resolved_by": outcome["resolved_by"],
-        "message": f"Undid {act_id}: task line {note}.",
+        "overwrote_edit": overwrote_edit,
+        "message": f"Undid {act_id}: task line {note}.{edit_warning}",
         "ledger_event": self_event,
         "log_record": self_record,
     }
@@ -639,10 +645,18 @@ def _resolve_by_task_id(
         if lines[idx] == raw_line:
             return {"ok": True, "restored": False, "new_content": content,
                     "resolved_by": "task_id"}
+        # The user may have EDITED this line since the act: it differs from BOTH the
+        # original ``raw_line`` and what the act wrote (``post_raw_line``). The snapshot
+        # stores only the full original line, so restoring it overwrites that later edit
+        # -- unavoidable (no structural diff), but it must NOT be silent. Flag it so the
+        # undo message warns the user their since-edit was reverted.
+        prior = lines[idx]
+        overwrote_edit = post_raw_line is not None and prior != str(post_raw_line)
         lines[idx] = raw_line
         return {"ok": True, "restored": True,
                 "new_content": _join_keep_trailing(lines, had_nl),
-                "resolved_by": "task_id"}
+                "resolved_by": "task_id",
+                "overwrote_edit": overwrote_edit}
 
     if len(matches) > 1:
         return {"ok": False, "reason": "conflict-duplicate", "candidates": len(matches)}
