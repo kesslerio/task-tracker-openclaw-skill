@@ -512,15 +512,18 @@ def run_main(component: str, main_func, trigger: str | None = None) -> int:
         _record_health_failure(component, classify(exc), resolved_trigger)
         print(line)
         return 0
-    # R1 Fix 1: inspect the RESULT CODE. A handled-but-failed ritual returns a NONZERO
-    # int (it caught its own failure rather than raising); that is NOT healthy, so it
-    # records a health FAILURE -- but we STILL return 0 to the OS so the cron relay sees
-    # the unchanged exit-0 contract (the health signal, not the exit code, carries the
-    # failure). A 0/None result is a clean run -> record_success. Both recorders are
-    # best-effort (post-main, wrapped) so they can never alter what main() returned/printed.
+    # R1 Fix 1: inspect the RESULT CODE for the health signal. A handled-but-failed ritual
+    # returns a NONZERO int (it caught its own failure rather than raising); that is NOT
+    # healthy, so it records a health FAILURE. A 0/None result -> record_success. We return
+    # the ACTUAL code, NOT a coerced 0: the exit-0-for-the-cron-relay contract is the
+    # ritual's/shell-wrapper's job (e.g. nag_check returns 0 itself), and coercing here
+    # would silently defeat an intentional diagnostic exit code such as
+    # ``preflight --strict-exit`` (which exists to return 1 on hard failure). Both
+    # recorders are best-effort (post-main, wrapped) so they never alter what main()
+    # returned/printed.
     if isinstance(result, int) and result != 0:
         _record_health_failure(component, "nonzero_exit", resolved_trigger)
-        return 0
+        return result
     _record_health_success(component)
     return int(result) if isinstance(result, int) else 0
 

@@ -576,17 +576,22 @@ def _deliver_more_pointer(deferred: int) -> None:
              message=str(exc))
 
 
-def _record_nag_health(*, blocked: int) -> None:
+def _record_nag_health(*, blocked: int = 0, crashed: str | None = None) -> None:
     """Best-effort: record this cron fire's outcome to the machine-visible health map.
 
-    A swallowed delivery failure (``blocked > 0``) is a health FAILURE; an otherwise-
-    clean real run is a success. Recorded DIRECTLY (not via the exit code) because the
-    cron's shell wrapper would turn a nonzero exit into a user-facing "unavailable"
-    announce. Wrapped so a broken/absent ``cos_health`` can never change the nag run.
+    A HARD crash (``crashed`` = the exception class) or a swallowed delivery failure
+    (``blocked > 0``) is a health FAILURE; an otherwise-clean real run is a success.
+    Recorded DIRECTLY (not via the exit code) because the cron's shell wrapper would turn
+    a nonzero exit into a user-facing "unavailable" announce -- and because nag_check
+    catches its own crash and returns 0, so the shell's log_subprocess_error never fires
+    either; without recording here a crashing nag_check would false-green until STALE.
+    Wrapped so a broken/absent ``cos_health`` can never change the nag run.
     """
     try:
         import cos_health  # noqa: PLC0415 -- lazy + wrapped: health is best-effort
-        if blocked > 0:
+        if crashed is not None:
+            cos_health.record_failure("nag_check", error_class=crashed, trigger="cron:nag_check")
+        elif blocked > 0:
             cos_health.record_failure("nag_check", error_class="nag_delivery_blocked",
                                       trigger="cron:nag_check")
         else:
@@ -653,6 +658,9 @@ def main(argv: list[str] | None = None) -> int:
             message="nag-check run failed", raw=repr(exc),
             trigger="cron:nag_check",
         )
+        # R1: a HARD crash is the worst silently-broken-cron case -- record a health
+        # FAILURE (best-effort) so it shows DEGRADED, not false-green-until-STALE.
+        _record_nag_health(crashed=type(exc).__name__)
         print(SAFE_ENVELOPE)
         return 0  # exit 0 so cron does not treat as failure
 

@@ -466,6 +466,20 @@ def test_r1_dry_run_records_no_health(harness, monkeypatch):
     assert "nag_check" not in cos_health.read_health()  # dry-run records nothing
 
 
+def test_r1_crash_records_health_failure(harness, monkeypatch):
+    """A HARD crash (an unexpected exception -- worse than a swallowed block) is recorded
+    as a health FAILURE too. nag_check catches its own crash and returns 0, so the shell
+    log_subprocess_error never fires; without recording here a crashing cron would
+    false-green until STALE."""
+    import cos_health  # noqa: PLC0415
+    board, state = harness
+    monkeypatch.setattr(nag_check, "run_nag_check",
+                        lambda **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    rc = nag_check.main([])
+    assert rc == 0  # the crash is enveloped (exit 0), SAFE_ENVELOPE printed
+    assert cos_health.read_health()["nag_check"]["last_failure"]["error_class"] == "RuntimeError"
+
+
 # --- Background recycle: no-longer-overdue clears (never terminally acks) ------
 
 def test_background_no_longer_overdue_recycles_not_acks(harness, monkeypatch):

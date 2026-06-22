@@ -384,13 +384,12 @@ def test_classify_anchored_patterns_avoid_false_positives():
     assert error_envelope.classify(None, stderr="connection reset by peer") == error_envelope.TRANSIENT
 
 
-def test_run_main_nonzero_result_records_failure_but_exits_zero(monkeypatch, tmp_path):
-    """R1 Fix 1: a handled-but-failed ritual (main() returns a NONZERO int -- it caught
-    its own failure rather than raising) is NOT healthy. run_main records a health
-    FAILURE (error_class ``nonzero_exit``) -- so H4 cannot false-green on a soft failure
-    -- but STILL returns 0 to the OS so the cron relay sees the unchanged exit-0
-    contract. This REPLACES the pre-R1 'a nonzero return is a success signal to preserve'
-    behaviour: a nonzero return is now a failure, recorded in health, exit forced to 0."""
+def test_run_main_nonzero_result_records_failure_and_returns_the_code(monkeypatch, tmp_path):
+    """R1 Fix 1: a handled-but-failed ritual (main() returns a NONZERO int) is NOT healthy.
+    run_main records a health FAILURE (error_class ``nonzero_exit``) AND returns the ACTUAL
+    code -- it does NOT coerce to 0. Coercing would silently defeat an intentional
+    diagnostic exit code (e.g. ``preflight --strict-exit``); the exit-0-for-the-cron
+    contract is the ritual's/shell-wrapper's job, not run_main's."""
     import cos_health  # noqa: PLC0415
 
     monkeypatch.setenv("TASK_MGMT_STATE_DIR", str(tmp_path))
@@ -398,10 +397,10 @@ def test_run_main_nonzero_result_records_failure_but_exits_zero(monkeypatch, tmp
     monkeypatch.setenv("TASK_TRACKER_LEDGER_FILE", str(tmp_path / "events.jsonl"))
 
     def main_func():
-        return 3  # a handled-but-failed ritual return code
+        return 3  # a handled-but-failed / diagnostic ritual return code
 
     rc = error_envelope.run_main("standup", main_func, trigger="cron:c99")
-    assert rc == 0  # exit-0 contract: a soft failure does NOT trip the cron
+    assert rc == 3  # the ACTUAL code is preserved (preflight --strict-exit stays meaningful)
     entry = cos_health.read_health()["standup"]
     assert entry["last_failure"]["error_class"] == "nonzero_exit"
     assert entry["last_failure"]["trigger"] == "cron:c99"
@@ -655,10 +654,12 @@ def test_health_recording_failure_never_breaks_envelope(monkeypatch, tmp_path, c
     rc2 = error_envelope.run_main("standup", lambda: 0)
     assert rc2 == 0
 
-    # R1 Fix 1 nonzero path: a raising record_failure on a nonzero RESULT must not
-    # change the exit-0 contract either -- the soft failure still exits 0, stdout
-    # unchanged. Health recording stays best-effort across all three outcome paths.
-    out_before = capsys.readouterr().out  # drain
+    # R1 Fix 1 nonzero path: a raising record_failure on a nonzero RESULT must not change
+    # what run_main returns -- it still returns the ACTUAL code (run_main no longer coerces
+    # to 0) and prints nothing itself. Health recording stays best-effort across all three
+    # outcome paths.
+    capsys.readouterr()  # drain
     rc3 = error_envelope.run_main("standup", lambda: 1)
-    assert rc3 == 0
-    assert out_before is not None  # (drained; the nonzero path prints nothing itself)
+    out3 = capsys.readouterr().out
+    assert rc3 == 1  # the code is preserved; the raising recorder did not alter it
+    assert out3 == ""  # the nonzero-result path prints nothing itself
