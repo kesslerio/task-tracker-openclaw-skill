@@ -225,7 +225,11 @@ def health_lines(*, stale_hours: int = _DEFAULT_STALE_HOURS) -> list[str]:
     for ritual in names:
         raw = rituals.get(ritual)
         entry = raw if isinstance(raw, dict) else None
-        flag = _ritual_flag(entry, stale_hours=stale_hours, registered=ritual in _EXPECTED_RITUALS)
+        # Each REGISTERED ritual is judged against ITS OWN cadence (e.g. weekly_review =
+        # 192h), so an on-cadence weekly ritual is not false-flagged STALE against the
+        # global default. An unregistered / recorded-only ritual falls back to stale_hours.
+        ritual_stale = _EXPECTED_RITUALS.get(ritual, stale_hours)
+        flag = _ritual_flag(entry, stale_hours=ritual_stale, registered=ritual in _EXPECTED_RITUALS)
         success_part = (entry or {}).get("last_success_ts") or "never"
         failure = (entry or {}).get("last_failure")
         if isinstance(failure, dict):

@@ -162,6 +162,27 @@ def test_r1_registry_iterated_when_health_json_lacks_entry(capsys):
     assert "some_adhoc_ritual" in out
 
 
+def test_r1_per_ritual_cadence_weekly_review_ok_at_100h(capsys):
+    """weekly_review's registry cadence is 192h, so a clean run 100h ago is OK -- it is
+    judged against ITS OWN cadence, NOT the global 36h default (which would false-STALE a
+    healthy weekly ritual for ~5 of every 7 days)."""
+    ts = (cos_config.local_now() - timedelta(hours=100)).isoformat()
+    _write_health({"weekly_review": {"last_success_ts": ts}})
+    cos_manifest.main(["health"])
+    out = capsys.readouterr().out
+    assert "OK weekly_review" in out  # 100h < 192h cadence -> OK
+
+
+def test_r1_per_ritual_cadence_daily_ritual_stale_past_its_window(capsys):
+    """A daily-cadence ritual (standup, 24h) IS stale at 40h -- the per-ritual cadence
+    tightens as well as loosens; only the registry value is used, not the global default."""
+    ts = (cos_config.local_now() - timedelta(hours=40)).isoformat()
+    _write_health({"standup": {"last_success_ts": ts}})
+    cos_manifest.main(["health"])
+    out = capsys.readouterr().out
+    assert "STALE standup" in out  # 40h > 24h cadence -> STALE
+
+
 def test_r1_fresh_success_no_newer_failure_is_ok(capsys):
     """The OK baseline under the new rule: a recent success with no failure at all (or
     only an older one) reads OK -- Fix 4 does not over-flag a healthy ritual."""
