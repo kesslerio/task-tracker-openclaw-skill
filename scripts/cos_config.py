@@ -123,6 +123,25 @@ def nag_snooze_max() -> int:
     return _int_env("NAG_SNOOZE_MAX", 3)
 
 
+def nag_disposition_after_snoozes() -> int:
+    """Snoozes after which the nag STOPS re-asking the same way and asks for a
+    disposition instead (default 2, env ``NAG_DISPOSITION_AFTER_SNOOZES``).
+
+    External review (ADHD-overwhelm surface): "after two snoozes, stop tightening
+    the interval and ask whether the task is blocked, unclear, too large, or no
+    longer important." There is no interval tightening to remove (the cadence is the
+    fixed cron schedule, not a per-loop shrink), so the escalation is purely the
+    DISPOSITION prompt: once ``snooze_count >= this``, the nag's TEXT becomes the
+    disposition question rather than the normal overdue nag (same gated/receipted
+    send -- just different wording).
+
+    Floored at 1: a 0/negative value (a misconfig typo) would make EVERY nag a
+    disposition prompt from the first snooze (or before), so the knob can raise the
+    bar but never drop below one snooze.
+    """
+    return max(1, _int_env("NAG_DISPOSITION_AFTER_SNOOZES", 2))
+
+
 def nag_display_limit() -> int:
     """Most-overdue nags pushed per cron cycle; the rest defer to ``/nag all``.
 
