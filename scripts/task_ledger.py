@@ -6,11 +6,12 @@ from __future__ import annotations
 import json
 import os
 import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 try:
     import fcntl
@@ -19,7 +20,37 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
 
 import cos_config
 import redaction
-from utils import get_tasks_file
+from utils import _atomic_write, get_tasks_file
+
+
+def _ledger_lock_path(target: Path) -> Path:
+    return target.with_name(target.name + ".lock")
+
+
+@contextmanager
+def _ledger_flock(target: Path) -> Iterator[None]:
+    """Hold the exclusive SIDECAR flock guarding ``target`` for the block.
+
+    The lock lives on a separate ``<ledger>.lock`` file (the same pattern
+    ``outbox._outbox_flock`` / ``quiet_state._quiet_flock`` use), NOT on the ledger
+    data file's own fd. That is precisely what lets the retention prune rewrite the
+    ledger via an atomic ``os.replace`` (temp-file swap) without orphaning the lock:
+    swapping the DATA file's inode leaves the sidecar lock's inode untouched, so a
+    waiting writer blocks on the sidecar and can never append to an unlinked old inode
+    (no lost append), while a lock-free reader (``read_events`` takes no lock) sees the
+    whole old OR whole new file -- never the torn/duplicated middle an in-place rewrite
+    would expose. ``append_event`` is the SOLE writer, so the sidecar fully serialises
+    every write.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with _ledger_lock_path(target).open("a", encoding="utf-8") as lock_handle:
+        if fcntl is not None:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
 
 @dataclass(frozen=True)
@@ -209,16 +240,15 @@ def _event_timestamp(line: str) -> datetime | None:
 
 
 def _prune_stale_locked(target: Path, *, now: datetime | None = None) -> None:
-    """Drop ledger lines older than the undo-window-safe cutoff. IN PLACE, under the lock.
+    """Drop ledger lines older than the undo-window-safe cutoff, under the sidecar lock.
 
-    Rewrites the data file IN PLACE (``r+`` seek-0 / write / truncate) -- NOT via a
-    temp-file ``os.replace``. That matters: ``append_event`` holds its exclusive flock
-    on the DATA file's inode, so swapping the inode out with ``os.replace`` would
-    orphan that lock and let a waiting writer append to the unlinked old inode (a lost
-    append). An in-place rewrite keeps the one inode the lock guards, so the whole
-    read-trim-write is serialised by the SAME flock the caller already holds (external
-    writers open the same path and block on it) -- no torn line, no lost append, no new
-    locking scheme.
+    Rewrites the data file via an ATOMIC ``os.replace`` (``utils._atomic_write`` writes
+    a temp file + renames), NOT an in-place ``r+`` truncate. Because the caller holds the
+    SIDECAR lock (``_ledger_flock``), not a flock on the data file's own fd, the inode
+    swap can never orphan the lock or lose a concurrent append -- and a lock-free reader
+    sees the whole old OR whole new file, never the torn/duplicated middle an in-place
+    rewrite exposes during its write->truncate window (and a crash mid-rewrite leaves the
+    intact old file rather than corrupting the audit ledger).
 
     Best-effort: any error is swallowed by the caller. The rewrite only happens when a
     line is CONFIDENTLY datable as older than the cutoff (``_event_timestamp`` returns
@@ -242,12 +272,7 @@ def _prune_stale_locked(target: Path, *, now: datetime | None = None) -> None:
         kept.append(line)
     if not dropped:
         return  # nothing stale: skip the rewrite so the common path stays append-only
-    content = "\n".join(kept) + ("\n" if kept else "")
-    with target.open("r+", encoding="utf-8") as rewriter:
-        rewriter.seek(0)
-        rewriter.write(content)
-        rewriter.truncate()
-        rewriter.flush()
+    _atomic_write(target, "\n".join(kept) + ("\n" if kept else ""))
 
 
 def append_event(event: dict[str, Any], path: Path | None = None) -> dict[str, Any]:
@@ -261,31 +286,25 @@ def append_event(event: dict[str, Any], path: Path | None = None) -> dict[str, A
     # degrades to a safe redacted event rather than crashing the append.
     safe_event = redaction.redact_event(event)
     rendered = json.dumps(safe_event, ensure_ascii=False, sort_keys=True)
-    # Contract 1: hold an exclusive flock for the whole append so concurrent
-    # writers (heartbeat cron + user CLI + every U1-U6 caller that goes through
-    # append_event) can never interleave a torn JSONL line. The lock lives HERE,
-    # inside append_event, not in any per-unit wrapper -- a wrapper would leave
-    # standup.py / complete_by_id() racing. flock is released when the handle is
-    # closed by the `with` block, including on exception.
-    with target.open("a", encoding="utf-8") as handle:
-        if fcntl is not None:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
+    # Contract 1: hold the exclusive SIDECAR flock for the whole append+prune so
+    # concurrent writers (heartbeat cron + user CLI + every U1-U6 caller that goes
+    # through append_event -- the sole writer) can never interleave a torn JSONL line.
+    # The lock is on <ledger>.lock, NOT the data fd, so the H10 retention prune can
+    # atomically os.replace the data file without orphaning the lock or losing an
+    # append. flock is released when the `with` block exits, including on exception.
+    with _ledger_flock(target):
+        with target.open("a", encoding="utf-8") as handle:
             handle.write(rendered + "\n")
             handle.flush()
-            # H10 Part B: APPEND FIRST, prune SECOND (best-effort) under the SAME
-            # flock -- mirroring outbox.deliver_once. The just-written event MUST
-            # survive; pruning only drops entries OLDER than the undo-window-safe
-            # cutoff, so it can never delete a fresh append or an in-window
-            # audit/undo/approval event. Any prune fault is contained here and never
-            # propagates out of append_event: the new line on disk stands.
-            try:
-                _prune_stale_locked(target)
-            except Exception:  # noqa: BLE001 -- prune is best-effort; the append is committed
-                pass
-        finally:
-            if fcntl is not None:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        # H10 Part B: APPEND FIRST, prune SECOND (best-effort) under the SAME lock --
+        # mirroring outbox.deliver_once. The just-written event MUST survive; pruning
+        # only drops entries OLDER than the undo-window-safe cutoff, so it can never
+        # delete a fresh append or an in-window audit/undo/approval event. Any prune
+        # fault is contained here and never propagates out of append_event.
+        try:
+            _prune_stale_locked(target)
+        except Exception:  # noqa: BLE001 -- prune is best-effort; the append is committed
+            pass
     return event
 
 

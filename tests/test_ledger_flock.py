@@ -53,24 +53,28 @@ def test_append_event_holds_exclusive_flock_during_write(tmp_path, monkeypatch):
     On Linux a single O_APPEND write() is already hard to tear, so the append
     tests above cannot by themselves prove the lock is load-bearing. This test
     asserts the mechanism directly: while one append_event holds the lock, a
-    second process's non-blocking LOCK_EX on the same file fails -- i.e. the lock
-    is held EXCLUSIVELY for the duration of the write.
+    second process's non-blocking LOCK_EX on the SIDECAR lock file fails -- i.e. the
+    lock is held EXCLUSIVELY for the duration of the write. (H10 moved the lock to a
+    ``<ledger>.lock`` sidecar so the retention prune can atomically os.replace the
+    data file; the exclusion guarantee is unchanged, only which inode carries it.)
     """
     import fcntl
     import task_ledger
 
     ledger = tmp_path / "events.jsonl"
     ledger.touch()
+    sidecar = task_ledger._ledger_lock_path(ledger)
     lock_contended = {"value": None}
 
     real_flock = fcntl.flock
 
     def probing_flock(fd, op):
         # Intercept the LOCK_EX taken inside append_event; while we hold it, try a
-        # non-blocking exclusive lock from a separate fd -- it must fail (EAGAIN).
+        # non-blocking exclusive lock from a separate fd on the SIDECAR -- it must
+        # fail (EAGAIN).
         result = real_flock(fd, op)
         if op == fcntl.LOCK_EX:
-            with open(ledger, "a", encoding="utf-8") as other:
+            with open(sidecar, "a", encoding="utf-8") as other:
                 try:
                     real_flock(other.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                     lock_contended["value"] = False  # got it -> not exclusive: bug
