@@ -239,3 +239,22 @@ def test_provider_state_change_resurfaces_same_identity(env, monkeypatch):
     assert len(third["evidence_candidates"]) == 1
     standup_state = harvest_state.load_state(harvest_state.WINDOW_STANDUP)
     assert standup_state["seen_provider_states"][first["evidence_candidates"][0]["evidence_hash"]] == "merged:sha-2:merged"
+
+
+def test_failed_source_watermark_is_not_advanced(env, monkeypatch):
+    # github harvest reports failed (e.g. PR search ok but commit search failed);
+    # gmail succeeds. The github watermark must NOT advance (or the next run skips
+    # the records the failed query missed); the gmail watermark may advance.
+    _stub_adapters(
+        monkeypatch,
+        github=[_github_record("Fix payroll sync acme/app#42")],
+        gmail=[_gmail_record("Sent the quarterly update")],
+        github_failed=True,
+    )
+
+    standup_harvest.harvest(target_date=date(2026, 6, 23), trigger="test")
+
+    state = harvest_state.load_state(harvest_state.WINDOW_STANDUP)
+    watermarks = state.get("watermarks") or {}
+    assert "github" not in watermarks
+    assert watermarks.get("gmail") == "2026-06-23T13:00:00-07:00"

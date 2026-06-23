@@ -196,6 +196,7 @@ def harvest(*, target_date: str | date | None = None, trigger: str) -> dict[str,
 
     all_records: list[dict[str, Any]] = []
     health: dict[str, Any] = {}
+    failed_sources: set[str] = set()
     for source in SOURCES:
         query_start, query_end = _source_query(resolved, state, source)
         raw_records, failed = _harvest_source(
@@ -205,6 +206,8 @@ def harvest(*, target_date: str | date | None = None, trigger: str) -> dict[str,
             query_start=query_start,
             query_end=query_end,
         )
+        if failed:
+            failed_sources.add(source)
         wrapped, invalid = _wrap_adapter_records(source, raw_records, run_id=run_id)
         all_records.extend(wrapped)
         health[source] = _record_source_health(
@@ -226,10 +229,15 @@ def harvest(*, target_date: str | date | None = None, trigger: str) -> dict[str,
         if not harvest_state.is_seen(state, candidate["evidence_hash"], candidate.get("provider_state"))
     ]
     persisted_fresh: list[dict[str, Any]] = []
+    # Only advance a source's watermark when that source's harvest fully succeeded
+    # (failed=False). A partial failure -- e.g. PR search ok but commit search failed
+    # -- must NOT advance the watermark, or the next run starts past the records the
+    # failed query missed and skips them permanently. is_seen dedups the re-query.
     watermarks = {
         source: watermark
         for source in SOURCES
-        if (watermark := _latest_occurred_at(filtered, source)) is not None
+        if source not in failed_sources
+        and (watermark := _latest_occurred_at(filtered, source)) is not None
     }
 
     def mutate(live_state: dict[str, Any]) -> None:
