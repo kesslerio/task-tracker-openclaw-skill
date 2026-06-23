@@ -90,6 +90,12 @@ def encode(action: str, task_id: str, arg: str | None = None) -> str | None:
     arg), or the assembled value exceeds 64 UTF-8 BYTES. A ``None`` tells the row-builder
     to drop the button and keep the text command (the drop-fallback).
     """
+    # Validate ``action`` is a clean string BEFORE indexing the policy map: an unhashable
+    # garbage action (``[]``, ``{}``, ``set()``) would otherwise raise ``TypeError`` from
+    # ``dict.get`` and break the documented never-raise contract. ``_is_clean_field`` also
+    # rejects a ``:``-bearing action, which could never name a real action anyway.
+    if not _is_clean_field(action):
+        return None
     policy = _ARG_POLICY.get(action)
     if policy is None:  # unknown action
         return None

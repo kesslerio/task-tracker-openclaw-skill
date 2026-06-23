@@ -84,6 +84,13 @@ def test_encode_unknown_action_returns_none():
     assert tb.encode("bogus", TASK) is None
 
 
+def test_encode_never_raises_on_garbage_action():
+    """The never-raise contract holds even for an UNHASHABLE garbage action: encode must
+    return None, not let a TypeError from indexing the policy map escape."""
+    for bad in ([], {}, set(), 42, None, "", "do:ne"):
+        assert tb.encode(bad, TASK) is None  # type: ignore[arg-type]
+
+
 # --- per-action arg policy (encode emits only canonical KTD-3 shapes) -------
 
 def test_encode_task_only_action_rejects_an_arg():
