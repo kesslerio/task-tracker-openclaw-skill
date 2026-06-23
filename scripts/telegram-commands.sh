@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Telegram slash command wrapper for task-tracker skill
-# Usage: telegram-commands.sh {daily|weekly|promote|swap|done|reschedule|snooze|body-double|start|cancel-session|
+# Usage: telegram-commands.sh {daily|eod|weekly|promote|swap|done|reschedule|snooze|body-double|start|cancel-session|
 #                              done24h|done7d|ledger|ledger-cron|win|approve|nag-check|checkin-dispatch|nag|quiet|unquiet|audit|undo}
 #
 # U1 NO-RAW-ERROR-LEAK boundary: every python3 invocation goes through
@@ -65,6 +65,16 @@ run_with_envelope() {
 case "$1" in
   daily)
     run_with_envelope "standup" python3 "$SCRIPT_DIR/standup.py"
+    ;;
+  eod)
+    # U7 EOD ritual (the 18:00 deterministic command cron points here). Assembles the
+    # detect/confirm + forced-disposition + tomorrow's-#1 steps and DELIVERS the whole
+    # ritual through the receipt-backed seam (prove -> gate -> assert -> deliver_once,
+    # button-capable, idem-keyed on the local date so a same-day re-fire never double-
+    # sends), then upserts the human-readable ## EOD Summary to the Obsidian daily note.
+    # Board mutations happen ONLY on the user's later button taps -- never on this send.
+    # eod_review.py wraps main() in run_main, which records the real eod_review health.
+    run_with_envelope "eod_review" python3 "$SCRIPT_DIR/eod_ritual.py"
     ;;
   weekly)
     # Show Q1 and Q2 tasks
@@ -210,7 +220,7 @@ case "$1" in
     run_with_envelope "manifest" python3 "$SCRIPT_DIR/cos_manifest.py" manifest
     ;;
   *)
-    echo "Usage: $0 {daily|weekly|promote|swap|done|reschedule|snooze|body-double|start|cancel-session|done24h|done7d|ledger|ledger-cron|win|approve|nag-check|checkin-dispatch|nag|quiet|unquiet|health|manifest|audit|undo}"
+    echo "Usage: $0 {daily|eod|weekly|promote|swap|done|reschedule|snooze|body-double|start|cancel-session|done24h|done7d|ledger|ledger-cron|win|approve|nag-check|checkin-dispatch|nag|quiet|unquiet|health|manifest|audit|undo}"
     exit 1
     ;;
 esac
