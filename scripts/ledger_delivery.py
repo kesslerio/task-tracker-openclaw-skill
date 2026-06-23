@@ -178,7 +178,7 @@ def _consume(proof: dict[str, Any], push: DigestPush, *, auto: bool) -> None:
         }.items() if tid not in approved
     }
     if auto:  # CANONICAL weekly delivery -- the reactive PREVIEW must not consume.
-        harvest_state.mark_seen(state, [item["evidence_hash"] for item in push.fresh])
+        harvest_state.mark_seen(state, push.fresh)
     harvest_state.save_state(state, push.window)
     if auto:
         win_store.mark_wins_seen([win["id"] for win in push.wins])
