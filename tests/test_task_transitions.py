@@ -509,6 +509,175 @@ def test_restore_snapshots_is_atomic(tmp_path, monkeypatch):
     assert target.read_text() == snapshot_content
 
 
+# --- U5 EOD disposition: carry_by_id + drop_by_id ----------------------------
+
+
+def _events(tmp_path):
+    ledger = tmp_path / "events.jsonl"
+    if not ledger.exists():
+        return []
+    return [json.loads(line) for line in ledger.read_text().splitlines() if line.strip()]
+
+
+def test_carry_keeps_task_active_and_stamps_carried(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text("""# Work
+
+## 🔴 Q1
+- [ ] **Ship milestone** task_id::tsk_ship area:: Delivery
+""")
+    env = _env(tmp_path, work)
+
+    proc = subprocess.run(
+        ["python3", "scripts/nag_commands.py", "carry", "tsk_ship"],
+        capture_output=True, text=True, check=False, env=env,
+    )
+
+    assert proc.returncode == 0
+    payload = json.loads(proc.stdout)
+    assert payload["ok"] is True
+    content = work.read_text()
+    # Carry KEEPS the task active and stamps the carried:: marker (no done, no parking).
+    assert "Ship milestone" in content
+    assert "carried::" in content
+    # The disposition event is the registered eod_disposition_carry type.
+    types = [e["event_type"] for e in _events(tmp_path)]
+    assert "eod_disposition_carry" in types
+
+
+def test_carry_is_idempotent_single_marker(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text("""# Work
+
+## 🔴 Q1
+- [ ] **Ship milestone** task_id::tsk_ship area:: Delivery
+""")
+    env = _env(tmp_path, work)
+
+    for _ in range(2):
+        subprocess.run(["python3", "scripts/nag_commands.py", "carry", "tsk_ship"],
+                       capture_output=True, text=True, check=False, env=env)
+
+    # Re-carrying refreshes the date rather than stacking markers: exactly one carried::.
+    assert work.read_text().count("carried::") == 1
+
+
+def test_drop_moves_task_to_parking_lot_and_logs_event(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text("""# Work
+
+## 🔴 Q1
+- [ ] **Ship milestone** task_id::tsk_ship area:: Delivery
+
+## 🅿️ Parking Lot
+""")
+    env = _env(tmp_path, work)
+
+    proc = subprocess.run(
+        ["python3", "scripts/nag_commands.py", "drop", "tsk_ship"],
+        capture_output=True, text=True, check=False, env=env,
+    )
+
+    assert proc.returncode == 0
+    payload = json.loads(proc.stdout)
+    assert payload["ok"] is True
+    content = work.read_text()
+    # The task left the active Q1 section and now lives under the Parking Lot header.
+    assert content.index("tsk_ship") > content.index("Parking Lot")
+    types = [e["event_type"] for e in _events(tmp_path)]
+    assert "eod_disposition_drop" in types
+
+
+def test_drop_without_parking_lot_refuses_and_leaves_board_unchanged(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    original = """# Work
+
+## 🔴 Q1
+- [ ] **Ship milestone** task_id::tsk_ship area:: Delivery
+"""
+    work.write_text(original)
+    env = _env(tmp_path, work)
+
+    proc = subprocess.run(
+        ["python3", "scripts/nag_commands.py", "drop", "tsk_ship"],
+        capture_output=True, text=True, check=False, env=env,
+    )
+
+    assert proc.returncode == 2
+    payload = json.loads(proc.stdout)
+    assert payload["error"]["code"] == "parking-lot-missing"
+    # Board untouched, no disposition event written.
+    assert work.read_text() == original
+    assert "eod_disposition_drop" not in [e["event_type"] for e in _events(tmp_path)]
+
+
+def test_drop_is_reversible_via_undo(tmp_path):
+    """A drop records a pre-action board snapshot through the autonomy gate, so /undo
+    restores the original active line by stable id (restore-by-task-id) within the undo
+    window: the parked line is swapped back to its original active form -- one copy, no
+    parking-lot ``created::`` marker, no duplicate."""
+    work = tmp_path / "Work Tasks.md"
+    active_line = "- [ ] **Ship milestone** task_id::tsk_ship area:: Delivery"
+    work.write_text(f"""# Work
+
+## 🔴 Q1
+{active_line}
+
+## 🅿️ Parking Lot
+""")
+    env = _env(tmp_path, work)
+    state = tmp_path / "state"
+    env["TASK_MGMT_STATE_DIR"] = str(state)
+
+    drop = subprocess.run(["python3", "scripts/nag_commands.py", "drop", "tsk_ship"],
+                          capture_output=True, text=True, check=False, env=env)
+    assert drop.returncode == 0
+    parked = work.read_text()
+    # The task moved to the parking lot (below the header) and carries the parking marker.
+    assert parked.index("tsk_ship") > parked.index("Parking Lot")
+    assert "created::" in parked
+
+    # Find the gated act_id for the drop, then /undo it.
+    audit = subprocess.run(["python3", "scripts/autonomy_cli.py", "audit"],
+                           capture_output=True, text=True, check=False, env=env)
+    act_line = next(line for line in audit.stdout.splitlines() if "act_" in line)
+    import re as _re
+    act_id = _re.search(r"act_[0-9a-f]+", act_line).group(0)
+
+    undo = subprocess.run(["python3", "scripts/autonomy_cli.py", "undo", act_id],
+                          capture_output=True, text=True, check=False, env=env)
+    assert undo.returncode == 0
+    content = work.read_text()
+    # The line is restored to its ORIGINAL active form by stable id (restore-by-task-id):
+    # exactly one copy, the parking ``created::`` marker gone (no parked duplicate).
+    assert content.count("task_id::tsk_ship") == 1
+    assert active_line in content
+    assert "created::" not in content
+
+
+def test_drop_recurring_task_does_not_spawn_next_occurrence(tmp_path):
+    """Dropping a recurring task is an explicit stop-chasing decision, NOT a
+    completion: it must move to the parking lot as-is, never roll forward a dup."""
+    work = tmp_path / "Work Tasks.md"
+    work.write_text("""# Work
+
+## 🔴 Q1
+- [ ] **Send weekly update** task_id::tsk_weekly recur::weekly 🗓️2026-05-20
+
+## 🅿️ Parking Lot
+""")
+    env = _env(tmp_path, work)
+
+    proc = subprocess.run(["python3", "scripts/nag_commands.py", "drop", "tsk_weekly"],
+                          capture_output=True, text=True, check=False, env=env)
+    assert proc.returncode == 0
+    content = work.read_text()
+    # Exactly ONE occurrence, now parked (no rolled-forward 2026-05-27 dup on the board).
+    assert content.count("Send weekly update") == 1
+    assert content.index("Send weekly update") > content.index("Parking Lot")
+    assert "🗓️2026-05-27" not in content
+
+
 def test_restore_snapshots_crash_mid_restore_leaves_target_intact(tmp_path, monkeypatch):
     """If os.replace fails during the atomic restore, the destination is not
     truncated -- the same crash-safety the forward path has."""

@@ -63,9 +63,9 @@ _COMMAND_TIMEOUT_S = 30.0
 # wrong-topic). ``snz``/``rsch`` map to the verbs ``snooze``/``reschedule`` so the result's
 # ``action`` (``command_argv[0]``) matches the plugin's ackText keys.
 #
-# ``carry`` / ``drop`` / ``set-top`` land in U5/U6: their commands do not exist yet, so they are
-# deliberately NOT mapped. An unmapped (but decodable) action returns a clean ``not_yet_available``
-# result -- never a crash -- and U5/U6 add both the command and the button row that emits it.
+# ``carry`` / ``drop`` are wired in U5 (their nag_commands verbs now exist). ``top`` (set tomorrow's
+# #1) lands in U6 and is deliberately NOT mapped yet. An unmapped (but decodable) action returns a
+# clean ``not_yet_available`` result -- never a crash -- and U6 adds both its command and the row.
 ArgvBuilder = Callable[[str, "str | None", str], "list[str]"]
 
 
@@ -85,6 +85,14 @@ def _reschedule_argv(task_id: str, arg: str | None, topic_id: str) -> list[str]:
     return ["reschedule", "--", task_id, arg or ""]
 
 
+def _carry_argv(task_id: str, arg: str | None, topic_id: str) -> list[str]:
+    return ["carry", "--", task_id]
+
+
+def _drop_argv(task_id: str, arg: str | None, topic_id: str) -> list[str]:
+    return ["drop", "--", task_id]
+
+
 def _approve_argv(task_id: str, arg: str | None, topic_id: str) -> list[str]:
     # ``approve --topic-id <inbound topic> -- <task_id>``: the inbound topic id is forwarded so the
     # downstream topic guard (the authority) can accept or reject. We never gate it here. The
@@ -97,6 +105,12 @@ _ACTION_TO_COMMAND: dict[str, tuple[str, ArgvBuilder]] = {
     "snz": ("nag_commands.py", _snooze_argv),
     "rsch": ("nag_commands.py", _reschedule_argv),
     "appr": ("harvest_ledger.py", _approve_argv),
+    # U5 EOD forced disposition: carry (keep active, stamp carried::) and drop (move to
+    # the parking lot) route to the new nag_commands verbs. ``top`` (set tomorrow's #1)
+    # stays UNMAPPED -- it lands in U6 and returns a clean ``not_yet_available`` until
+    # then (the row that emits it ships with its command).
+    "carry": ("nag_commands.py", _carry_argv),
+    "drop": ("nag_commands.py", _drop_argv),
 }
 
 

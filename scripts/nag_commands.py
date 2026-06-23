@@ -51,7 +51,8 @@ import nag_state
 import quiet_state
 from task_ledger import append_event, new_event
 from task_records import active_records, load_records
-from task_transitions import complete_by_id, reschedule_by_id
+import task_transitions
+from task_transitions import carry_by_id, complete_by_id, drop_by_id, reschedule_by_id
 
 # Nag durations are days/hours/minutes (the spec uses 1h / 1d / 3d / 90m). The
 # shared utils.parse_duration only understands h/m (it sizes focus blocks), so we
@@ -183,6 +184,90 @@ def handle_done(task_id: str, *, personal: bool = False) -> dict[str, Any]:
     _end_focus_session(task_id, outcome="done")
     if result.get("recurring"):
         return _recycle_loop(result, task_id, closed_by=nag_state.CLOSED_EXPLICIT_DONE)
+    return _close_loop_after_board_op(result, task_id,
+                                      closed_by=nag_state.CLOSED_EXPLICIT_DONE)
+
+
+def _gate_board_disposition(act_type: str, task_id: str, record,
+                            *, post_raw_line: str | None = None) -> None:
+    """Record an EOD disposition board mutation in the autonomy log (for /undo).
+
+    Mirrors ``harvest_ledger.approve``'s snapshot discipline so a carry/drop is
+    REVERSIBLE via ``/undo``: the gate captures a ``pre_action_snapshot`` carrying the
+    ORIGINAL active ``raw_line`` BEFORE the board write, which ``autonomy._undo_board``
+    later restores by the snapshot's stable ``task_id`` within the undo window. For a
+    DROP, ``post_raw_line`` is the parked form of the line, so ``/undo``'s id-keyed
+    restore swaps the parked line back to the original active line in place (a true
+    reversal of the move, not a re-insert that would leave a parked duplicate). The
+    snapshot is taken from the resolved active record's line, so it always names a real
+    board line. Best-effort: an audit-log I/O hiccup must not abort the disposition the
+    user explicitly tapped (the ledger event still records what happened) -- so any
+    OSError here is swallowed, exactly as the proactive calendar-write audit does.
+    """
+    try:
+        from autonomy import board_snapshot
+        import autonomy_gate
+
+        snapshot = board_snapshot(
+            _disposition_board_file(personal=False),
+            record.raw_line,
+            record.line_number,
+            post_raw_line=post_raw_line,
+        )
+        autonomy_gate.gate(act_type, task_id=task_id, unit="U5",
+                           snapshot_provider=lambda: snapshot)
+    except OSError:
+        pass
+
+
+def _disposition_board_file(*, personal: bool) -> str:
+    """The board file path the disposition snapshot names (work board by default)."""
+    from utils import get_tasks_file
+
+    tasks_file, _fmt = get_tasks_file(personal)
+    return str(tasks_file)
+
+
+def handle_carry(task_id: str, *, personal: bool = False) -> dict[str, Any]:
+    """EOD ``carry``: keep the task active + stamp ``carried::`` then RECYCLE the loop.
+
+    Carry is the "still mine, chase it again tomorrow" disposition: the task stays on
+    the active board (KTD-7 -- no done, no parking, no new board status field) with a
+    ``carried::<today>`` marker the morning standup surfaces. Like ``/reschedule``, a
+    carry RECYCLES the nag loop (clears, not acks) so a future overdue crossing opens a
+    fresh loop rather than muting the task forever. A board snapshot is gate-recorded
+    first so the carry is /undo-reversible.
+    """
+    record = _active_record(task_id, personal=personal)
+    if record is not None:
+        _gate_board_disposition("task_carried", task_id, record)
+    result = carry_by_id(task_id, personal=personal, source="user_command")
+    if not result.get("ok"):
+        return result
+    return _recycle_loop(result, task_id, closed_by=nag_state.CLOSED_RESCHEDULED)
+
+
+def handle_drop(task_id: str, *, personal: bool = False) -> dict[str, Any]:
+    """EOD ``drop``: move the task to the parking lot then CLOSE the nag loop.
+
+    Drop is the "let it go (for now)" disposition: the task leaves the active board for
+    the 🅿️ Parking Lot in one atomic write. A board snapshot is gate-recorded BEFORE
+    the move so ``/undo`` can restore the original active line by stable id within the
+    undo window (REVERSIBILITY). A dropped task is no longer active, so its nag loop is
+    CLOSED (terminally acked) -- nothing on the active board is chasing it anymore.
+    """
+    record = _active_record(task_id, personal=personal)
+    post_raw_line = None
+    if record is not None:
+        # The parked form is deterministic from the active line, so we can compute it
+        # for the gate snapshot's post_raw_line BEFORE the board write (the gate takes
+        # the snapshot at gate time). This lets /undo swap the parked line back to the
+        # active line in place -- a true reversal of the move.
+        post_raw_line = task_transitions._parked_line(record.raw_line)
+        _gate_board_disposition("task_dropped", task_id, record, post_raw_line=post_raw_line)
+    result = drop_by_id(task_id, personal=personal, source="user_command")
+    if not result.get("ok"):
+        return result
     return _close_loop_after_board_op(result, task_id,
                                       closed_by=nag_state.CLOSED_EXPLICIT_DONE)
 
@@ -755,6 +840,12 @@ def main(argv: list[str] | None = None) -> int:
     p_res.add_argument("task_id")
     p_res.add_argument("new_due", help="YYYY-MM-DD")
 
+    p_carry = sub.add_parser("carry", help="EOD: keep active + stamp carried::")
+    p_carry.add_argument("task_id")
+
+    p_drop = sub.add_parser("drop", help="EOD: move the task to the parking lot")
+    p_drop.add_argument("task_id")
+
     p_snz = sub.add_parser("snooze", help="pause the nag loop (cap 3)")
     p_snz.add_argument("task_id")
     p_snz.add_argument("duration", help="e.g. 1h / 1d / 3d")
@@ -786,6 +877,10 @@ def main(argv: list[str] | None = None) -> int:
         result = handle_done(args.task_id, personal=args.personal)
     elif args.command == "reschedule":
         result = handle_reschedule(args.task_id, args.new_due, personal=args.personal)
+    elif args.command == "carry":
+        result = handle_carry(args.task_id, personal=args.personal)
+    elif args.command == "drop":
+        result = handle_drop(args.task_id, personal=args.personal)
     elif args.command == "snooze":
         result = handle_snooze(args.task_id, args.duration, block_reason=args.reason)
     elif args.command == "body-double":

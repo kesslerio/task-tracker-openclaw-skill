@@ -137,10 +137,12 @@ case "$1" in
     # first to free a slot; a bad out/in id refuses with no partial move.
     run_with_envelope "swap" python3 "$SCRIPT_DIR/tasks.py" swap "$2" "$3"
     ;;
-  done|reschedule|snooze|body-double|cancel-session)
-    # U4 reactive nag commands. Each mutates the board (where applicable) and then
-    # closes/pauses the nag loop SYNCHRONOUSLY in the same turn (origin-proven, no
-    # proactive push). The subcommand name is $1; the rest are its args.
+  done|reschedule|snooze|carry|drop|body-double|cancel-session)
+    # U4 reactive nag commands + U5 EOD dispositions (carry/drop). Each mutates the
+    # board (where applicable) and then closes/recycles the nag loop SYNCHRONOUSLY in
+    # the same turn (origin-proven, no proactive push). carry keeps the task active and
+    # stamps a carried:: marker; drop moves it to the parking lot (both /undo-reversible
+    # via a gated pre-action snapshot). The subcommand name is $1; the rest are its args.
     sub="$1"; shift
     run_with_envelope "$sub" python3 "$SCRIPT_DIR/nag_commands.py" "$sub" "$@"
     ;;
