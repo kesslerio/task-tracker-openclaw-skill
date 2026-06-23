@@ -64,6 +64,13 @@ run_with_envelope() {
 
 case "$1" in
   daily)
+    # U8 consolidated morning standup: the CANONICAL deterministic cron entry the 8am
+    # standup runs (a deterministic command cron, replacing the legacy Lobster
+    # `Daily Interactive Work Standup` agentTurn -- see standup.standup_cron_descriptor).
+    # The standup OPENS with tomorrow's #1 (the EOD-set tomorrow-pointer, resolved against
+    # the live board), then the board/priorities/blockers. No LLM relay; same command a
+    # user runs by hand. The cron swap + the legacy-cron deletion are DEFERRED OPERATOR
+    # steps, gated on the U8 parity check.
     run_with_envelope "standup" python3 "$SCRIPT_DIR/standup.py"
     ;;
   eod)
