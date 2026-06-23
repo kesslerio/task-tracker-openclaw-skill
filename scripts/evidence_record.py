@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import re
 import sys
-from dataclasses import dataclass
 from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any, Literal
@@ -28,23 +27,9 @@ RecordKind = Literal["activity", "commitment", "accomplishment"]
 
 ADAPTER_KINDS: set[str] = {"activity", "commitment"}
 GATE_ONLY_KIND = "accomplishment"
+VALID_SOURCES = frozenset({"github", "gmail", "calendar", "dialpad_sms"})
 AUTO_DONE_NEVER_SOURCES: set[str] = {"calendar", "dialpad_sms"}
 _DISPLAY_REF_RE = re.compile(r"\s*\[[^\]]+#\d+\]\s*$")
-
-
-@dataclass(frozen=True)
-class EvidenceRecordInput:
-    source: Source
-    kind: AdapterKind
-    provider_id: str
-    provider_state: str
-    occurred_at: str | datetime | date
-    match_title: str
-    title: str | None = None
-    url: str | None = None
-    match: dict[str, Any] | None = None
-    auto_done_eligible: bool | None = None
-    run_id: str | None = None
 
 
 def _clean_match_title(value: str) -> str:
@@ -81,6 +66,8 @@ def _base_record(
     auto_done_eligible: bool | None,
     run_id: str | None,
 ) -> dict[str, Any]:
+    if source not in VALID_SOURCES:
+        raise ValueError("source must be github, gmail, calendar, or dialpad_sms")
     if not provider_id.strip():
         raise ValueError("provider_id is required")
     if not provider_state.strip():
@@ -181,7 +168,3 @@ def accomplishment_record(
         auto_done_eligible=auto_done_eligible,
         run_id=run_id,
     )
-
-
-def from_input(record_input: EvidenceRecordInput) -> dict[str, Any]:
-    return adapter_record(**record_input.__dict__)

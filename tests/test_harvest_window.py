@@ -88,3 +88,18 @@ def test_source_query_window_uses_watermark_with_overlap():
 
     assert start.isoformat() == "2026-06-22T14:50:00-07:00"
     assert end == resolved.evidence_end
+
+
+def test_source_query_window_clamps_future_watermark_to_evidence_end():
+    resolved = harvest_window.resolve_standup_window(
+        target_date=date(2026, 6, 23),
+        evidence_date=date(2026, 6, 22),
+    )
+
+    start, end = harvest_window.source_query_window(
+        resolved,
+        watermark=datetime.fromisoformat("2026-06-24T01:00:00-07:00"),
+    )
+
+    assert start == resolved.evidence_end
+    assert end == resolved.evidence_end

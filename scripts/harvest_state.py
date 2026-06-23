@@ -40,23 +40,35 @@ SCHEMA_VERSION = 1
 
 WINDOW_WEEK = "week"
 WINDOW_24H = "24h"
+WINDOW_STANDUP = "standup"
 
 
 def harvest_state_path(window: str = WINDOW_WEEK) -> Path:
     """The state file for a window kind.
 
-    The weekly approval loop and the on-demand 24h ``/done`` loop are independent
-    and MUST NOT share one file -- a 24h run would otherwise clobber the weekly
-    window's ``pending_task_ids`` / ``seen_hashes`` and silently break ``/approve``
-    (spec §3.1: the 24h window "does not reset the weekly state"). The weekly file
-    keeps the canonical name; the 24h file is suffixed.
+    The weekly approval loop, on-demand 24h ``/done`` loop, and explicit standup
+    evidence window are independent and MUST NOT share one file -- one window
+    kind would otherwise clobber another's ``pending_task_ids`` / ``seen_hashes``
+    and silently break ``/approve`` (spec §3.1: the 24h window "does not reset the
+    weekly state"). The weekly file keeps the canonical name; other files are
+    suffixed.
     """
-    name = "harvest-state.json" if window == WINDOW_WEEK else "harvest-state-24h.json"
+    if window == WINDOW_WEEK:
+        name = "harvest-state.json"
+    elif window == WINDOW_STANDUP:
+        name = "harvest-state-standup.json"
+    else:
+        name = "harvest-state-24h.json"
     return cos_config.state_dir() / name
 
 
 def harvest_state_lock_path(window: str = WINDOW_WEEK) -> Path:
-    name = "harvest-state.lock" if window == WINDOW_WEEK else "harvest-state-24h.lock"
+    if window == WINDOW_WEEK:
+        name = "harvest-state.lock"
+    elif window == WINDOW_STANDUP:
+        name = "harvest-state-standup.lock"
+    else:
+        name = "harvest-state-24h.lock"
     return cos_config.state_dir() / name
 
 
@@ -171,14 +183,32 @@ def _max_iso(left: Any, right: Any) -> Any:
         return right
     if right in (None, ""):
         return left
-    return max(str(left), str(right))
+    left_s = str(left)
+    right_s = str(right)
+    try:
+        left_dt = datetime.fromisoformat(left_s.replace("Z", "+00:00"))
+        right_dt = datetime.fromisoformat(right_s.replace("Z", "+00:00"))
+        return left if left_dt >= right_dt else right
+    except (TypeError, ValueError):
+        return max(left_s, right_s)
 
 
 def _merge_state(existing: dict[str, Any] | None, incoming: dict[str, Any]) -> dict[str, Any]:
-    if existing is None or existing.get("harvest_window_id") != incoming.get("harvest_window_id"):
+    if existing is None:
         return incoming
+    if existing.get("harvest_window_id") != incoming.get("harvest_window_id"):
+        existing_id = existing.get("harvest_window_id")
+        incoming_id = incoming.get("harvest_window_id")
+        if existing_id in (None, ""):
+            return incoming
+        if incoming_id in (None, ""):
+            return existing
+        return existing if str(existing_id) > str(incoming_id) else incoming
 
     merged = {**existing, **incoming}
+    for key in ("auto_pushed_window", "reactive_pushed_window", "draft_pushed_at", "delivery_target"):
+        if incoming.get(key) is None and existing.get(key) is not None:
+            merged[key] = existing[key]
     for key in ("seen_hashes", "pending_task_ids", "approved_task_ids", "rejected_candidate_ids"):
         merged[key] = _merge_unique(existing.get(key) or [], incoming.get(key) or [])
 
@@ -191,6 +221,7 @@ def _merge_state(existing: dict[str, Any] | None, incoming: dict[str, Any]) -> d
     merged["pending_matches"] = {
         tid: match for tid, match in merged["pending_matches"].items() if tid not in approved
     }
+    # Within a matched window provider_state converges, so incoming wins on key conflict.
     merged["seen_provider_states"] = {
         **(existing.get("seen_provider_states") or {}),
         **(incoming.get("seen_provider_states") or {}),
@@ -308,7 +339,7 @@ def mark_seen(
         if h not in known:
             seen.append(h)
             known.add(h)
-        if item_state is not None:
+        if item_state is not None and str(item_state).strip():
             seen_states[h] = str(item_state)
     state["seen_hashes"] = seen
     state["seen_provider_states"] = seen_states

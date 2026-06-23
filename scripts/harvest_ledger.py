@@ -561,7 +561,8 @@ def run_harvest(window: str, *, since_override: str | None, dry_run: bool, trigg
     if evidence_window is None and target_date is not None:
         evidence_window = harvest_windows.resolve_standup_window(target_date=target_date)
     harvest_window_id = evidence_window.window_id if evidence_window is not None else harvest_state.window_id(window)
-    state, expired = harvest_state.load_or_reset(harvest_window_id, window)
+    state_window = harvest_state.WINDOW_STANDUP if evidence_window is not None else window
+    state, expired = harvest_state.load_or_reset(harvest_window_id, state_window)
     state["run_id"] = run_id
 
     since = since_override or (
@@ -663,7 +664,7 @@ def run_harvest(window: str, *, since_override: str | None, dry_run: bool, trigg
         push = ledger_delivery.push_and_consume(
             proof,
             ledger_delivery.DigestPush(
-                state=state, window=window, pushed_key=pushed_key,
+                state=state, window=state_window, pushed_key=pushed_key,
                 harvest_window_id=harvest_window_id,
                 match_index=_pending_match_index(matches),
                 pending_task_ids=pending_task_ids, fresh=fresh, wins=wins, draft=draft,

@@ -104,7 +104,8 @@ def resolve_standup_window(
         plan_date = parse_local_datetime(now).date()
     else:
         plan_date = cos_config.local_today()
-    assert plan_date is not None
+    if plan_date is None:
+        raise ValueError("target_date must resolve to a date")
 
     if evidence_date is not None:
         resolved_evidence_date = _parse_date(evidence_date)
@@ -112,7 +113,8 @@ def resolve_standup_window(
         resolved_evidence_date = plan_date
     else:
         resolved_evidence_date = previous_workday(plan_date)
-    assert resolved_evidence_date is not None
+    if resolved_evidence_date is None:
+        raise ValueError("evidence_date must resolve to a date")
     start = _local_midnight(resolved_evidence_date)
     end = _local_midnight(resolved_evidence_date + timedelta(days=1))
     week_id = harvest_state.iso_week_id(plan_date)
@@ -141,6 +143,8 @@ def source_query_window(
         start = max(start, parse_local_datetime(watermark) - timedelta(minutes=overlap))
     else:
         start = start - timedelta(minutes=overlap)
+    # A future/bad watermark should produce an empty window, not an inverted query.
+    start = min(start, resolved.evidence_end)
     return start, resolved.evidence_end
 
 

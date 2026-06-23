@@ -565,3 +565,52 @@ def test_late_rerun_for_same_explicit_window_counts_evidence_once(env, monkeypat
     assert first["draft_pushed"] is True
     assert second["draft_pushed"] is False
     assert second["reason"] == "no_new_evidence"
+
+
+def test_explicit_standup_window_writes_only_standup_state_file(env, monkeypatch):
+    from datetime import date, datetime
+    import harvest_window
+
+    _set_productivity_env(monkeypatch)
+    resolved = harvest_window.resolve_standup_window(
+        target_date=date(2026, 6, 23),
+        evidence_date=date(2026, 6, 22),
+    )
+    evidence = [{
+        "source_type": "github",
+        "match_title": "Add social updates to World Cup skill",
+        "title": "Add social updates to World Cup skill [repo#31]",
+        "url": "https://example.test/pr/31",
+        "evidence_hash": harvest_ledger._evidence_hash("github", "repo#31"),
+        "provider_state": "merged:2026-06-22T10:00:00-07:00",
+        "occurred_at": "2026-06-22T10:00:00-07:00",
+    }]
+
+    def fake_harvest_all_for_window(window, *, trigger):
+        assert window == resolved
+        return [dict(item) for item in evidence], 1, False
+
+    monkeypatch.setattr(harvest_ledger, "harvest_all_for_window", fake_harvest_all_for_window)
+
+    def sender(_target, _message):
+        return {"ok": True, "message_id": "m-standup", "idem_key": "idem-standup"}
+
+    result = harvest_ledger.run_harvest(
+        "week",
+        since_override=None,
+        dry_run=False,
+        trigger="t",
+        auto=True,
+        now=datetime(2026, 6, 26, 9, 0),
+        evidence_window=resolved,
+        sender=sender,
+    )
+
+    assert result["draft_pushed"] is True
+    assert (env["state_dir"] / "harvest-state-standup.json").exists()
+    assert not (env["state_dir"] / "harvest-state.json").exists()
+    assert not (env["state_dir"] / "harvest-state-24h.json").exists()
+
+    standup_state = harvest_state.load_state(harvest_state.WINDOW_STANDUP)
+    assert standup_state["harvest_window_id"] == resolved.window_id
+    assert standup_state["seen_hashes"] == [harvest_ledger._evidence_hash("github", "repo#31")]

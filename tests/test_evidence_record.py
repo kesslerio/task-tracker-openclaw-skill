@@ -56,6 +56,18 @@ def test_adapter_constructor_cannot_emit_accomplishment():
     assert gated["kind"] == "accomplishment"
 
 
+def test_adapter_record_rejects_unknown_source_case():
+    with pytest.raises(ValueError, match="source must be"):
+        evidence_record.adapter_record(
+            source="Calendar",  # type: ignore[arg-type]
+            kind="activity",
+            provider_id="event-1",
+            provider_state="accepted",
+            occurred_at="2026-06-22T10:00:00-07:00",
+            match_title="Customer followup",
+        )
+
+
 @pytest.mark.parametrize("source", ["calendar", "dialpad_sms"])
 def test_calendar_and_sms_default_auto_done_ineligible(source):
     record = evidence_record.adapter_record(
