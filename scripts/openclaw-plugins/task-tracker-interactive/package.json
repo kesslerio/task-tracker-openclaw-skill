@@ -1,0 +1,11 @@
+{
+  "name": "task-tracker-interactive",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenClaw interactive plugin: routes task-tracker Telegram inline-button taps (tt:<action>:<task_id>) into the skill's existing deterministic commands. Auth is enforced downstream (KTD-4).",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test-handler.mjs"
+  }
+}
