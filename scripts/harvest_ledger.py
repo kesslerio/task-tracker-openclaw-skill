@@ -69,6 +69,7 @@ import cos_config
 import delivery_target
 import error_envelope
 import harvest_state
+import harvest_window as harvest_windows
 import ledger_delivery
 import redaction
 import win_store
@@ -168,11 +169,16 @@ def _since_date(window: str, since_override: str | None, reference: date | None 
     """The harvest-window start date (YYYY-MM-DD)."""
     if since_override:
         return since_override
-    ref = reference or date.today()
+    ref = reference or cos_config.local_today()
     if window == harvest_state.WINDOW_24H:
         return (ref - timedelta(days=1)).isoformat()
     # Weekly window: start of the current ISO week (Monday).
     return (ref - timedelta(days=ref.weekday())).isoformat()
+
+
+def _since_date_for_window(resolved: harvest_windows.HarvestWindow) -> str:
+    """Start date for an explicit stable evidence window."""
+    return resolved.evidence_start.date().isoformat()
 
 
 def harvest_github(since: str, *, trigger: str) -> tuple[list[dict[str, Any]], bool]:
@@ -239,6 +245,20 @@ def harvest_all(since: str, *, trigger: str) -> tuple[list[dict[str, Any]], int,
     gh_evidence, gh_failed = harvest_github(since, trigger=trigger)
     gmail_evidence, gmail_failed = harvest_gmail(since, trigger=trigger)
     return gh_evidence + gmail_evidence, 2, gh_failed or gmail_failed
+
+
+def harvest_all_for_window(
+    resolved: harvest_windows.HarvestWindow, *, trigger: str
+) -> tuple[list[dict[str, Any]], int, bool]:
+    """Harvest through an explicit stable evidence window.
+
+    Current EOD adapters accept a date-only ``since`` argument; U2 adapters will
+    emit ``occurred_at`` and use the returned window for exact Pacific filtering.
+    """
+    evidence, sources_tried, source_error = harvest_all(_since_date_for_window(resolved), trigger=trigger)
+    if any("occurred_at" in item for item in evidence):
+        evidence = harvest_windows.filter_records(evidence, resolved)
+    return evidence, sources_tried, source_error
 
 
 # --- matching --------------------------------------------------------------
@@ -519,6 +539,8 @@ def _auto_send_allowed(*, auto: bool, has_content: bool, now: datetime | None) -
 
 def run_harvest(window: str, *, since_override: str | None, dry_run: bool, trigger: str,
                 auto: bool = False, now: datetime | None = None,
+                evidence_window: harvest_windows.HarvestWindow | None = None,
+                target_date: str | date | None = None,
                 sender: Callable[[dict[str, Any], str], dict[str, Any]] | None = None
                 ) -> dict[str, Any]:
     """Harvest, dedup, match, fold in manual wins, and (unless dry-run) push a digest.
@@ -535,23 +557,39 @@ def run_harvest(window: str, *, since_override: str | None, dry_run: bool, trigg
     blocked reason). NEVER raises -- the ``main`` wrapper classifies any unhandled
     exception into the friendly fallback.
     """
-    harvest_window_id = harvest_state.window_id(window)
+    run_id = harvest_state.new_run_id()
+    if evidence_window is None and target_date is not None:
+        evidence_window = harvest_windows.resolve_standup_window(target_date=target_date)
+    harvest_window_id = evidence_window.window_id if evidence_window is not None else harvest_state.window_id(window)
     state, expired = harvest_state.load_or_reset(harvest_window_id, window)
+    state["run_id"] = run_id
 
-    since = _since_date(window, since_override)
+    since = since_override or (
+        _since_date_for_window(evidence_window)
+        if evidence_window is not None
+        else _since_date(window, since_override)
+    )
     append_event(
         new_event(
             "ledger_harvest_started",
             actor=ACTOR,
             source=LEDGER_SOURCE,
-            metadata={"harvest_window_id": harvest_window_id, "window": window, "since": since},
+            metadata={"harvest_window_id": harvest_window_id, "window": window, "since": since, "run_id": run_id},
         )
     )
 
-    evidence, sources_tried, source_error = harvest_all(since, trigger=trigger)
+    if evidence_window is not None:
+        evidence, sources_tried, source_error = harvest_all_for_window(evidence_window, trigger=trigger)
+    else:
+        evidence, sources_tried, source_error = harvest_all(since, trigger=trigger)
+    for item in evidence:
+        item.setdefault("run_id", run_id)
     # Dedup against this window's seen set BEFORE matching, so a heartbeat re-fire
     # never re-ingests the same PR/email.
-    fresh = [item for item in evidence if not harvest_state.is_seen(state, item["evidence_hash"])]
+    fresh = [
+        item for item in evidence
+        if not harvest_state.is_seen(state, item["evidence_hash"], item.get("provider_state"))
+    ]
     matches = match_evidence(fresh)
     # Manual /win captures count as digest content alongside harvested evidence --
     # they are the strategy/decision items the harvest misses. Selected by the SAME
@@ -579,6 +617,7 @@ def run_harvest(window: str, *, since_override: str | None, dry_run: bool, trigg
             "draft_pushed": False,
             "reason": reason,
             "harvest_window_id": harvest_window_id,
+            "run_id": run_id,
             "expired": expired,
             # A source error means "no content" is unproven -- carry the signal so the
             # cron path records a FAILURE rather than false-greening an empty digest
@@ -636,6 +675,7 @@ def run_harvest(window: str, *, since_override: str | None, dry_run: bool, trigg
         "ok": True,
         "draft_pushed": bool(push["ok"]),
         "harvest_window_id": harvest_window_id,
+        "run_id": run_id,
         "since": since,
         "sources_tried": sources_tried,
         "evidence_count": len(fresh),

@@ -496,3 +496,72 @@ def test_load_or_reset_keeps_same_window(env, monkeypatch):
     state, expired = harvest_state.load_or_reset(wid)
     assert state["pending_task_ids"] == ["tsk_keep"]
     assert expired == []
+
+
+def test_explicit_standup_window_since_is_stable_when_24h_rolling_cutoff_moves():
+    from datetime import date
+    import harvest_window
+
+    resolved = harvest_window.resolve_standup_window(
+        target_date=date(2026, 6, 23),
+        evidence_date=date(2026, 6, 22),
+    )
+
+    assert harvest_ledger._since_date("24h", None, reference=date(2026, 6, 23)) == "2026-06-22"
+    assert harvest_ledger._since_date("24h", None, reference=date(2026, 6, 24)) == "2026-06-23"
+    assert harvest_ledger._since_date_for_window(resolved) == "2026-06-22"
+
+
+def test_late_rerun_for_same_explicit_window_counts_evidence_once(env, monkeypatch):
+    from datetime import date, datetime
+    import harvest_window
+
+    _set_productivity_env(monkeypatch)
+    resolved = harvest_window.resolve_standup_window(
+        target_date=date(2026, 6, 23),
+        evidence_date=date(2026, 6, 22),
+    )
+    evidence = [{
+        "source_type": "github",
+        "match_title": "Add social updates to World Cup skill",
+        "title": "Add social updates to World Cup skill [repo#31]",
+        "url": "https://example.test/pr/31",
+        "evidence_hash": harvest_ledger._evidence_hash("github", "repo#31"),
+        "provider_state": "merged:2026-06-22T10:00:00-07:00",
+        "occurred_at": "2026-06-22T10:00:00-07:00",
+    }]
+
+    def fake_harvest_all_for_window(window, *, trigger):
+        assert window == resolved
+        return [dict(item) for item in evidence], 1, False
+
+    monkeypatch.setattr(harvest_ledger, "harvest_all_for_window", fake_harvest_all_for_window)
+
+    def sender(_target, _message):
+        return {"ok": True, "message_id": "m-1", "idem_key": "idem-1"}
+
+    first = harvest_ledger.run_harvest(
+        "week",
+        since_override=None,
+        dry_run=False,
+        trigger="t",
+        auto=True,
+        now=datetime(2026, 6, 26, 9, 0),
+        evidence_window=resolved,
+        sender=sender,
+    )
+    second = harvest_ledger.run_harvest(
+        "week",
+        since_override=None,
+        dry_run=False,
+        trigger="t",
+        auto=True,
+        now=datetime(2026, 6, 26, 9, 0),
+        evidence_window=resolved,
+        sender=sender,
+    )
+
+    assert first["evidence_count"] == 1
+    assert first["draft_pushed"] is True
+    assert second["draft_pushed"] is False
+    assert second["reason"] == "no_new_evidence"
