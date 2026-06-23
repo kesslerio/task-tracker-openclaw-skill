@@ -57,7 +57,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Callable
@@ -181,13 +181,53 @@ def _since_date_for_window(resolved: harvest_windows.HarvestWindow) -> str:
     return resolved.evidence_start.date().isoformat()
 
 
-def harvest_github(since: str, *, trigger: str) -> tuple[list[dict[str, Any]], bool]:
-    """Harvest merged PRs authored by the user since ``since`` (``gh``).
+def _local_iso(value: Any, *, fallback_date: str | None = None) -> str | None:
+    if value in (None, ""):
+        if fallback_date is None:
+            return None
+        dt = datetime.combine(date.fromisoformat(fallback_date), time.min, tzinfo=cos_config.local_tz())
+        return dt.isoformat()
+    if isinstance(value, (int, float)) or (isinstance(value, str) and value.isdigit()):
+        # Gmail internalDate is milliseconds since epoch.
+        raw = int(value)
+        if raw > 10_000_000_000:
+            raw = raw // 1000
+        return datetime.fromtimestamp(raw, tz=timezone.utc).astimezone(cos_config.local_tz()).isoformat()
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        if fallback_date is None:
+            return None
+        dt = datetime.combine(date.fromisoformat(fallback_date), time.min, tzinfo=cos_config.local_tz())
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=cos_config.local_tz())
+    return dt.astimezone(cos_config.local_tz()).isoformat()
+
+
+def _date_range(start: datetime | None, end: datetime | None, since: str) -> str:
+    if start is None or end is None:
+        return f">={since}"
+    inclusive_end = max(start, end - timedelta(seconds=1))
+    return f"{start.date().isoformat()}..{inclusive_end.date().isoformat()}"
+
+
+def _first_line(value: Any) -> str:
+    return _WHITESPACE_RE.sub(" ", str(value or "").splitlines()[0] if str(value or "").splitlines() else "").strip()
+
+
+def harvest_github(
+    since: str,
+    *,
+    trigger: str,
+    query_start: datetime | None = None,
+    query_end: datetime | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Harvest merged PRs and direct commits authored by the user since ``since`` (``gh``).
 
     Returns ``(evidence, failed)`` -- ``failed`` is True when the ``gh`` subprocess
     errored (so a source error is not mistaken for a clean-empty week)."""
 
-    def parse(payload: Any) -> list[dict[str, Any]]:
+    def parse_prs(payload: Any) -> list[dict[str, Any]]:
         items = payload if isinstance(payload, list) else payload.get("items", [])
         evidence: list[dict[str, Any]] = []
         for pr in items:
@@ -199,37 +239,145 @@ def harvest_github(since: str, *, trigger: str) -> tuple[list[dict[str, Any]], b
             if not title or number is None:
                 continue
             canonical = f"{repo_name}#{number}"
-            evidence.append(_evidence("pr", title, canonical, url, display_suffix=f"[{canonical}]"))
+            occurred_at = _local_iso(
+                pr.get("mergedAt") or pr.get("closedAt") or pr.get("updatedAt"),
+                fallback_date=since,
+            )
+            if not occurred_at:
+                continue
+            head_state = (
+                pr.get("headSha")
+                or pr.get("headRefOid")
+                or pr.get("headRef", {}).get("oid")
+                or pr.get("commit", {}).get("oid")
+                or occurred_at
+            )
+            provider_state = f"merged:{head_state}:{pr.get('state') or 'merged'}"
+            item = _evidence("pr", title, canonical, url, display_suffix=f"[{canonical}]")
+            item.update(
+                {
+                    "provider_id": canonical,
+                    "provider_state": provider_state,
+                    "occurred_at": occurred_at,
+                }
+            )
+            evidence.append(item)
         return evidence
 
-    cmd = [
+    pr_cmd = [
         "gh", "search", "prs", "--author", "@me", "--merged",
-        "--merged-at", f">={since}",
+        "--merged-at", _date_range(query_start, query_end, since),
         "--json", "title,closedAt,repository,url,number",
         "--limit", "100",
     ]
-    return _harvest("github", cmd, parse, trigger=trigger)
+    pr_evidence, pr_failed = _harvest("github", pr_cmd, parse_prs, trigger=trigger)
+
+    def parse_commits(payload: Any) -> list[dict[str, Any]]:
+        items = payload if isinstance(payload, list) else payload.get("items", [])
+        evidence: list[dict[str, Any]] = []
+        for commit in items:
+            repo = commit.get("repository") or {}
+            repo_name = repo.get("nameWithOwner") or repo.get("fullName") or repo.get("name") or ""
+            sha = commit.get("sha") or commit.get("oid")
+            commit_obj = commit.get("commit") if isinstance(commit.get("commit"), dict) else {}
+            message = commit.get("message") or commit_obj.get("message") or commit.get("title") or ""
+            title = _first_line(message)
+            occurred_at = _local_iso(
+                commit.get("committedDate")
+                or commit.get("authoredDate")
+                or commit_obj.get("committedDate")
+                or commit_obj.get("authoredDate")
+                or commit_obj.get("committer", {}).get("date")
+                or commit_obj.get("author", {}).get("date"),
+                fallback_date=since,
+            )
+            if not repo_name or not sha or not title or not occurred_at:
+                continue
+            short_sha = str(sha)[:12]
+            canonical = f"{repo_name}@{sha}"
+            url = commit.get("url") or commit.get("htmlUrl")
+            item = _evidence("commit", title, canonical, url, display_suffix=f"[{repo_name}@{short_sha}]")
+            item.update(
+                {
+                    "provider_id": canonical,
+                    "provider_state": str(sha),
+                    "occurred_at": occurred_at,
+                }
+            )
+            evidence.append(item)
+        return evidence
+
+    commit_cmd = [
+        "gh", "search", "commits", "--author", "@me",
+        "--committer-date", _date_range(query_start, query_end, since),
+        "--json", "sha,commit,repository,url",
+        "--limit", "100",
+    ]
+    commit_evidence, commit_failed = _harvest("github", commit_cmd, parse_commits, trigger=trigger)
+    return pr_evidence + commit_evidence, pr_failed or commit_failed
 
 
-def harvest_gmail(since: str, *, trigger: str) -> tuple[list[dict[str, Any]], bool]:
+def harvest_gmail(
+    since: str,
+    *,
+    trigger: str,
+    query_start: datetime | None = None,
+    query_end: datetime | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
     """Harvest sent-mail subjects since ``since`` (``gog``).
 
     Returns ``(evidence, failed)`` -- ``failed`` is True when the ``gog`` subprocess
     errored (so a source error is not mistaken for a clean-empty week)."""
 
     def parse(payload: Any) -> list[dict[str, Any]]:
-        threads = payload.get("threads", []) if isinstance(payload, dict) else []
+        threads = payload.get("threads", []) if isinstance(payload, dict) else payload if isinstance(payload, list) else []
         evidence: list[dict[str, Any]] = []
         for thread in threads:
             thread_id = thread.get("id")
             subject = thread.get("subject") or ""
-            if not thread_id or not subject:
-                continue
-            evidence.append(_evidence("email", subject, str(thread_id), None))
+            messages = thread.get("messages") if isinstance(thread.get("messages"), list) else []
+            if not messages:
+                messages = [thread]
+            for message in messages:
+                message_id = message.get("id") or message.get("messageId") or thread_id
+                msg_subject = message.get("subject") or subject
+                if not message_id or not msg_subject:
+                    continue
+                occurred_at = _local_iso(
+                    message.get("sentAt")
+                    or message.get("date")
+                    or message.get("internalDate")
+                    or thread.get("sentAt")
+                    or thread.get("date")
+                    or thread.get("internalDate"),
+                    fallback_date=since,
+                )
+                if not occurred_at:
+                    continue
+                provider_state = str(
+                    message.get("historyId")
+                    or message.get("internalDate")
+                    or thread.get("historyId")
+                    or thread.get("internalDate")
+                    or occurred_at
+                )
+                item = _evidence("email", msg_subject, str(message_id), None)
+                item.update(
+                    {
+                        "provider_id": str(message_id),
+                        "provider_state": provider_state,
+                        "occurred_at": occurred_at,
+                    }
+                )
+                evidence.append(item)
         return evidence
 
-    gmail_after = since.replace("-", "/")
-    cmd = ["gog", "gmail", "search", f"in:sent after:{gmail_after}", "--max", "50", "--json"]
+    gmail_after = (query_start.date().isoformat() if query_start else since).replace("-", "/")
+    before = query_end.date().isoformat().replace("-", "/") if query_end else None
+    query = f"in:sent after:{gmail_after}"
+    if before:
+        query = f"{query} before:{before}"
+    cmd = ["gog", "gmail", "search", query, "--max", "50", "--json"]
     return _harvest("gmail", cmd, parse, trigger=trigger)
 
 
@@ -255,7 +403,17 @@ def harvest_all_for_window(
     Current EOD adapters accept a date-only ``since`` argument; U2 adapters will
     emit ``occurred_at`` and use the returned window for exact Pacific filtering.
     """
-    evidence, sources_tried, source_error = harvest_all(_since_date_for_window(resolved), trigger=trigger)
+    since = _since_date_for_window(resolved)
+    query_start, query_end = harvest_windows.source_query_window(resolved)
+    gh_evidence, gh_failed = harvest_github(
+        since, trigger=trigger, query_start=query_start, query_end=query_end
+    )
+    gmail_evidence, gmail_failed = harvest_gmail(
+        since, trigger=trigger, query_start=query_start, query_end=query_end
+    )
+    evidence = gh_evidence + gmail_evidence
+    sources_tried = 2
+    source_error = gh_failed or gmail_failed
     if any("occurred_at" in item for item in evidence):
         evidence = harvest_windows.filter_records(evidence, resolved)
     return evidence, sources_tried, source_error
