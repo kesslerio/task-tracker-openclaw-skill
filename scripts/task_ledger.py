@@ -148,6 +148,11 @@ KNOWN_EVENT_TYPES: frozenset[str] = frozenset({
     "eod_disposition_carry",
     "eod_disposition_reschedule",
     "eod_disposition_drop",
+    # U6 -- set tomorrow's #1 (the loop's write side). The EOD records the chosen
+    # (or explicit "none") #1 to tomorrow-pointer.json; this event is the audit trail
+    # of WHICH task became tomorrow's #1 and when. MUST stay in lockstep with
+    # tests/test_event_registry.REQUIRED_NEW_TYPES.
+    "eod_tomorrow_top_set",
 })
 
 # Canonical actor sources. "agent_autonomous" is the source every agent-initiated

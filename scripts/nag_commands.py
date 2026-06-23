@@ -272,6 +272,36 @@ def handle_drop(task_id: str, *, personal: bool = False) -> dict[str, Any]:
                                       closed_by=nag_state.CLOSED_EXPLICIT_DONE)
 
 
+def handle_set_top(task_id: str, *, personal: bool = False) -> dict[str, Any]:
+    """EOD ``set-top``: set ``task_id`` as tomorrow's #1 (write the tomorrow-pointer).
+
+    The write side of the standup<->EOD loop (KTD-6 / U6): the user taps "Set as
+    tomorrow's #1" on a proposed task and this persists it to ``tomorrow-pointer.json``
+    where the morning standup reads it. It RESOLVES the task on the active board to
+    capture its current title (a STALE tap on an already-actioned task is refused, not
+    silently pointed at a dead id). It MUTATES NO board state -- it only writes the
+    pointer (a single canonical pointer that re-setting OVERWRITES, never appends), so
+    there is no nag-loop coupling here and no /undo board snapshot. ``import`` is local
+    to keep the module's import cost (it loads under the nag-state lock elsewhere) flat.
+    """
+    import tomorrow_pointer
+
+    record = _active_record(task_id, personal=personal)
+    if record is None:
+        # A stale tap (the task was already done/dropped/rescheduled off the active
+        # board) must NOT set a dead pointer the standup then resolves to nothing.
+        # Report it as a structured non-ok result so the U2 dispatcher edits the
+        # message to "already actioned" rather than confirming a #1 that is gone.
+        return {"ok": False, "task_id": task_id, "reason": "not-active",
+                "message": "That task is no longer on your active board; nothing set as #1."}
+    pointer = tomorrow_pointer.set_top(task_id, record.title, source=tomorrow_pointer.SOURCE_EOD)
+    _log("eod_tomorrow_top_set", task_id=task_id, title=record.title,
+         source=tomorrow_pointer.SOURCE_EOD)
+    return {"ok": True, "task_id": task_id, "title": record.title,
+            "set_at": pointer["set_at"], "source": pointer["source"],
+            "ack": f"Set as tomorrow's #1: {record.title}."}
+
+
 def handle_reschedule(task_id: str, new_due: str, *, personal: bool = False) -> dict[str, Any]:
     """Move ``due::`` then RECYCLE the nag loop in the SAME turn (Path C / spec T10).
 
@@ -846,6 +876,9 @@ def main(argv: list[str] | None = None) -> int:
     p_drop = sub.add_parser("drop", help="EOD: move the task to the parking lot")
     p_drop.add_argument("task_id")
 
+    p_top = sub.add_parser("set-top", help="EOD: set the task as tomorrow's #1")
+    p_top.add_argument("task_id")
+
     p_snz = sub.add_parser("snooze", help="pause the nag loop (cap 3)")
     p_snz.add_argument("task_id")
     p_snz.add_argument("duration", help="e.g. 1h / 1d / 3d")
@@ -881,6 +914,8 @@ def main(argv: list[str] | None = None) -> int:
         result = handle_carry(args.task_id, personal=args.personal)
     elif args.command == "drop":
         result = handle_drop(args.task_id, personal=args.personal)
+    elif args.command == "set-top":
+        result = handle_set_top(args.task_id, personal=args.personal)
     elif args.command == "snooze":
         result = handle_snooze(args.task_id, args.duration, block_reason=args.reason)
     elif args.command == "body-double":
