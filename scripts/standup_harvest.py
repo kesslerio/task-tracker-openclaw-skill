@@ -22,9 +22,10 @@ import evidence_record
 import harvest_ledger
 import harvest_state
 import harvest_window
+from adapters import calendar_adapter, dialpad_adapter
 
 STANDUP_RITUAL = "standup"
-SOURCES = ("github", "gmail")
+SOURCES = ("github", "gmail", "calendar", "dialpad_sms")
 
 
 def _source_query(
@@ -63,7 +64,7 @@ def _wrap_adapter_records(
             wrapped.append(
                 evidence_record.adapter_record(
                     source=_adapter_source_type(source, raw),  # type: ignore[arg-type]
-                    kind="activity",
+                    kind=str(raw.get("kind") or "activity"),  # type: ignore[arg-type]
                     provider_id=provider_id,
                     provider_state=provider_state,
                     occurred_at=occurred_at,
@@ -161,6 +162,7 @@ def _apply_attribution_policy(candidate: dict[str, Any]) -> dict[str, Any]:
 def _harvest_source(
     source: str,
     *,
+    resolved: harvest_window.HarvestWindow,
     since: str,
     trigger: str,
     query_start: datetime,
@@ -177,6 +179,20 @@ def _harvest_source(
     if source == "gmail":
         return harvest_ledger.harvest_gmail(
             since,
+            trigger=trigger,
+            query_start=query_start,
+            query_end=query_end,
+        )
+    if source == "calendar":
+        return calendar_adapter.harvest(
+            resolved=resolved,
+            trigger=trigger,
+            query_start=query_start,
+            query_end=query_end,
+        )
+    if source == "dialpad_sms":
+        return dialpad_adapter.harvest(
+            resolved=resolved,
             trigger=trigger,
             query_start=query_start,
             query_end=query_end,
@@ -201,6 +217,7 @@ def harvest(*, target_date: str | date | None = None, trigger: str) -> dict[str,
         query_start, query_end = _source_query(resolved, state, source)
         raw_records, failed = _harvest_source(
             source,
+            resolved=resolved,
             since=since,
             trigger=trigger,
             query_start=query_start,
