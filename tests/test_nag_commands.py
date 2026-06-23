@@ -34,8 +34,10 @@ REF = datetime(2026, 6, 19, tzinfo=timezone.utc)
 
 def _fake_sender(record):
     """H3 deliver_once-shaped fake sender: records (target, text), returns a canned
-    receipt. Never calls real openclaw."""
-    def _send(target, text):
+    receipt. Never calls real openclaw. Accepts the optional ``buttons`` third
+    positional (U3: the nag now attaches a tappable action row), recording only
+    (target, text) so existing assertions are unchanged."""
+    def _send(target, text, buttons=None):
         record.append((target, text))
         return {"message_id": "-4242424242"}
     return _send

@@ -33,7 +33,12 @@ import error_envelope  # noqa: E402
 
 PRODUCTIVITY = "-4242424242"
 WORK_GROUP = "-5252525252"
-REF = datetime(2026, 6, 19, tzinfo=timezone.utc)
+# REF is anchored at the 11:00 nag cron slot (U3): the idem-key period is now the
+# scheduled SLOT (date + slot-hour), not the raw wall-clock hour, so anchoring REF at a
+# real slot keeps the "advance within a slot = same cycle, advance to the next slot =
+# re-deliver" semantics clean. REF.date() is unchanged (2026-06-19), so every overdue-day
+# / threshold computation is byte-identical to before.
+REF = datetime(2026, 6, 19, 11, tzinfo=timezone.utc)
 
 # Fake gateway message id the FAKE sender returns -- never a real send. Valid id
 # shape but does not match the public-hygiene -100[0-9]{8,} grep.
@@ -42,13 +47,22 @@ FAKE_MESSAGE_ID = "-4242424242"
 
 def fake_sender(record=None, *, message_id=FAKE_MESSAGE_ID):
     """A deliver_once-shaped fake sender: records (target, text) and returns a canned
-    ``{"message_id": ...}`` receipt. NEVER calls real openclaw."""
-    calls = record if record is not None else []
+    ``{"message_id": ...}`` receipt. NEVER calls real openclaw.
 
-    def _send(target, text):
+    Accepts an optional ``buttons`` third positional (U3: the nag now attaches a
+    tappable action row, so deliver_once calls the sender with three args). The
+    recorded tuple stays ``(target, text)`` so every existing ``target, text = sent[i]``
+    assertion is unchanged; ``button_rows`` captures the buttons separately for the
+    tests that assert on them."""
+    calls = record if record is not None else []
+    button_rows: list = []
+
+    def _send(target, text, buttons=None):
         calls.append((target, text))
+        button_rows.append(buttons)
         return {"message_id": message_id}
 
+    _send.button_rows = button_rows
     return _send
 
 BOARD = """# Work
@@ -131,10 +145,11 @@ def test_t2_nag_refires_without_ack(harness, monkeypatch):
     from datetime import timedelta
     board, state = harness
     _run(harness)
-    # Advance to the NEXT scheduled cycle so the un-acked loop genuinely re-fires
-    # (a same-cycle re-run would be an idempotent no-op; the invariant under test is
-    # that the loop is NEVER closed without an ack, so it must re-deliver each cycle).
-    monkeypatch.setattr(nag_check, "_today", lambda: REF + timedelta(hours=3))
+    # Advance to the NEXT scheduled cycle (REF is the 11:00 slot; +5h = the 16:00 slot)
+    # so the un-acked loop genuinely re-fires. A within-slot re-run (e.g. +3h, still the
+    # 11:00 slot) would be an idempotent no-op; the invariant under test is that the loop
+    # is NEVER closed without an ack, so it must re-deliver each scheduled cycle.
+    monkeypatch.setattr(nag_check, "_today", lambda: REF + timedelta(hours=5))
     counts2, sent2 = _run(harness)
     assert counts2["sent"] == 1
     nag = _state(state)["tsk_abc123"]
@@ -157,7 +172,9 @@ def test_h3_nag_sent_event_carries_message_id_and_idem_key(harness):
     meta = sent_events[0]["metadata"]
     assert meta["message_id"] == "1915"  # the captured receipt
     assert meta["idem_key"].startswith("nag:tsk_abc123:")
-    assert meta["idem_key"].endswith(":2026-06-19-00")  # period = the run's REF cycle (date+hour)
+    # period = the scheduled SLOT the REF fire falls into (date + slot-hour). REF is
+    # anchored at the 11:00 slot, so the period is 2026-06-19-11.
+    assert meta["idem_key"].endswith(":2026-06-19-11")
 
 
 def test_h3_sender_receives_the_proven_gated_target(harness):
@@ -199,8 +216,8 @@ def test_h3_different_cycle_same_day_redelivers(harness, monkeypatch):
     board, state = harness
     sent = []
     sender = fake_sender(sent)
-    nag_check.run_nag_check(sender=sender)  # cycle 1 (REF hour)
-    monkeypatch.setattr(nag_check, "_today", lambda: REF + timedelta(hours=3))  # next cycle, same day
+    nag_check.run_nag_check(sender=sender)  # cycle 1 (REF = the 11:00 slot)
+    monkeypatch.setattr(nag_check, "_today", lambda: REF + timedelta(hours=5))  # next slot (16:00), same day
     nag_check.run_nag_check(sender=sender)
     assert len(sent) == 2  # each scheduled cycle delivers -- the re-nag cadence stands
     nag = _state(state)["tsk_abc123"]
@@ -407,7 +424,7 @@ def test_h3_delivery_failure_reconciles_gate_act(harness):
     import autonomy_gate  # noqa: PLC0415
     board, state = harness
 
-    def boom(target, text):
+    def boom(target, text, buttons=None):
         raise nag_check.outbox.OpenclawSendError("gateway unreachable")
 
     counts = nag_check.run_nag_check(sender=boom)
@@ -434,7 +451,7 @@ def test_h3_sender_failure_leaves_loop_open_and_logs_block(harness):
     nag_sent is recorded, and a delivery-failure (nag_delivery_blocked) is logged."""
     board, state = harness
 
-    def boom(target, text):
+    def boom(target, text, buttons=None):
         raise nag_check.outbox.OpenclawSendError("gateway unreachable")
 
     counts = nag_check.run_nag_check(sender=boom)
@@ -453,7 +470,7 @@ def test_h3_failed_send_then_clean_retry_delivers(harness):
     cleanly (the failed send recorded no idem-key, so the retry is not deduped)."""
     board, state = harness
 
-    def boom(target, text):
+    def boom(target, text, buttons=None):
         raise nag_check.outbox.OpenclawSendError("transient")
 
     nag_check.run_nag_check(sender=boom)  # fails, loop left open
@@ -539,7 +556,7 @@ def test_r1_sender_failure_records_health_failure_returns_zero(harness, monkeypa
     'unavailable' announce on the cron path)."""
     import cos_health  # noqa: PLC0415
     board, state = harness
-    def boom(target, text):
+    def boom(target, text, buttons=None):
         raise nag_check.outbox.OpenclawSendError("gateway unreachable")
     monkeypatch.setattr(nag_check.outbox, "openclaw_sender", boom)
     rc = nag_check.main([])
@@ -751,8 +768,10 @@ def test_crash_mid_run_leaves_open_loop_open(harness, monkeypatch):
     # uncaught fault: it propagates out, transition() persists nothing, loop stays open.
     # The crash run must land in a FRESH cycle so the outbox peek does NOT short-circuit
     # on the REF cycle's recorded delivery before _authorise_nag is reached -- otherwise
-    # we would be exercising the dedup peek, not the mid-authorise crash this pins.
-    monkeypatch.setattr(nag_check, "_today", lambda: REF + timedelta(hours=3))
+    # we would be exercising the dedup peek, not the mid-authorise crash this pins. REF is
+    # the 11:00 slot; +5h = the 16:00 slot, a genuinely fresh cycle (a +3h within-slot
+    # advance would still be slot 11 and the peek WOULD short-circuit).
+    monkeypatch.setattr(nag_check, "_today", lambda: REF + timedelta(hours=5))
     real_authorise = nag_check._authorise_nag
 
     def boom(*a, **k):
@@ -765,12 +784,12 @@ def test_crash_mid_run_leaves_open_loop_open(harness, monkeypatch):
     assert _state(state)["tsk_abc123"]["ack"] is False
 
     # Recovery: a clean run re-fires the still-open loop. We advance the clock again
-    # to a fresh cycle so the receipt idem-key is unseen and the recovery genuinely
-    # re-delivers -- proving the crashed loop was processed, not lost (in the crashed
-    # cycle nothing was ever recorded, so this is a clean new delivery).
+    # to a fresh cycle (next day's 11:00 slot) so the receipt idem-key is unseen and the
+    # recovery genuinely re-delivers -- proving the crashed loop was processed, not lost
+    # (in the crashed cycle nothing was ever recorded, so this is a clean new delivery).
     monkeypatch.setattr(nag_check, "_authorise_nag", real_authorise)
     monkeypatch.setattr(nag_check, "_today",
-                        lambda: datetime(2026, 6, 20, tzinfo=timezone.utc))
+                        lambda: datetime(2026, 6, 20, 11, tzinfo=timezone.utc))
     sent2 = []
     nag_check.run_nag_check(sender=fake_sender(sent2))
     assert len(sent2) == 1
@@ -1255,7 +1274,7 @@ def test_h5_disposition_prompt_after_two_snoozes(harness, monkeypatch):
     _snooze_loop_n_times(state, "tsk_abc123", 2, until=expired)
     assert _state(state)["tsk_abc123"]["snooze_count"] == 2
     # Next scheduled cycle: the loop re-fires, but now as a DISPOSITION prompt.
-    monkeypatch.setattr(nag_check, "_today", lambda: REF + timedelta(hours=3))
+    monkeypatch.setattr(nag_check, "_today", lambda: REF + timedelta(hours=5))
     sent = []
     counts = nag_check.run_nag_check(sender=fake_sender(sent))
     assert counts["sent"] == 1 and len(sent) == 1
@@ -1278,7 +1297,7 @@ def test_h5_below_threshold_gets_normal_nag(harness, monkeypatch):
     expired = (REF - timedelta(hours=1)).isoformat()
     _snooze_loop_n_times(state, "tsk_abc123", 1, until=expired)  # only ONE snooze
     assert _state(state)["tsk_abc123"]["snooze_count"] == 1
-    monkeypatch.setattr(nag_check, "_today", lambda: REF + timedelta(hours=3))
+    monkeypatch.setattr(nag_check, "_today", lambda: REF + timedelta(hours=5))
     sent = []
     nag_check.run_nag_check(sender=fake_sender(sent))
     text = sent[0][1]
@@ -1294,7 +1313,7 @@ def test_h5_disposition_rides_the_gated_receipted_send(harness, monkeypatch):
     _run(harness)
     expired = (REF - timedelta(hours=1)).isoformat()
     _snooze_loop_n_times(state, "tsk_abc123", 2, until=expired)
-    monkeypatch.setattr(nag_check, "_today", lambda: REF + timedelta(hours=3))
+    monkeypatch.setattr(nag_check, "_today", lambda: REF + timedelta(hours=5))
     sent = []
     nag_check.run_nag_check(sender=fake_sender(sent, message_id="5150"))
     target, text = sent[0]
@@ -1319,7 +1338,7 @@ def test_h5_disposition_does_not_tighten_any_interval(harness, monkeypatch):
     _snooze_loop_n_times(state, "tsk_abc123", 2, until=expired)
     before = _state(state)["tsk_abc123"]
     snooze_before = before["snooze_count"]
-    monkeypatch.setattr(nag_check, "_today", lambda: REF + timedelta(hours=3))
+    monkeypatch.setattr(nag_check, "_today", lambda: REF + timedelta(hours=5))
     nag_check.run_nag_check(sender=fake_sender([]))
     after = _state(state)["tsk_abc123"]
     # The fire bumped nag_count (a delivered nag) but did NOT touch snooze_count or
@@ -1339,3 +1358,138 @@ def test_h5_disposition_threshold_env_override_and_floor(monkeypatch):
     for bad in ("0", "-1", "  -4 "):
         monkeypatch.setenv("NAG_DISPOSITION_AFTER_SNOOZES", bad)
         assert cos_config.nag_disposition_after_snoozes() == 1  # floored at 1
+
+
+# --- U3: tappable nag buttons (Done / Snooze 1d / Reschedule) ---------------
+
+def test_u3_nag_carries_tappable_action_row(harness):
+    """The nag send attaches the KTD-3 action row: Done / Snooze 1d / Reschedule, with
+    callback_data matching the tt: scheme. The buttons ride the SAME receipt-backed send
+    (they are passed to the sender as the buttons arg), not a separate push."""
+    board, state = harness
+    sender = fake_sender([])
+    nag_check.run_nag_check(sender=sender)
+    assert len(sender.button_rows) == 1
+    row = sender.button_rows[0]
+    assert row is not None
+    values = {b["value"] for b in row}
+    # ONLY the wired actions are emitted -- no Start (its codec/dispatcher land in U10).
+    assert values == {"tt:done:tsk_abc123", "tt:snz:tsk_abc123:1d", "tt:rsch:tsk_abc123"}
+    labels = [b["label"] for b in row]
+    assert labels == ["Done", "Snooze 1d", "Reschedule"]
+    assert all(not v.startswith("tt:start") for v in values)  # no Start button (U10)
+
+
+def test_u3_nag_buttons_are_not_part_of_the_idem_key(harness):
+    """Buttons do not change dedup: a same-cycle retry still sends exactly once even
+    though every fire builds an identical button row (buttons are not in the idem-key)."""
+    board, state = harness
+    sender = fake_sender([])
+    nag_check.run_nag_check(sender=sender)
+    nag_check.run_nag_check(sender=sender)  # same slot -> idempotent no-op
+    assert len(sender.button_rows) == 1  # the real send (with buttons) happened ONCE
+
+
+# --- U3: duplicate-delivery fix -- slot-bucketed idem-key -------------------
+
+def test_u3_manual_run_between_crons_does_not_double_send(harness, monkeypatch):
+    """CHARACTERIZATION of the 2026-06-22 production double-delivery, then the fix.
+
+    Timeline that day for one task: the 11:00 cron fired, an out-of-band MANUAL run at
+    12:39 also fired, and the 16:00 cron fired -- the user saw the task TWICE. The old
+    idem-key was the raw wall-clock HOUR, so 11:00 and 12:39 minted DISTINCT keys
+    (``…-11`` vs ``…-12``) and BOTH delivered. The fix buckets each fire into its
+    scheduled SLOT: 11:00 and 12:39 both map to slot 11 -> ONE delivery; 16:00 is the
+    next slot -> the single intended re-nag. Net: exactly TWO sends across the day (one
+    per scheduled slot), never three, regardless of the manual run."""
+    board, state = harness  # REF = the 11:00 slot
+    sent = []
+    sender = fake_sender(sent)
+    # 11:00 scheduled cron fire.
+    nag_check.run_nag_check(sender=sender)
+    # 12:39 out-of-band manual run -- SAME slot (11), so it must DEDUPE, not re-send.
+    monkeypatch.setattr(nag_check, "_today",
+                        lambda: datetime(2026, 6, 19, 12, 39, tzinfo=timezone.utc))
+    nag_check.run_nag_check(sender=sender)
+    assert len(sent) == 1  # the manual run did NOT double-send (the bug, now fixed)
+    # 16:00 scheduled cron fire -- the NEXT slot, so the single intended re-nag fires.
+    monkeypatch.setattr(nag_check, "_today",
+                        lambda: datetime(2026, 6, 19, 16, tzinfo=timezone.utc))
+    nag_check.run_nag_check(sender=sender)
+    assert len(sent) == 2  # exactly two sends across the day -- one per scheduled slot
+    # The two deliveries carry the two distinct SLOT periods, never a raw-hour ``…-12``.
+    sent_events = [e for e in _events(state) if e["event_type"] == "nag_sent"]
+    periods = sorted(e["metadata"]["idem_key"].rsplit(":", 1)[-1] for e in sent_events)
+    assert periods == ["2026-06-19-11", "2026-06-19-16"]
+
+
+def test_u3_failed_cron_then_manual_retry_same_slot_delivers_once(harness, monkeypatch):
+    """A transport-failed 11:00 cron (records nothing) followed by a manual retry in the
+    SAME slot delivers exactly once -- the retry is a fresh delivery (the failed fire
+    recorded no key), but a SECOND manual run in that slot then dedupes. This pins that
+    the slot bucket is the right unit: one delivery per slot even across a failure +
+    retry + extra run."""
+    board, state = harness
+    def boom(target, text, buttons=None):
+        raise nag_check.outbox.OpenclawSendError("11:00 transport down")
+    nag_check.run_nag_check(sender=boom)  # 11:00 fire fails, records no receipt
+    # 12:39 manual retry, same slot -> a clean delivery (the failure poisoned nothing).
+    monkeypatch.setattr(nag_check, "_today",
+                        lambda: datetime(2026, 6, 19, 12, 39, tzinfo=timezone.utc))
+    sent = []
+    nag_check.run_nag_check(sender=fake_sender(sent))
+    assert len(sent) == 1  # retry delivered
+    # A further run still in slot 11 -> deduped (no second copy of the same nag).
+    monkeypatch.setattr(nag_check, "_today",
+                        lambda: datetime(2026, 6, 19, 13, tzinfo=timezone.utc))
+    sent2 = []
+    nag_check.run_nag_check(sender=fake_sender(sent2))
+    assert sent2 == []  # same slot -> deduped
+
+
+def test_u3_post_midnight_retry_belongs_to_prior_slot(harness, monkeypatch):
+    """A fire after midnight, before the day's first slot, belongs to YESTERDAY's last
+    slot -- so a post-midnight retry of an already-nagged task does NOT mint a fresh
+    cycle and re-nag at 02:00. (Edge of _nag_slot_period's cross-midnight branch.)"""
+    board, state = harness
+    # Fire at the 16:00 slot (the day's last) so a receipt is recorded for 2026-06-19-16.
+    monkeypatch.setattr(nag_check, "_today",
+                        lambda: datetime(2026, 6, 19, 16, tzinfo=timezone.utc))
+    sent = []
+    nag_check.run_nag_check(sender=fake_sender(sent))
+    assert len(sent) == 1
+    # 02:00 the next morning -- before the 11:00 slot -> prior day's 16 slot -> deduped.
+    monkeypatch.setattr(nag_check, "_today",
+                        lambda: datetime(2026, 6, 20, 2, tzinfo=timezone.utc))
+    sent2 = []
+    nag_check.run_nag_check(sender=fake_sender(sent2))
+    assert sent2 == []  # post-midnight retry maps to the prior slot -> no re-nag
+
+
+def test_u3_nag_slot_period_maps_to_preceding_slot():
+    """_nag_slot_period buckets a wall-clock time to its scheduled slot (default 11/16):
+    times in [11,16) -> slot 11; >=16 -> slot 16; before the first slot -> prior day's
+    last slot. This is the dedup unit that collapses a within-cycle manual run."""
+    def slot(h, day=19):
+        return nag_check._nag_slot_period(datetime(2026, 6, day, h, tzinfo=timezone.utc))
+    assert slot(11) == "2026-06-19-11"
+    assert slot(12) == "2026-06-19-11"  # the 12:39-style manual run buckets to slot 11
+    assert slot(15) == "2026-06-19-11"
+    assert slot(16) == "2026-06-19-16"  # the second cron slot
+    assert slot(23) == "2026-06-19-16"
+    assert slot(2) == "2026-06-18-16"   # before the first slot -> prior day's last slot
+
+
+def test_u3_nag_cron_slot_hours_config(monkeypatch):
+    """nag_cron_slot_hours: default [11, 16]; a comma-separated env override is honoured;
+    an empty/garbage value degrades to the default so the slot list is never empty."""
+    import cos_config  # noqa: PLC0415
+    monkeypatch.delenv("NAG_CRON_SLOT_HOURS", raising=False)
+    assert cos_config.nag_cron_slot_hours() == [11, 16]  # default matches the 0 11,16 cron
+    monkeypatch.setenv("NAG_CRON_SLOT_HOURS", "9,13,18")
+    assert cos_config.nag_cron_slot_hours() == [9, 13, 18]  # override honoured
+    monkeypatch.setenv("NAG_CRON_SLOT_HOURS", "9, bogus, 18")
+    assert cos_config.nag_cron_slot_hours() == [9, 18]  # non-int tokens dropped
+    for bad in ("", "   ", "x,y,z"):
+        monkeypatch.setenv("NAG_CRON_SLOT_HOURS", bad)
+        assert cos_config.nag_cron_slot_hours() == [11, 16]  # degrades, never empty

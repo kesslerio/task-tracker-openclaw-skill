@@ -29,6 +29,29 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _int_list_env(name: str, default: list[int]) -> list[int]:
+    """Read a comma-separated int-list env var, degrading to ``default``.
+
+    Mirrors ``_int_env``: an unset/empty/garbage value (and any non-int token)
+    degrades rather than crashing a ritual. Non-int tokens are dropped; if nothing
+    valid parses the default stands, so the returned list is NEVER empty -- a caller
+    can index ``[-1]`` safely.
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return list(default)
+    parsed: list[int] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            parsed.append(int(token))
+        except ValueError:
+            continue
+    return parsed or list(default)
+
+
 # --- Local-time canonical helpers -----------------------------------------
 #
 # WHY: the cron jobs fire in America/Los_Angeles, but the container clock runs in
@@ -167,6 +190,26 @@ def nag_display_limit() -> int:
     return max(1, _int_env("NAG_DISPLAY_LIMIT", 3))
 
 
+def nag_cron_slot_hours() -> list[int]:
+    """The local-clock hours the nag cron fires at -- the scheduled re-nag slots
+    (default ``[11, 16]`` for the ``0 11,16`` Pacific cron; env ``NAG_CRON_SLOT_HOURS``
+    e.g. ``"11,16"``).
+
+    The nag idem-key buckets each fire into the most-recent preceding slot (see
+    ``nag_check._nag_slot_period``) so EVERY fire of one scheduled cycle -- the cron
+    fire plus any retry or out-of-band manual run before the next slot -- dedupes to a
+    SINGLE delivery, while distinct slots re-nag. This closes the observed
+    duplicate-delivery hole: a manual run between the 11:00 and 16:00 crons no longer
+    mints a fresh wall-clock-hour key and double-sends. A task re-nags at most once per
+    slot per day.
+
+    Keep this in sync with the actual cron descriptor's schedule. Degrades to the
+    documented default on a missing/garbage value (``_int_list_env`` never returns an
+    empty list), so the period is never built from an empty slot set.
+    """
+    return _int_list_env("NAG_CRON_SLOT_HOURS", [11, 16])
+
+
 def nag_send_timeout_seconds() -> int:
     """Hard bound on a single ``openclaw message send`` (default 10s, floored at 1).
 
@@ -184,7 +227,7 @@ def outbox_retention_days() -> int:
     """Days of delivered-receipt idem-keys to keep in ``outbox.json`` (default 7).
 
     The outbox only needs RECENT periods to dedupe a same-cycle retry; an entry from
-    days ago can never collide with a current ``(task_id, date+hour)`` key. Old
+    days ago can never collide with a current ``(task_id, date+slot)`` key. Old
     entries are pruned on write so the file and the per-run read-modify-write cost
     stay flat. Floored at 1 so a typo cannot disable dedupe within the day.
     """

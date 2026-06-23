@@ -27,14 +27,17 @@ fire it:
    STAYS OPEN; a transport FAILURE (the sender raises) likewise leaves the loop OPEN
    and records NO ``nag_sent`` -- it is never silently cleared or phantom-sent.
 
-CADENCE COUPLING (HARD DEPENDENCY): the outbox idem-key period is the local date +
-HOUR (``%Y-%m-%d-%H``), so the same-fire dedup window assumes >= 1h spacing between
-scheduled fires. This holds for the 11/14/17 cadence (each lands in a distinct clock
-hour). If the schedule is EVER tightened to sub-hourly (two fires in one hour), the
-second would silently dedupe to the same key -- a DROPPED nag with NO log. A
-sub-hourly schedule MUST coarsen or re-key the period (e.g. include the minute)
-before tightening. The invariant is restated at the idem-key site in ``_fire_locked``;
-keep both halves in sync.
+CADENCE COUPLING (HARD DEPENDENCY): the outbox idem-key period is the scheduled cron
+SLOT the fire belongs to (``date + slot-hour`` via ``_nag_slot_period``), NOT the raw
+wall-clock hour. Every fire of one scheduled cycle -- the cron fire, a retry after a
+transport failure, AND an out-of-band manual run before the next slot -- buckets to the
+SAME period and so delivers EXACTLY ONCE; the next slot (e.g. 16:00 after 11:00) is a
+distinct cycle, so a task re-nags at most once per slot per day. This closes the
+observed duplicate-delivery hole: under the old raw-hour key a manual run at 12:39
+between the 11:00 and 16:00 crons minted a fresh ``…-12`` key and double-sent. The
+slot hours come from ``cos_config.nag_cron_slot_hours()`` (default ``[11, 16]``) and
+MUST stay in sync with the actual cron descriptor. The invariant is restated at the
+idem-key site in ``_fire_locked``; keep both halves in sync.
 
 Hard invariants enforced here:
 
@@ -52,7 +55,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable
 
 import cos_config
@@ -62,6 +65,7 @@ import nag_state
 import outbox
 import quiet_state
 import task_ledger
+import telegram_buttons
 from task_ledger import append_event, new_event
 from task_records import active_records, load_records
 
@@ -92,6 +96,31 @@ def _today() -> datetime:
     # the UTC day has already rolled over, so ``ref.date()`` in ``_overdue_days``
     # must read the local calendar day or a due-today task counts as 1d overdue.
     return cos_config.local_now()
+
+
+def _nag_slot_period(ref: datetime) -> str:
+    """Map ``ref`` to the scheduled cron SLOT it belongs to, as ``YYYY-MM-DD-HH``.
+
+    The nag idem-key period is the most-recent preceding cron slot for ``ref``'s LOCAL
+    day -- NOT the raw wall-clock hour. So every fire of one scheduled cycle (the
+    11:00 cron, a retry after a transport failure, an out-of-band manual run at 12:39)
+    shares ONE period and delivers exactly once, while the 16:00 slot is a distinct
+    cycle that re-nags once. This is the duplicate-delivery fix: the old raw-hour key
+    let a manual run land in a fresh hour and double-send.
+
+    Reads ``ref``'s OWN date/hour fields and never re-converts the zone: ``ref`` is
+    already local (it comes from ``_today() -> local_now()``), so its ``.hour`` is the
+    local clock hour the slots are defined in. Before the first slot of the day (a
+    post-midnight retry at, say, 02:00) the fire belongs to YESTERDAY's last slot, so a
+    retry after midnight does not mint a fresh cycle and re-nag.
+    """
+    slots = sorted(set(cos_config.nag_cron_slot_hours()))
+    preceding = [hour for hour in slots if hour <= ref.hour]
+    if preceding:
+        return f"{ref.date().isoformat()}-{preceding[-1]:02d}"
+    # Before the day's first slot: this fire belongs to the prior day's last slot.
+    prev_day = ref.date() - timedelta(days=1)
+    return f"{prev_day.isoformat()}-{slots[-1]:02d}"
 
 
 def _overdue_days(due: str | None, *, ref: datetime) -> int | None:
@@ -467,14 +496,16 @@ def _fire_locked(live, task_id, record, section, overdue, *, ref, sender,
             nag_state.is_snoozed(current, now=ref):
         return {"status": "skipped"}  # raced with a close/snooze -- do nothing
 
-    # CADENCE COUPLING (P3): the period is local date + HOUR, so the dedup window
-    # assumes >= 1h spacing between scheduled fires (the 11/14/17 cadence -- each
-    # lands in a distinct clock hour). If the schedule is ever tightened to
-    # sub-hourly (two fires in one hour), the second would silently dedupe here to
-    # the same key -- a DROPPED nag with no log. A sub-hourly schedule MUST coarsen
-    # or re-key this period (e.g. include the minute) before tightening. See the
-    # module docstring; do NOT change the granularity without changing both halves.
-    idem_key = outbox.make_idem_key("nag", task_id, ref.strftime("%Y-%m-%d-%H"))
+    # CADENCE COUPLING (P3): the period is the scheduled cron SLOT this fire falls into
+    # (``_nag_slot_period`` -> ``date + slot-hour``), NOT the raw wall-clock hour. So
+    # every fire of one cycle -- the cron fire, a transport-failure retry, and an
+    # out-of-band manual run before the next slot -- dedupes to the SAME key and
+    # delivers once; the next slot (16:00 after 11:00) is a distinct cycle that
+    # re-nags. This is the duplicate-delivery fix: the old raw-hour key let a manual
+    # run at 12:39 mint a fresh ``…-12`` key and double-send. The slots come from
+    # ``cos_config.nag_cron_slot_hours()`` and MUST match the cron descriptor. See the
+    # module docstring; keep both halves in sync.
+    idem_key = outbox.make_idem_key("nag", task_id, _nag_slot_period(ref))
 
     # PEEK BEFORE GATE: if this cycle's delivery is already recorded, this is a
     # same-cycle idempotent retry. Short-circuit BEFORE _authorise_nag so gate() is
@@ -550,8 +581,16 @@ def _fire_locked(live, task_id, record, section, overdue, *, ref, sender,
     # -- no separate ungated pointer push. Appended here so the pointer is part of the
     # exact bytes deliver_once sends and records under the idem-key.
     text = authorised["text"] + (f"\n\n{more_pointer}" if more_pointer else "")
+    # U3: attach the tappable nag action row (Done / Snooze 1d / Reschedule). The
+    # builder drops any over-budget button and keeps the text command as the fallback,
+    # so the existing ``/done``/``/snooze``/``/reschedule`` reply path in the nag body
+    # still works if a button can't be encoded. ``buttons`` is NOT part of the idem-key
+    # (a button message and its text-only twin are the SAME delivery), so it never
+    # changes the dedup behaviour above. An empty row degrades to a plain-text send.
+    buttons = telegram_buttons.nag_row(task_id) or None
     try:
-        receipt = outbox.deliver_once(target, text, idem_key, sender=sender)
+        receipt = outbox.deliver_once(target, text, idem_key, sender=sender,
+                                      buttons=buttons)
     except Exception as exc:  # noqa: BLE001 -- a send failure is a per-task block,
         # not a run crash: leave the loop OPEN (state untouched), log it, move on.
         # The gate already logged an executed act; carry act_id so the caller can
