@@ -110,6 +110,13 @@ DEFAULT_ACT_TYPE_RUNGS: dict[str, int] = {
     "calendar_block_moved": RUNG_MONITORED_AUTO,
     "wip_cap_enforced": RUNG_APPROVE,
     "task_marked_done": RUNG_APPROVE,
+    # U5 EOD drop: a board mutation (active->parking) -> execute-with-approval (rung
+    # 2), so the gate MANDATES a pre-action board snapshot. That snapshot carries the
+    # original active raw_line, which is what /undo restores by stable id within the
+    # undo window (REVERSIBILITY). A carry keeps the task active (line edit only), but
+    # is gated the same way so it too is /undo-reversible.
+    "task_dropped": RUNG_APPROVE,
+    "task_carried": RUNG_APPROVE,
     "focus_set": RUNG_APPROVE,
     "focus_updated": RUNG_APPROVE,
     "email_draft": RUNG_DRAFT,

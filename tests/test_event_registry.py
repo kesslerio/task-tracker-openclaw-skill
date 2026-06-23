@@ -32,6 +32,10 @@ REQUIRED_NEW_TYPES = [
     "calendar_block_refused", "brief_sent", "debrief_captured",
     "commitment_task_created", "freebusy_check_passed", "freebusy_check_failed",
     "delivery_target_resolved", "delivery_target_proof_failed",
+    # U5 -- EOD forced disposition. Dual-registration contract: these MUST also be
+    # in task_ledger.KNOWN_EVENT_TYPES (this test asserts both sides match).
+    "eod_disposition_done", "eod_disposition_carry",
+    "eod_disposition_reschedule", "eod_disposition_drop",
 ]
 
 

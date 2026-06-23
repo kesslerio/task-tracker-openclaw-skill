@@ -138,6 +138,16 @@ KNOWN_EVENT_TYPES: frozenset[str] = frozenset({
     "freebusy_check_failed",
     "delivery_target_resolved",
     "delivery_target_proof_failed",
+    # U5 -- EOD forced disposition (every open task gets done/carry/reschedule/drop).
+    # done/reschedule reuse the existing state_transition events; carry/drop are the
+    # new transitions and each emits its own eod_disposition_* marker so the standup
+    # + audit can tell a carried-from-yesterday task from a freshly-dropped one
+    # (KTD-7: disposition lives in the ledger + inline metadata, NOT a board status
+    # field). MUST stay in lockstep with tests/test_event_registry.REQUIRED_NEW_TYPES.
+    "eod_disposition_done",
+    "eod_disposition_carry",
+    "eod_disposition_reschedule",
+    "eod_disposition_drop",
 })
 
 # Canonical actor sources. "agent_autonomous" is the source every agent-initiated

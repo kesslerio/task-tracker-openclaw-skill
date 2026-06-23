@@ -253,3 +253,100 @@ def test_main_json_exits_zero_and_emits_payload(env, monkeypatch, capsys):
     assert out["step"] == "detect_confirm"
     assert out["detection_count"] == 1
     assert out["detections"][0]["buttons"][0]["value"] == "tt:appr:tsk_abc123"
+
+
+# --- U5 forced disposition: every open task gets a button row, board UNCHANGED ----
+
+
+def test_disposition_renders_a_four_button_row_per_open_task(env):
+    payload = eod_ritual.build_disposition_step()
+
+    # Both open tasks are surfaced for a forced disposition.
+    assert payload["step"] == "disposition"
+    assert payload["open_count"] == 2
+    ids = {item["task_id"] for item in payload["items"]}
+    assert ids == {"tsk_abc123", "tsk_def456"}
+
+    item = next(i for i in payload["items"] if i["task_id"] == "tsk_abc123")
+    values = [b["value"] for b in item["buttons"]]
+    # The KTD-3 disposition row: done / carry / reschedule / drop.
+    assert values == [
+        "tt:done:tsk_abc123",
+        "tt:carry:tsk_abc123",
+        "tt:rsch:tsk_abc123",
+        "tt:drop:tsk_abc123",
+    ]
+    # Every open task is reported as needing a disposition (no decision until a tap).
+    assert item["needs_disposition"] is True
+    assert "need a disposition" in payload["message"]
+
+
+def test_disposition_does_not_mutate_the_board(env):
+    """The disposition step RENDERS the buttons but mutates nothing -- mirroring the
+    no-change-without-confirm invariant. Only a later tap changes the board."""
+    board_before = env["work"].read_text()
+    ledger_before = env["ledger"].read_text() if env["ledger"].exists() else ""
+
+    payload = eod_ritual.build_disposition_step()
+    assert payload["open_count"] == 2  # a meaningful (non-vacuous) no-mutation assertion
+
+    assert env["work"].read_text() == board_before
+    after = env["ledger"].read_text() if env["ledger"].exists() else ""
+    assert after == ledger_before
+    # No disposition events leaked from the read-only render step.
+    assert "eod_disposition_carry" not in _ledger_event_types(env["ledger"])
+    assert "eod_disposition_drop" not in _ledger_event_types(env["ledger"])
+
+
+def test_disposition_untapped_task_is_reported_needs_disposition_board_unchanged(env):
+    """An un-tapped task is REPORTED (needs_disposition_count > 0), never silently
+    carried or dropped -- the board is byte-for-byte unchanged."""
+    board_before = env["work"].read_text()
+    payload = eod_ritual.build_disposition_step()
+
+    assert payload["needs_disposition_count"] == 2
+    assert all(item["needs_disposition"] for item in payload["items"])
+    assert env["work"].read_text() == board_before
+
+
+def test_disposition_empty_board_is_a_clean_no_op(env):
+    """An empty board is a clean no-op (open_count 0), proceeding to tomorrow's #1
+    (U6) rather than rendering an empty prompt."""
+    env["work"].write_text("# Work\n\n## 🔴 Q1\n")
+
+    payload = eod_ritual.build_disposition_step()
+
+    assert payload["open_count"] == 0
+    assert payload["items"] == []
+    assert payload["needs_disposition_count"] == 0
+    assert "Nothing open" in payload["message"]
+
+
+def test_disposition_main_step_flag_emits_payload(env, capsys):
+    rc = eod_ritual.main(["--json", "--step", "disposition"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["step"] == "disposition"
+    assert out["open_count"] == 2
+    assert out["items"][0]["buttons"][0]["value"].startswith("tt:done:")
+
+
+def test_recurring_done_disposition_spawns_next_not_a_carried_dup(env, monkeypatch):
+    """A recurring task dispositioned DONE rolls forward its next occurrence via the
+    existing recurrence path -- it is NOT a carried duplicate (a done disposition reuses
+    complete_by_id, whose recurrence handling spawns the next due date)."""
+    import nag_commands
+
+    env["work"].write_text("""# Work
+
+## 🔴 Q1
+- [ ] **Send weekly update** task_id::tsk_weekly recur::weekly 🗓️2026-05-20
+""")
+    result = nag_commands.handle_done("tsk_weekly")
+    assert result["ok"] is True
+    assert result.get("recurring") is True
+    content = env["work"].read_text()
+    # The recurrence rolled forward to the next week (NOT a carried:: marker, NOT a dup).
+    assert content.count("Send weekly update") == 1
+    assert "🗓️2026-05-27" in content
+    assert "carried::" not in content

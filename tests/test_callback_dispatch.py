@@ -14,8 +14,11 @@ These assert the invariants, not the implementation path:
   reschedules through the existing command (closes the R7 two-step-reschedule UX in one tap).
 * NO RAW ERROR LEAK: a malformed args JSON surfaces as a friendly one line + exit 0, never a
   traceback (the error_envelope.run_main boundary).
-* NOT-YET-AVAILABLE: a decodable ``carry`` / ``drop`` / ``top`` (commands land in U5/U6) returns
-  a clean ``not_yet_available`` result, not a crash.
+* U5 DISPOSITION: a decodable ``carry`` / ``drop`` tap routes to the new nag_commands verbs and
+  mutates the board through the existing reversible path (carry keeps it active + stamps carried::;
+  drop moves it to the parking lot).
+* NOT-YET-AVAILABLE: a decodable ``top`` (command lands in U6) returns a clean
+  ``not_yet_available`` result, not a crash.
 
 Public-repo hygiene: the only chat/topic ids here are FAKE values that do NOT match the
 -100[0-9]{8,} pattern the CI hygiene grep flags. Real ids are env-sourced at runtime.
@@ -218,15 +221,39 @@ def test_reschedule_to_date_moves_the_due_date(env):
     assert "tsk_abc123" in text  # still on the board (rescheduled, not completed)
 
 
-# --- not-yet-available actions (U5/U6 wire the commands) ------------------------------------
+# --- U5 disposition: carry / drop now route to the new nag_commands verbs --------------------
 
-@pytest.mark.parametrize("action", ["carry", "drop", "top"])
-def test_unwired_actions_are_clean_not_crashes(env, action):
-    res = _result(f"{action}:tsk_abc123")
+def test_carry_tap_keeps_task_active_and_stamps_carried(env):
+    res = _result("carry:tsk_abc123")
+    assert res["ok"] is True
+    assert res["action"] == "carry"
+    assert res["task_id"] == "tsk_abc123"
+    text = env["work"].read_text()
+    assert "tsk_abc123" in text  # still on the active board
+    assert "carried::" in text  # marker stamped for the standup
+
+
+def test_drop_tap_moves_task_to_parking_lot(env, monkeypatch):
+    # drop needs a Parking Lot section to move into; give the board one.
+    work = env["work"]
+    work.write_text(work.read_text() + "\n## 🅿️ Parking Lot\n")
+    res = _result("drop:tsk_abc123")
+    assert res["ok"] is True
+    assert res["action"] == "drop"
+    assert res["task_id"] == "tsk_abc123"
+    text = work.read_text()
+    # The line is gone from active (Q2) and now lives under the Parking Lot header.
+    assert text.index("tsk_abc123") > text.index("Parking Lot")
+
+
+# --- not-yet-available actions (U6 wires the command) ---------------------------------------
+
+def test_top_action_is_clean_not_a_crash(env):
+    res = _result("top:tsk_abc123")
     assert res["ok"] is False
     assert res["reason"] == "not_yet_available"
     assert res["task_id"] == "tsk_abc123"
-    # Nothing was mutated for an unwired action.
+    # Nothing was mutated for the unwired action.
     assert "tsk_abc123" in env["work"].read_text()
 
 
@@ -267,6 +294,7 @@ def test_dispatch_unit_decode_miss(env):
 
 def test_dispatch_unit_namespace_reprepended(env):
     # The plugin hands the payload WITHOUT the ``tt:`` prefix (the gateway split it off); dispatch
-    # re-prepends it so decode (the single source of truth for the scheme) accepts it.
-    res = callback_dispatch.dispatch({"callback_data": "carry:tsk_abc123", "sender_id": "x", "topic_id": "5"})
-    assert res["action"] == "carry" and res["reason"] == "not_yet_available"
+    # re-prepends it so decode (the single source of truth for the scheme) accepts it. ``top`` is
+    # still unwired (U6), so its decode round-trips and routes to the clean not_yet_available path.
+    res = callback_dispatch.dispatch({"callback_data": "top:tsk_abc123", "sender_id": "x", "topic_id": "5"})
+    assert res["action"] == "top" and res["reason"] == "not_yet_available"
