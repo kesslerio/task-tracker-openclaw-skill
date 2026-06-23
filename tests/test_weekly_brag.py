@@ -65,13 +65,21 @@ def env(tmp_path, monkeypatch):
     work = tmp_path / "Work Tasks.md"
     work.write_text(WORK_BOARD)
     ledger = tmp_path / "events.jsonl"
+    daily = tmp_path / "daily"
 
     monkeypatch.setenv("TASK_MGMT_STATE_DIR", str(state_dir))
     monkeypatch.setenv("TASK_TRACKER_WORK_FILE", str(work))
     monkeypatch.setenv("TASK_TRACKER_LEDGER_FILE", str(ledger))
     monkeypatch.setenv("TASK_TRACKER_ERROR_LOG", str(state_dir / "errors.jsonl"))
+    # Pin the done-log target under tmp_path too. complete_by_id (reached via approve())
+    # writes the daily done-log; without this the fixture leaks to the AMBIENT
+    # TASK_TRACKER_DAILY_NOTES_DIR, so the suite passed only where that var was set (the
+    # author's box / a CI env leak) and FAILED in a clean env -- making this whole file
+    # order/env-dependent. Isolating it here is what the fixture's docstring already promises.
+    monkeypatch.setenv("TASK_TRACKER_DAILY_NOTES_DIR", str(daily))
+    monkeypatch.setenv("TASK_TRACKER_DONE_LOG_DIR", str(daily))
     monkeypatch.setattr(utils, "OBSIDIAN_WORK", work)
-    return {"work": work, "ledger": ledger, "state_dir": state_dir}
+    return {"work": work, "ledger": ledger, "state_dir": state_dir, "daily": daily}
 
 
 def _set_productivity_env(monkeypatch):
