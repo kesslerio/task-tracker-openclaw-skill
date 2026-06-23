@@ -229,7 +229,7 @@ gated, asserted delivery target. The proof is unchanged — an unset env / wrong
 group / mismatched send is still blocked. Boot preflight (U1) must keep
 `autonomy-log.jsonl` writable for these.
 
-### Accountability / nag engine (U4 — Productivity Group topic 2)
+### Accountability / nag engine (U4 + U10 priority-first — Productivity Group)
 
 The nag engine chases overdue tasks until they are acknowledged. A nag is an open
 loop persisted in `nag-state.json`; it closes ONLY on an explicit ack
@@ -271,6 +271,56 @@ bash scripts/telegram-commands.sh cancel-session <task_id>   # end a body-double
   reactive command path (`/done`, `/reschedule`).
 - Body-double check-ins are ephemeral one-shot crons with `deleteAfterRun:true`
   and an explicit proven `delivery.to` + `agentId` set at session-start time.
+
+**v0.3 — priority-first + tappable (U10, U3):** the intraday nag now leads with
+**today's committed priorities** (the standup's `focus_state` daily 2-3 + the
+EOD-set tomorrow-pointer #1) that aren't done yet — eligible even at zero days
+overdue — each with a **▶️ Start** initiation button, then a reduced overdue tail.
+A *reweight*, not a volume increase: `NAG_DISPLAY_LIMIT`, the H5 cadence, and
+`/quiet` are unchanged. Each nag carries tap buttons (Done / Snooze 1d /
+Reschedule▸) instead of copy-paste IDs, and the duplicate-delivery hole is closed
+by a slot-bucketed idem-key (every fire of one cron slot — the scheduled fire, a
+retry, a manual run before the next slot — delivers exactly once). Taps route
+through the inline-button seam below.
+
+### EOD ritual (U4–U7 — Productivity Group Done topic)
+
+The end-of-day ritual is the canonical daily capture and the read side of the
+morning standup. `bash scripts/telegram-commands.sh eod` runs the guided flow:
+
+1. **Detect** — a read-only (`dry_run`) `done24h` harvest (merged PRs + sent mail
+   matched to the board + manual `/win`s); nothing is consumed.
+2. **Confirm** — each detected completion is a `✅ Confirm` button (`tt:appr`) that
+   drives the existing topic-guarded, reversible `approve` gate. No board change
+   without a tap.
+3. **Disposition** — every still-open task gets a Done / Carry / Reschedule / Drop
+   button row; an un-tapped task is reported "needs disposition" (the board is
+   never silently mutated). `carry`/`drop` are reversible via `/undo`.
+4. **Tomorrow's #1** — propose-then-confirm (`⭐ Set as #1`, `tt:top`) writes a
+   single atomic `tomorrow-pointer.json` that the morning standup opens with.
+
+The EOD delivers through the receipt-backed idempotent outbox (prove → gate →
+`deliver_once`), records `eod_review` health, and upserts an idempotent
+`## EOD Summary` (done / still-open / tomorrow's #1) to the Obsidian daily note —
+the JSONL ledger stays the canonical audit. Runs as a deterministic command cron
+(descriptor template in `eod_ritual.eod_cron_descriptor()`).
+
+### Inline-button UX (U1–U2)
+
+Telegram rituals are tappable instead of ID-typed. The **send** side
+(`telegram_buttons.py` + the receipt-backed outbox `--presentation`) attaches
+`tt:<action>:<task_id>` buttons; the **receive** side is a sideloaded gateway
+plugin (`scripts/openclaw-plugins/task-tracker-interactive/`, namespace `tt`) plus
+`callback_dispatch.py`, which route a tap into the **existing** deterministic
+commands (done / snooze / reschedule / carry / drop / approve / set-top / start).
+The plugin authorizes nothing — the skill command + topic guard are the single
+authority, so a forged/stale tap can only no-op. `callback_data` is hard-capped at
+64 bytes (over-budget → the button is dropped and the typed command survives).
+
+> **Operator step (required for taps to work):** register the plugin in
+> `openclaw.json` `plugins.allow` + `entries`, boot-sync it as REAL files into the
+> AlphaClaw state root (never symlinks), and restart the gateway. Until then the
+> buttons render but a tap is a silent no-op.
 
 ## Agent Invocation Guidance
 
