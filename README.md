@@ -38,7 +38,15 @@ python3 scripts/weekly_review.py
 - Durable completion evidence inbox for review/confirm/reject/snooze decisions
 - Read-only task health audits for duplicate titles, stale tasks, identity
   issues, candidates, and backlog pressure
-- Daily standup summaries (`standup.py`, `personal_standup.py`)
+- Daily standup summaries (`standup.py`, `personal_standup.py`) — the work standup
+  opens with the EOD-set tomorrow's #1
+- **Priority-first nag** that chases today's committed priorities (with a Start
+  initiation button), not just worst-overdue
+- **EOD ritual** (`telegram-commands.sh eod`): detect-done → confirm → disposition
+  every open task → set tomorrow's #1, feeding the board, ledger, a tomorrow-pointer,
+  and an Obsidian `## EOD Summary`
+- **Inline-button UX**: nags, EOD, and disposition are tappable (`tt:` gateway
+  plugin → existing deterministic commands) instead of copy-paste task IDs
 - Weekly review + archive workflows (`weekly_review.py`, `archive.py`)
 - Backlog and delegated-task hygiene
 - Action extraction from notes (`extract_tasks.py`)
