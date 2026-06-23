@@ -190,6 +190,24 @@ def nag_display_limit() -> int:
     return max(1, _int_env("NAG_DISPLAY_LIMIT", 3))
 
 
+def eod_disposition_limit() -> int:
+    """Open tasks the EOD renders a per-task disposition message for (default 5).
+
+    The EOD delivers ONE message per still-open task (title + context + that task's
+    Done/Carry/Reschedule/Drop row), so a big board would flood the thread with a
+    message per task. This caps the per-task disposition messages to the N tasks that
+    most need a decision -- the disposition step LEADS with overdue / high-priority
+    (q1<q2<q3) tasks so the worst work surfaces first, and the remainder is summarised
+    as a single "+K more open" text line (no buttons) pointing at the board / nag.
+
+    Mirrors ``nag_display_limit`` in spirit (the ADHD-focused surface shows the worst
+    few, not an unbounded dump). Floored at 1: a 0/negative misconfig would mute the
+    disposition step entirely, so the knob can shrink the surface but never switch it
+    off.
+    """
+    return max(1, _int_env("EOD_DISPOSITION_LIMIT", 5))
+
+
 def nag_cron_slot_hours() -> list[int]:
     """The local-clock hours the nag cron fires at -- the scheduled re-nag slots
     (default ``[11, 16]`` for the ``0 11,16`` Pacific cron; env ``NAG_CRON_SLOT_HOURS``

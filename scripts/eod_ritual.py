@@ -70,6 +70,7 @@ import argparse
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -255,7 +256,44 @@ def _open_tasks(*, personal: bool = False) -> list[Any]:
     return list(active_records(records))
 
 
-def _disposition_item(record: Any) -> dict[str, Any]:
+# Section rank for LEADING the disposition with the most urgent work: q1 (urgent &
+# important) outranks q2, q2 outranks q3, anything else falls to the back. The same
+# coarse ranking the tomorrow's-#1 proposal uses (``_SECTION_RANK`` below), restated
+# here so the disposition lead-sort and the proposal stay independently tunable.
+_DISPOSITION_SECTION_RANK: dict[str, int] = {"q1": 0, "q2": 1, "q3": 2}
+_DISPOSITION_DEFAULT_RANK = 9
+
+
+def _overdue_days(due: str | None, *, ref: datetime) -> int:
+    """Scalar days overdue (positive == overdue), or 0 when no/garbage due date.
+
+    Used only to LEAD the disposition with the most-overdue tasks; a non-overdue or
+    undated task reads 0 and sorts after dated overdue ones. Mirrors the nag engine's
+    local-day comparison (``nag_check._overdue_days``) but clamps to a sort scalar.
+    """
+    if not due:
+        return 0
+    try:
+        due_date = datetime.strptime(due, "%Y-%m-%d").date()
+    except ValueError:
+        return 0
+    return (ref.date() - due_date).days
+
+
+def _disposition_sort_key(record: Any, *, ref: datetime) -> tuple[int, int, str]:
+    """Lead the disposition with overdue / high-priority work: most-overdue first,
+    then most-urgent section (q1<q2<q3), then canonical id for a stable order.
+
+    So a big board's capped disposition surfaces the tasks that most need a decision
+    (an overdue Q1 ahead of a not-yet-due Q3), and the remainder is summarised as one
+    "+K more open" line rather than flooding the thread with a message per task.
+    """
+    overdue = _overdue_days(record.due, ref=ref)
+    section_rank = _DISPOSITION_SECTION_RANK.get(record.section, _DISPOSITION_DEFAULT_RANK)
+    return (-overdue, section_rank, record.canonical_id or "")
+
+
+def _disposition_item(record: Any, *, ref: datetime) -> dict[str, Any]:
     """Render one open task into a disposition record + its 4-button row.
 
     The row is ``tt:done`` / ``tt:carry`` / ``tt:rsch`` / ``tt:drop`` built through
@@ -263,7 +301,9 @@ def _disposition_item(record: Any) -> dict[str, Any]:
     overflow 64 bytes, leaving the text command as the fallback). ``needs_disposition``
     is True for EVERY open task: nothing is decided until the user taps, so an
     un-tapped task is REPORTED (visible) with the board UNCHANGED -- the no-silent-carry,
-    no-silent-drop invariant.
+    no-silent-drop invariant. The 4-button row references EXACTLY this one ``task_id``:
+    a disposition message carries no other task's actions (the one-task-per-message
+    rule the nag-style EOD delivers each item under).
     """
     task_id = record.canonical_id
     return {
@@ -271,39 +311,97 @@ def _disposition_item(record: Any) -> dict[str, Any]:
         "title": record.title,
         "due": record.due,
         "section": record.section,
+        "overdue_days": _overdue_days(record.due, ref=ref),
         "needs_disposition": True,
         "buttons": telegram_buttons.disposition_row(task_id) if task_id else [],
     }
 
 
-def disposition(*, personal: bool = False) -> dict[str, Any]:
-    """List every open task with a forced-disposition button row -- READ-ONLY.
+def disposition(*, personal: bool = False, now: datetime | None = None) -> dict[str, Any]:
+    """List open tasks with a forced-disposition button row, CAPPED + overdue-first.
 
-    Returns the open tasks (each with a ``tt:done``/``tt:carry``/``tt:rsch``/``tt:drop``
-    row) plus ``needs_disposition_count``. An EMPTY board is a clean no-op
-    (``open_count == 0``), proceeding to tomorrow's #1 (U6). NOTHING is mutated here:
-    the board changes only when the user taps a button (which the U2 dispatcher routes
-    to the existing reversible, gated command). NEVER raises -- a missing board yields
-    an empty list, and ``main``'s envelope classifies any other unhandled exception.
+    Returns the open tasks ranked overdue/priority-first (so a big board's capped
+    surface leads with the worst work), split into:
+
+    * ``items`` -- the top ``EOD_DISPOSITION_LIMIT`` tasks, each carrying its OWN
+      ``tt:done``/``tt:carry``/``tt:rsch``/``tt:drop`` row (one task per message
+      downstream). ``open_count`` is the full open total; ``items`` is the capped slice.
+    * ``remainder_count`` -- how many open tasks the cap held back; the caller
+      summarises these as a single "+K more open" text line (no buttons).
+
+    An EMPTY board is a clean no-op (``open_count == 0``), proceeding to tomorrow's #1
+    (U6). NOTHING is mutated here: the board changes only when the user taps a button
+    (which the U2 dispatcher routes to the existing reversible, gated command). NEVER
+    raises -- a missing board yields an empty list, and ``main``'s envelope classifies
+    any other unhandled exception.
     """
-    open_tasks = _open_tasks(personal=personal)
-    items = [_disposition_item(record) for record in open_tasks]
+    ref = now or cos_config.local_now()
+    open_tasks = sorted(
+        _open_tasks(personal=personal),
+        key=lambda record: _disposition_sort_key(record, ref=ref),
+    )
+    limit = cos_config.eod_disposition_limit()
+    capped = open_tasks[:limit]
+    items = [_disposition_item(record, ref=ref) for record in capped]
     return {
         "ok": True,
-        "open_count": len(items),
+        "open_count": len(open_tasks),
         "items": items,
-        # Every open task needs a decision; an un-tapped one stays in this count so the
+        # The open tasks the cap held back -- summarised as a "+K more open" line, NOT a
+        # message per task. Always >= 0 (the cap is a slice bound, not a mute).
+        "remainder_count": max(0, len(open_tasks) - len(items)),
+        # Every SURFACED task needs a decision; an un-tapped one stays in this count so the
         # caller can REPORT "N still need disposition" without mutating anything.
         "needs_disposition_count": len(items),
     }
 
 
+def _disposition_item_message(item: dict[str, Any]) -> str:
+    """ONE still-open task's self-contained disposition message (nag-style).
+
+    The title + a short context line (due marker / overdue age) + the no-change-until-tap
+    framing. The task's OWN ``[Done][Carry][Reschedule][Drop]`` row rides the send as
+    ``buttons`` -- this message carries no other task's actions, so the unreadable
+    multi-task button grid (the shipped bug) can never form: one task, one button row.
+    """
+    title = item["title"] or item["task_id"] or "(untitled)"
+    overdue = item.get("overdue_days") or 0
+    if overdue > 0:
+        plural = "s" if overdue != 1 else ""
+        context = f"⚠️ {overdue} day{plural} overdue"
+    elif item.get("due"):
+        context = f"🗓️ due {item['due']}"
+    else:
+        context = "no due date"
+    return (
+        f"EOD — {title}\n"
+        f"{context}\n\n"
+        "Done / Carry / Reschedule / Drop? Nothing changes until you tap."
+    )
+
+
+def _remainder_message(remainder_count: int) -> str:
+    """The single "+K more open" summary line (no buttons) for tasks past the cap.
+
+    The disposition is capped to ``EOD_DISPOSITION_LIMIT`` per-task messages so a big
+    board does not flood the thread; the tasks the cap held back are summarised here as
+    ONE plain-text line pointing at the board / the nag, mirroring the nag's "+K more"
+    pointer. Never carries a button -- it references no single task.
+    """
+    plural = "s" if remainder_count != 1 else ""
+    return (
+        f"EOD — +{remainder_count} more open task{plural} "
+        "(handle them on the board or via the nag)."
+    )
+
+
 def _disposition_message(disposition_result: dict[str, Any]) -> str:
-    """The user-facing disposition-step text (buttons ride the send, not the text).
+    """The user-facing disposition-step PREVIEW text (``--step disposition``).
 
     An empty board shows a single clean "nothing open" line -- never an empty prompt.
-    Otherwise each open task is listed with its due marker so the user can decide; the
-    "needs disposition" framing makes the no-change-until-tap invariant explicit.
+    Otherwise the CAPPED tasks are listed with their due marker, and a "+K more" line is
+    appended when the cap held tasks back. This is the read-only preview; the live EOD
+    delivers each task as its own one-task-per-message send (see ``_eod_items``).
     """
     items = disposition_result["items"]
     if not items:
@@ -315,10 +413,15 @@ def _disposition_message(disposition_result: dict[str, Any]) -> str:
     for item in items:
         due = f" 🗓️{item['due']}" if item.get("due") else ""
         lines.append(f"• {item['title']}{due}")
+    remainder = disposition_result.get("remainder_count", 0)
+    if remainder:
+        plural = "s" if remainder != 1 else ""
+        lines.append(f"+{remainder} more open task{plural} — handle on the board / via the nag.")
     return "\n".join(lines)
 
 
-def build_disposition_step(*, personal: bool = False) -> dict[str, Any]:
+def build_disposition_step(*, personal: bool = False, now: datetime | None = None
+                           ) -> dict[str, Any]:
     """Assemble the EOD forced-disposition step output (structured, no delivery).
 
     The U5 deliverable: a structured payload carrying the disposition-step ``message``
@@ -326,13 +429,14 @@ def build_disposition_step(*, personal: bool = False) -> dict[str, Any]:
     delivery) and mutates NOTHING -- a tap on a rendered ``tt:done``/``carry``/``rsch``/
     ``drop`` button later drives the existing reversible, gated command path.
     """
-    result = disposition(personal=personal)
+    result = disposition(personal=personal, now=now)
     return {
         "ok": True,
         "step": "disposition",
         "message": _disposition_message(result),
         "items": result["items"],
         "open_count": result["open_count"],
+        "remainder_count": result["remainder_count"],
         "needs_disposition_count": result["needs_disposition_count"],
     }
 
@@ -448,51 +552,131 @@ def build_tomorrow_step(*, personal: bool = False) -> dict[str, Any]:
     }
 
 
-# --- U7: assemble the full ritual, deliver it, summarise, record health --------
+# --- U7: assemble the ritual as a SEQUENCE of one-item messages, deliver, summarise --
+#
+# THE FIX (one-message-per-task, nag-style): the EOD no longer packs the whole ritual
+# into ONE Telegram message with ONE flat button grid -- Telegram cannot label or
+# interleave "Done/Carry/Reschedule/Drop × N tasks", so the old mega-message collapsed
+# into an unreadable grid at any N>1. Instead the EOD assembles a LIST of small,
+# self-contained chunks (each its own ``message`` + ``buttons`` + ``idem_suffix``) and
+# delivers each through its OWN receipt-backed ``deliver_once``, mirroring the working
+# nag (``nag_check``/``nag_delivery``) one-task-per-message pattern.
+#
+# HARD RULE: NO chunk's ``buttons`` reference more than one ``task_id``. A disposition
+# chunk carries exactly ONE task's 4-button row; a confirm chunk carries ONE task's
+# Confirm; the tomorrow's-#1 chunk is the one acceptable multi-button decision (picking
+# ONE #1 among ~3 candidates). The remainder is a single buttonless "+K more" line.
 
 
-def _assemble(*, personal: bool = False) -> dict[str, Any]:
-    """Run the three EOD steps and bundle their text + buttons into ONE ritual payload.
+def _eod_items(*, personal: bool = False, now: datetime | None = None) -> dict[str, Any]:
+    """Assemble the EOD as an ordered LIST of one-item delivery chunks (no send).
 
-    Reuses the U4/U5/U6 builders verbatim -- this only composes their structured output.
-    The disposition + tomorrow's-#1 steps may write the empty-board "none" pointer (U6),
-    but NO board task is mutated here: every board change still requires a user tap.
+    Reuses the U4/U5/U6 builders verbatim, then EXPLODES their output into a sequence of
+    self-contained chunks -- one Confirm per detection, one disposition message per
+    surfaced open task, a single "+K more" remainder line, and the tomorrow's-#1 chunk.
+    Each chunk is ``{"message", "buttons", "idem_suffix"}`` where the buttons reference
+    AT MOST one task. The disposition + tomorrow steps may write the empty-board "none"
+    pointer (U6), but NO board task is mutated here: every board change still needs a tap.
+
+    Returns ``{"chunks", "confirm", "disposition", "tomorrow"}`` -- the steps are kept so
+    the ## EOD Summary derives from the same structured output.
     """
     confirm = build_confirm_step()
-    disposition = build_disposition_step(personal=personal)
+    disposition = build_disposition_step(personal=personal, now=now)
     tomorrow = build_tomorrow_step(personal=personal)
-    message = "\n\n".join(
-        step["message"] for step in (confirm, disposition, tomorrow)
-    )
-    # The buttons that ride the send: every detection's Confirm + every open task's
-    # disposition row + the tomorrow's-#1 proposal buttons, in ritual order.
-    buttons: list[dict[str, Any]] = []
-    for det in confirm["detections"]:
-        buttons.extend(det["buttons"])
+
+    chunks: list[dict[str, Any]] = []
+
+    # CONFIRM: one self-contained message per detected completion (title + evidence + a
+    # single tt:appr Confirm). When nothing was auto-detected, a single buttonless
+    # "nothing detected" summary stands in (NEVER a multi-task confirm grid).
+    detections = confirm["detections"]
+    if detections:
+        for det in detections:
+            chunks.append({
+                "message": _confirm_item_message(det),
+                "buttons": list(det["buttons"]),
+                "idem_suffix": ("conf", det["task_id"]),
+            })
+    else:
+        chunks.append({
+            "message": confirm["message"],
+            "buttons": [],
+            "idem_suffix": ("conf", "none"),
+        })
+
+    # DISPOSITION: one self-contained message per still-open task (its OWN 4-button row),
+    # capped + overdue/priority-first. The tasks the cap held back become one buttonless
+    # "+K more" remainder line -- never a message-per-task flood.
     for item in disposition["items"]:
-        buttons.extend(item["buttons"])
+        chunks.append({
+            "message": _disposition_item_message(item),
+            "buttons": list(item["buttons"]),
+            "idem_suffix": ("disp", item["task_id"]),
+        })
+    if disposition["remainder_count"]:
+        chunks.append({
+            "message": _remainder_message(disposition["remainder_count"]),
+            "buttons": [],
+            "idem_suffix": ("more",),
+        })
+
+    # TOMORROW'S #1: ONE message -- the proposed #1 + up to ~2 alternatives as tt:top
+    # buttons. Picking ONE #1 among ~3 candidates is a single decision (acceptable as a
+    # small button row); it is the only multi-button chunk and references one task per
+    # button, never an interleaved per-task grid.
+    tomorrow_buttons: list[dict[str, Any]] = []
     for cand in tomorrow["candidates"]:
-        buttons.extend(cand["buttons"])
+        tomorrow_buttons.extend(cand["buttons"])
+    chunks.append({
+        "message": tomorrow["message"],
+        "buttons": tomorrow_buttons,
+        "idem_suffix": ("top",),
+    })
+
     return {
+        "chunks": chunks,
         "confirm": confirm,
         "disposition": disposition,
         "tomorrow": tomorrow,
-        "message": message,
-        "buttons": buttons,
     }
 
 
-def _summary_inputs(assembled: dict[str, Any]) -> dict[str, Any]:
+def _confirm_item_message(detection: dict[str, Any]) -> str:
+    """ONE detected completion's self-contained confirm message (title + evidence).
+
+    Carries a single ``[✅ Confirm]`` (``tt:appr:<id>``) ride-along button and no other
+    task's action -- the one-item-per-message rule for the confirm step.
+    """
+    title = detection["title"] or detection["task_id"] or "(untitled)"
+    source = detection.get("source_type")
+    evidence = detection.get("evidence_url")
+    lines = [f"EOD — detected done: {title}"]
+    if source:
+        lines.append(f"via {source}")
+    if evidence:
+        lines.append(str(evidence))
+    lines.append("")
+    lines.append("Tap Confirm to mark it done (nothing changes until you tap).")
+    return "\n".join(lines)
+
+
+def _summary_inputs(items: dict[str, Any]) -> dict[str, Any]:
     """Derive the ``## EOD Summary`` groups from the assembled ritual (no I/O).
 
     * done today -- the confirmable detections (the work the harvest linked to an open
       task; the canonical wins live in the ledger, this is the human-readable echo).
-    * still open -- every task the disposition step lists (the board's open set at EOD).
+    * still open -- the SURFACED open tasks plus, when the cap held some back, an explicit
+      "+K more open" line so the summary still reflects the true open total.
     * tomorrow's #1 -- the proposed top, or ``None`` on an empty board.
     """
-    done_today = [det["title"] for det in assembled["confirm"]["detections"]]
-    still_open = [item["title"] for item in assembled["disposition"]["items"]]
-    top = assembled["tomorrow"]["top"]
+    done_today = [det["title"] for det in items["confirm"]["detections"]]
+    still_open = [item["title"] for item in items["disposition"]["items"]]
+    remainder = items["disposition"]["remainder_count"]
+    if remainder:
+        plural = "s" if remainder != 1 else ""
+        still_open.append(f"+{remainder} more open task{plural}")
+    top = items["tomorrow"]["top"]
     tomorrow_top = top["title"] if top else None
     return {"done_today": done_today, "still_open": still_open,
             "tomorrow_top": tomorrow_top}
@@ -535,73 +719,93 @@ def _prove_gate_authorise() -> dict[str, Any]:
     return {"ok": True, "delivery_target": target, "act_id": gated["act_id"]}
 
 
-def _eod_idem_key(now=None) -> str:
-    """The outbox idem-key for one EOD: ``eod:<YYYY-MM-DD>`` in the local zone.
+def _eod_idem_key(suffix: tuple[str, ...], *, now=None) -> str:
+    """The outbox idem-key for ONE EOD chunk: ``eod:<YYYY-MM-DD>:<suffix...>``.
 
-    Keyed on the local calendar DATE so one EOD delivers per day: a same-day cron retry
-    (or a manual re-fire before midnight) short-circuits to the recorded receipt and
-    never double-sends the evening ritual.
+    PER-ITEM keys (not one key for the whole ritual) so a re-fire dedupes each item
+    independently: a same-day retry never double-sends a given disposition / confirm /
+    #1 item, yet a NEW item (a task that became open since the last fire) still sends.
+    Examples: ``eod:2026-06-22:disp:tsk_abc123``, ``eod:2026-06-22:conf:tsk_def456``,
+    ``eod:2026-06-22:top``. Keyed on the LOCAL calendar date so the day is the dedup
+    period (a manual re-fire before midnight short-circuits to the recorded receipts).
     """
     day = (now or cos_config.local_now()).strftime("%Y-%m-%d")
-    return outbox.make_idem_key(DELIVERY_KIND, day)
+    return outbox.make_idem_key(DELIVERY_KIND, day, *suffix)
 
 
 def deliver(
-    assembled: dict[str, Any],
+    items: dict[str, Any],
     *,
     sender: Callable[..., dict[str, Any]] | None = None,
     now=None,
 ) -> dict[str, Any]:
-    """Deliver the assembled EOD through the receipt-backed seam AT MOST ONCE per day.
+    """Deliver the EOD's SEQUENCE of one-item chunks through the receipt-backed seam.
 
-    Proves + gates + asserts the DONE-thread target, then hands the ritual text + buttons
-    to ``outbox.deliver_once`` (idempotent, receipt-capturing). A blocked proof/gate
+    Proves + gates + asserts the DONE-thread target ONCE, then delivers each chunk via
+    its OWN ``outbox.deliver_once`` keyed on a PER-ITEM idem-key -- so the EOD does N
+    receipted sends (one per item), each independently deduped. A blocked proof/gate
     returns ``{"ok": False, "reason"}`` with NO send (no partial delivery). A transport
-    failure (the sender raises) is caught and returned as ``{"ok": False,
-    "reason": "delivery_failed:..."}`` -- the board mutations the user already confirmed
-    via taps are NEVER coupled to this send. A successful send (fresh OR an idempotent
-    short-circuit) returns ``{"ok": True, "message_id", "idempotent"}``.
+    failure on any chunk (the sender raises) stops the run and returns ``{"ok": False,
+    "reason": "delivery_failed:..."}`` -- the chunks already delivered stand on their
+    recorded receipts (a re-fire skips them and resumes), and the board mutations the
+    user confirmed via taps are NEVER coupled to this send. On success returns
+    ``{"ok": True, "sent", "idempotent_all", "message_ids"}`` where ``idempotent_all`` is
+    True only when EVERY chunk short-circuited on a recorded receipt (a same-day re-fire).
     """
     authorised = _prove_gate_authorise()
     if not authorised["ok"]:
         return {"ok": False, "reason": authorised["reason"]}
-    idem_key = _eod_idem_key(now=now)
-    try:
-        receipt = outbox.deliver_once(
-            authorised["delivery_target"], assembled["message"], idem_key,
-            sender=sender or outbox.openclaw_sender, buttons=assembled["buttons"],
-        )
-    except Exception as exc:  # noqa: BLE001 -- a send failure is a delivery block, not a
-        # crash: nothing partial leaves, the confirmed taps already stand on the board.
-        return {"ok": False, "reason": f"delivery_failed:{type(exc).__name__}",
-                "message": str(exc)}
+    target = authorised["delivery_target"]
+    send = sender or outbox.openclaw_sender
+
+    message_ids: list[str | None] = []
+    receipts: list[dict[str, Any]] = []
+    for chunk in items["chunks"]:
+        idem_key = _eod_idem_key(chunk["idem_suffix"], now=now)
+        try:
+            receipt = outbox.deliver_once(
+                target, chunk["message"], idem_key,
+                sender=send, buttons=chunk["buttons"],
+            )
+        except Exception as exc:  # noqa: BLE001 -- a send failure is a delivery block,
+            # not a crash: the chunks already delivered keep their receipts (a re-fire
+            # resumes), and the confirmed taps already stand on the board.
+            return {"ok": False, "reason": f"delivery_failed:{type(exc).__name__}",
+                    "message": str(exc), "sent": len(receipts)}
+        receipts.append(receipt)
+        message_ids.append(receipt.get("message_id"))
+
     return {
         "ok": True,
-        "message_id": receipt.get("message_id"),
-        "idempotent": bool(receipt.get("idempotent")),
-        "delivery_target": authorised["delivery_target"],
+        "sent": len(receipts),
+        # True only when EVERY chunk deduped (a same-day re-fire) -- so a partial re-fire
+        # that still delivers a freshly-opened item is correctly NOT flagged idempotent.
+        "idempotent_all": bool(receipts) and all(r.get("idempotent") for r in receipts),
+        "message_ids": message_ids,
+        "delivery_target": target,
     }
 
 
 def run(*, personal: bool = False, sender: Callable[..., dict[str, Any]] | None = None,
         now=None) -> dict[str, Any]:
-    """The full U7 EOD: assemble -> deliver -> upsert ## EOD Summary -> audit.
+    """The full U7 EOD: assemble the per-item chunks -> deliver each -> upsert ## EOD
+    Summary -> audit.
 
-    Returns ``{"ok", "delivered", "reason"?, "summary_path", "message_id"?}``. The board
-    mutations from U4/U5/U6 already committed ONLY on the user's taps and are independent
-    of delivery: a blocked/failed send leaves ``ok: False`` (so ``run_main`` records an
-    ``eod_review`` health FAILURE) but never partially sends and never touches those
-    confirmed taps. The ``## EOD Summary`` is upserted ONLY on a delivered EOD (idempotent
-    -- a re-fire replaces the section, never appends), and the ``eod_summary_written``
-    audit event carries the receipt id + the note path so a replay can prove the ritual
-    ran end-to-end.
+    Returns ``{"ok", "delivered", "reason"?, "summary_path", ...}``. The board mutations
+    from U4/U5/U6 already committed ONLY on the user's taps and are independent of
+    delivery: a blocked/failed send leaves ``ok: False`` (so ``run_main`` records an
+    ``eod_review`` health FAILURE) but never touches those confirmed taps. The
+    ``## EOD Summary`` is upserted ONLY on a delivered EOD (idempotent -- a re-fire
+    replaces the section, never appends), and the ``eod_summary_written`` audit event
+    carries the receipt ids + the note path so a replay can prove the ritual ran
+    end-to-end.
     """
-    assembled = _assemble(personal=personal)
-    delivered = deliver(assembled, sender=sender, now=now)
+    items = _eod_items(personal=personal, now=now)
+    delivered = deliver(items, sender=sender, now=now)
     if not delivered["ok"]:
         return {"ok": False, "delivered": False, "reason": delivered["reason"]}
 
-    summary_inputs = _summary_inputs(assembled)
+    summary_inputs = _summary_inputs(items)
     written = eod_summary.write_summary(
         done_today=summary_inputs["done_today"],
         still_open=summary_inputs["still_open"],
@@ -610,18 +814,20 @@ def run(*, personal: bool = False, sender: Callable[..., dict[str, Any]] | None 
     append_event(new_event(
         "eod_summary_written", actor=ACTOR, source="agent_autonomous",
         metadata={
-            "message_id": delivered.get("message_id"),
+            "message_ids": delivered["message_ids"],
+            "messages_sent": delivered["sent"],
             "summary_path": written["path"],
-            "idempotent_send": delivered["idempotent"],
+            "idempotent_send": delivered["idempotent_all"],
             "done_count": len(summary_inputs["done_today"]),
-            "open_count": len(summary_inputs["still_open"]),
+            "open_count": items["disposition"]["open_count"],
         },
     ))
     return {
         "ok": True,
         "delivered": True,
-        "idempotent": delivered["idempotent"],
-        "message_id": delivered.get("message_id"),
+        "idempotent": delivered["idempotent_all"],
+        "messages_sent": delivered["sent"],
+        "message_ids": delivered["message_ids"],
         "summary_path": written["path"],
         "summary_changed": written["changed"],
     }

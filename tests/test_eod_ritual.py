@@ -487,10 +487,44 @@ def _read_summary(env):
     return note.read_text() if note.exists() else ""
 
 
-def test_full_eod_run_delivers_one_receipted_message_and_upserts_summary(env, monkeypatch):
-    """A full EOD run delivers exactly ONE receipted message (stubbed sender) carrying the
-    ritual's buttons, upserts a ## EOD Summary to the daily note, and records the
-    end-to-end eod_summary_written audit event -- the U7 happy path."""
+# The per-task ACTION actions: a task's disposition row (done/carry/rsch/drop) and the
+# confirm (appr). The ``top`` picker is DELIBERATELY excluded -- the tomorrow's-#1 chunk
+# is one decision (pick ONE #1 among ~3 candidates), the contract's single allowed
+# multi-button exception; it is not a per-task action grid.
+_PER_TASK_ACTIONS = {"done", "carry", "rsch", "drop", "appr", "snz", "start"}
+
+
+def _task_ids_in_buttons(buttons):
+    """The DISTINCT task_ids the button rows reference, decoded via the tt: codec."""
+    ids = set()
+    for button in buttons or []:
+        decoded = telegram_buttons.decode(button["value"])
+        assert decoded is not None, f"un-decodable callback {button['value']!r}"
+        ids.add(decoded[1])
+    return ids
+
+
+def _action_task_ids_in_buttons(buttons):
+    """The DISTINCT task_ids referenced by PER-TASK ACTION buttons in a message.
+
+    THE REGRESSION GUARD: a single message's per-task action buttons (done/carry/rsch/
+    drop/appr) must reference AT MOST one task_id, or the unreadable multi-task grid (the
+    shipped bug) is back. The ``top`` picker is excluded -- that one chunk is the
+    deliberate single-decision exception (pick one #1 among candidates)."""
+    ids = set()
+    for button in buttons or []:
+        decoded = telegram_buttons.decode(button["value"])
+        assert decoded is not None, f"un-decodable callback {button['value']!r}"
+        action, task_id, _arg = decoded
+        if action in _PER_TASK_ACTIONS:
+            ids.add(task_id)
+    return ids
+
+
+def test_full_eod_run_delivers_a_sequence_of_one_item_messages_and_upserts_summary(env, monkeypatch):
+    """A full EOD run delivers a SEQUENCE of small one-item messages (NOT one mega-message),
+    upserts a ## EOD Summary to the daily note, and records the end-to-end eod_summary_written
+    audit event -- the nag-style happy path that fixes the unreadable single-message grid."""
     import cos_health
 
     _set_productivity_env(monkeypatch)
@@ -502,19 +536,26 @@ def test_full_eod_run_delivers_one_receipted_message_and_upserts_summary(env, mo
     assert result["ok"] is True
     assert result["delivered"] is True
     assert result["idempotent"] is False
-    # Exactly one receipted send, carrying the ritual buttons (>=1: the confirm + the
-    # disposition rows + the tomorrow's-#1 proposal all ride one message).
-    assert len(sender.calls) == 1
-    assert sender.calls[0]["buttons"]
-    assert sender.calls[0]["target"]["chat_id"] == PRODUCTIVITY
-    assert sender.calls[0]["target"]["topic_id"] == DONE_TOPIC
+    # A LIST of messages, not one: the board has 1 detection + 2 open tasks + the #1 step,
+    # so the EOD does 4 receipted sends (one confirm, one disposition per task, one #1).
+    assert len(sender.calls) == 4
+    assert result["messages_sent"] == 4
+    # Every send hit the proven DONE-thread target.
+    assert all(c["target"]["chat_id"] == PRODUCTIVITY for c in sender.calls)
+    assert all(c["target"]["topic_id"] == DONE_TOPIC for c in sender.calls)
+    # REGRESSION GUARD (the bug): NO single message's PER-TASK ACTION buttons reference
+    # more than one task_id. The shipped mega-message crammed Done/Carry/Reschedule/Drop
+    # × N tasks into one grid; here each message carries at most one task's action row.
+    for call in sender.calls:
+        assert len(_action_task_ids_in_buttons(call["buttons"])) <= 1, \
+            f"a single message carried action buttons for >1 task: {call['buttons']!r}"
 
     # The ## EOD Summary was upserted to the daily note (done today / still-open / #1).
     summary = _read_summary(env)
     assert summary.count("## EOD Summary") == 1
     assert "Done today" in summary and "Still open" in summary and "Tomorrow's #1" in summary
 
-    # The end-to-end audit event carries the receipt id + the summary path.
+    # The end-to-end audit event carries the receipt ids + the summary path.
     types = _ledger_event_types(env["ledger"])
     assert "eod_summary_written" in types
 
@@ -524,6 +565,43 @@ def test_full_eod_run_delivers_one_receipted_message_and_upserts_summary(env, mo
     rc = eod_ritual.error_envelope.run_main("eod_review", lambda: eod_ritual.main([]), trigger="cron:eod_review")
     assert rc == 0
     assert "last_success_ts" in cos_health.read_health()["eod_review"]
+
+
+def test_no_eod_message_carries_more_than_one_tasks_buttons(env, monkeypatch):
+    """THE REGRESSION GUARD for the shipped bug: with several open tasks AND a detection,
+    every delivered message's button rows reference AT MOST one task_id. The old EOD packed
+    every task's buttons into one flat grid -- this asserts that can never happen again."""
+    env["work"].write_text("""# Work
+
+## 🔴 Q1
+- [ ] **Add social updates to World Cup skill** task_id::tsk_abc123 area:: Delivery
+- [ ] **Camp coordination for June** task_id::tsk_def456 🗓️2026-06-10 area:: Ops
+- [ ] **Third open task** task_id::tsk_ghi789 area:: Ops
+- [ ] **Fourth open task** task_id::tsk_jkl012 🗓️2026-06-01 area:: Ops
+""")
+    _set_productivity_env(monkeypatch)
+    _stub_sources(monkeypatch, gh_payload=[PR_EVIDENCE])
+    sender = _StubSender()
+
+    result = eod_ritual.run(sender=sender)
+    assert result["delivered"] is True
+
+    # Several messages were sent (a confirm + per-task disposition messages + the #1).
+    assert len(sender.calls) >= 3
+    seen_action_button = False
+    for call in sender.calls:
+        ids = _action_task_ids_in_buttons(call["buttons"])
+        assert len(ids) <= 1, f"a message carried action buttons for >1 task: {ids}"
+        if ids:
+            seen_action_button = True
+    # The guard is non-vacuous: at least one message actually carried a per-task action row.
+    assert seen_action_button
+    # And the ONLY multi-task-button message is the tomorrow's-#1 picker -- whose buttons
+    # are ALL the `top` action (one decision: pick one #1), never a disposition grid.
+    multi = [c for c in sender.calls if len(_task_ids_in_buttons(c["buttons"])) > 1]
+    for call in multi:
+        actions = {telegram_buttons.decode(b["value"])[0] for b in call["buttons"]}
+        assert actions == {"top"}, f"a multi-task message was not the #1 picker: {actions}"
 
 
 def test_confirmed_taps_are_not_coupled_to_delivery(env, monkeypatch):
@@ -599,23 +677,136 @@ def test_blocked_delivery_returns_nonzero_so_run_main_records_failure(env, monke
 
 
 def test_refire_does_not_double_send_or_duplicate_summary(env, monkeypatch):
-    """Re-firing the EOD in the same day does NOT double-send (the outbox idem-key is the
-    local date) and does NOT duplicate the ## EOD Summary (the upsert REPLACES, never
-    appends) -- the idempotency guarantee."""
+    """Re-firing the EOD in the same day does NOT re-send ANY item (each item's per-item
+    idem-key short-circuits to its recorded receipt) and does NOT duplicate the ## EOD
+    Summary (the upsert REPLACES, never appends) -- the per-item idempotency guarantee."""
     _set_productivity_env(monkeypatch)
     _stub_sources(monkeypatch, gh_payload=[PR_EVIDENCE])
     sender = _StubSender()
 
     first = eod_ritual.run(sender=sender)
+    sent_on_first = len(sender.calls)
     second = eod_ritual.run(sender=sender)
 
     assert first["delivered"] is True and first["idempotent"] is False
-    # The second fire short-circuits on the recorded receipt -- delivered, but idempotent.
+    # The second fire short-circuits EVERY item on its recorded receipt -- delivered, but
+    # idempotent (no item re-sent).
     assert second["delivered"] is True and second["idempotent"] is True
-    # The sender was called exactly ONCE across both fires (the second deduped).
-    assert len(sender.calls) == 1
+    # The sender was called only on the FIRST fire (the whole sequence deduped on re-fire).
+    assert len(sender.calls) == sent_on_first
     # Exactly ONE ## EOD Summary on disk -- the re-run replaced, never appended.
     assert _read_summary(env).count("## EOD Summary") == 1
+
+
+def test_refire_with_a_new_open_task_still_sends_only_that_item(env, monkeypatch):
+    """Per-item idem-keys mean a re-fire skips every already-delivered item but a NEW item
+    (a task that became open since the last fire) STILL sends -- one send for the new item,
+    none for the rest."""
+    _set_productivity_env(monkeypatch)
+    _stub_sources(monkeypatch, gh_payload=[])  # no detections, so chunks = disp + #1
+    sender = _StubSender()
+
+    first = eod_ritual.run(sender=sender)
+    assert first["delivered"] is True
+    sent_on_first = len(sender.calls)
+
+    # A third task is added to the board, then the EOD re-fires the same day.
+    env["work"].write_text(env["work"].read_text().replace(
+        "- [ ] **Camp coordination for June** task_id::tsk_def456 area:: Ops",
+        "- [ ] **Camp coordination for June** task_id::tsk_def456 area:: Ops\n"
+        "- [ ] **Brand-new task** task_id::tsk_new999 area:: Ops",
+    ))
+    second = eod_ritual.run(sender=sender)
+
+    assert second["delivered"] is True
+    # NOT fully idempotent: a new item sent. Exactly ONE new send (the new task's
+    # disposition); every prior item deduped on its recorded receipt.
+    assert second["idempotent"] is False
+    assert len(sender.calls) == sent_on_first + 1
+    last = sender.calls[-1]
+    assert _task_ids_in_buttons(last["buttons"]) == {"tsk_new999"}
+
+
+def test_eod_uses_per_item_idem_keys(env, monkeypatch):
+    """The EOD keys each item on its OWN idem-key (eod:<date>:disp:<id> / :conf:<id> / :top),
+    so re-fires dedupe per item rather than as one all-or-nothing send."""
+    import outbox
+    from cos_config import local_today
+
+    _set_productivity_env(monkeypatch)
+    _stub_sources(monkeypatch, gh_payload=[PR_EVIDENCE])
+
+    result = eod_ritual.run(sender=_StubSender())
+    assert result["delivered"] is True
+
+    day = local_today().strftime("%Y-%m-%d")
+    recorded = set(outbox._read_outbox().keys())
+    # Per-item keys: a confirm for the detected task, a disposition per open task, the #1.
+    assert f"eod:{day}:conf:tsk_abc123" in recorded
+    assert f"eod:{day}:disp:tsk_abc123" in recorded
+    assert f"eod:{day}:disp:tsk_def456" in recorded
+    assert f"eod:{day}:top" in recorded
+    # NOT one whole-ritual key (the old single-message design).
+    assert f"eod:{day}" not in recorded
+
+
+def test_disposition_is_capped_and_leads_with_overdue_then_priority(env, monkeypatch):
+    """A big board's disposition is CAPPED to EOD_DISPOSITION_LIMIT per-task messages and
+    LEADS with overdue / high-priority (q1<q2) tasks, summarising the rest as one buttonless
+    "+K more" line -- so a big board does not flood the thread."""
+    monkeypatch.setenv("EOD_DISPOSITION_LIMIT", "2")
+    # q1 overdue, q2 overdue (older), q1 not-due, q3 not-due. Overdue leads, then q1<q2<q3.
+    env["work"].write_text("""# Work
+
+## 🔴 Q1
+- [ ] **Q1 overdue recent** task_id::tsk_q1over 🗓️2026-06-20 area:: Ops
+- [ ] **Q1 not due** task_id::tsk_q1new area:: Ops
+
+## 🟠 Q2
+- [ ] **Q2 overdue old** task_id::tsk_q2over 🗓️2026-06-01 area:: Ops
+
+## 🟢 Q3
+- [ ] **Q3 not due** task_id::tsk_q3new area:: Ops
+""")
+    _set_productivity_env(monkeypatch)
+    _stub_sources(monkeypatch, gh_payload=[])
+
+    payload = eod_ritual.build_disposition_step(now=__import__("datetime").datetime(2026, 6, 23))
+    assert payload["open_count"] == 4
+    # Capped to 2 surfaced items; 2 held back.
+    assert len(payload["items"]) == 2
+    assert payload["remainder_count"] == 2
+    # LEAD order: most-overdue first (the older Q2-overdue beats the recent Q1-overdue on
+    # days-overdue), so the two surfaced are the overdue ones, worst first.
+    surfaced = [item["task_id"] for item in payload["items"]]
+    assert surfaced == ["tsk_q2over", "tsk_q1over"]
+    # The "+K more" remainder is summarised in the preview text (no per-task flood).
+    assert "+2 more" in payload["message"]
+
+
+def test_disposition_remainder_is_a_single_buttonless_message(env, monkeypatch):
+    """The tasks past the cap ride ONE buttonless "+K more open" message, never a
+    message-per-task flood."""
+    monkeypatch.setenv("EOD_DISPOSITION_LIMIT", "1")
+    env["work"].write_text("""# Work
+
+## 🔴 Q1
+- [ ] **First** task_id::tsk_one 🗓️2026-06-01 area:: Ops
+- [ ] **Second** task_id::tsk_two area:: Ops
+- [ ] **Third** task_id::tsk_three area:: Ops
+""")
+    _set_productivity_env(monkeypatch)
+    _stub_sources(monkeypatch, gh_payload=[])
+    sender = _StubSender()
+
+    result = eod_ritual.run(sender=sender)
+    assert result["delivered"] is True
+
+    # Find the remainder message: it mentions "more open" and carries NO buttons.
+    remainder = [c for c in sender.calls if "more open" in c["text"]]
+    assert len(remainder) == 1
+    assert not remainder[0]["buttons"]  # the summary line references no single task
+    assert "+2 more" in remainder[0]["text"]
 
 
 def test_summary_upsert_is_idempotent_replaces_not_appends(env):
