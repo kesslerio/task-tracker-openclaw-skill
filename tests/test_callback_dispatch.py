@@ -270,6 +270,39 @@ def test_stale_top_tap_is_clean_no_pointer_for_dead_id(env):
     assert not (env["state"] / "tomorrow-pointer.json").exists()
 
 
+# --- U10 start: the priority-nag Start button routes to the H7 handle_start -----------------
+
+def test_start_action_maps_to_the_nag_commands_start_verb():
+    # The decode->command routing table maps `start` to nag_commands' `start` verb with the
+    # default button form `["start", "--", <task_id>]` (the `--` argv guard before the id).
+    module, build_argv = callback_dispatch._ACTION_TO_COMMAND["start"]
+    assert module == "nag_commands.py"
+    assert build_argv("tsk_abc123", None, "5") == ["start", "--", "tsk_abc123"]
+
+
+def test_start_tap_routes_through_handle_start(env):
+    """A `start` tap routes to the EXISTING handle_start (H7 initiation loop) -- not the
+    `not_yet_available` stub. We assert routing via the active-board guard handle_start
+    enforces: a tap on a task NOT on the board is refused with handle_start's own
+    `task-not-active` code, which only that command emits -- proving the tap reached it."""
+    res = _result("start:tsk_gone999")
+    assert res.get("action") == "start"          # decoded `start` verb reported
+    assert res.get("reason") != "not_yet_available"  # it IS wired (not a stub)
+    assert res["ok"] is False
+    assert res.get("error", {}).get("code") == "task-not-active"  # handle_start's own guard
+
+
+def test_start_tap_uses_the_argv_dash_guard(env):
+    """The `start` argv inserts `--` before the task id so a flag-shaped id is a literal
+    positional (no argv-flag escape), exactly like the sibling verbs."""
+    # A flag-shaped id (`-x`) is decoded fine (no `:`), routed as `start -- -x`, and treated
+    # as a literal task id -> task-not-active (not parsed as an argparse option).
+    res = _result("start:-x")
+    assert res.get("action") == "start"
+    assert res["ok"] is False
+    assert res.get("error", {}).get("code") == "task-not-active"
+
+
 # --- no raw error leak: a malformed args JSON is a friendly line, exit 0, no traceback -------
 
 def test_malformed_args_json_no_raw_leak(env):

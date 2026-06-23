@@ -1493,3 +1493,223 @@ def test_u3_nag_cron_slot_hours_config(monkeypatch):
     for bad in ("", "   ", "x,y,z"):
         monkeypatch.setenv("NAG_CRON_SLOT_HOURS", bad)
         assert cos_config.nag_cron_slot_hours() == [11, 16]  # degrades, never empty
+
+
+# ===========================================================================
+# U10 -- priority-first nag targeting (KTD-8 / R8)
+# ===========================================================================
+#
+# The intraday nag becomes PRIORITY-FIRST: it chases today's COMMITTED priorities
+# (focus_state daily 2-3 + the U6 tomorrow-pointer #1) that are not yet done -- even
+# at ZERO days overdue -- with /start as the lead action, before a REDUCED overdue
+# tail. These tests pin the U10 invariants: a not-yet-overdue priority is nag-eligible
+# (the whole point), priority leads overdue, the volume cap + /quiet are untouched,
+# Start routes through the existing handle_start, a completed priority is not nagged,
+# and with no committed priorities the nag degrades to the overdue tail (never silent).
+
+import focus_state  # noqa: E402
+import tomorrow_pointer  # noqa: E402
+import telegram_buttons  # noqa: E402
+
+# A board with one OVERDUE non-priority (tsk_old, 20 days late) and one priority task
+# due TODAY (tsk_pri, 0 days overdue -> the old crossed-due-only logic skips it).
+PRIORITY_BOARD = """# Work
+
+## 🟡 Q2
+- [ ] **Re-evaluate ActiveCampaign** task_id::tsk_old 🗓️2026-05-30 area:: Marketing
+- [ ] **Ship the v0.3 nag** task_id::tsk_pri 🗓️2026-06-19 area:: Eng
+"""
+
+
+def _approve_priorities(state_dir, task_ids, *, reference_date="2026-06-19"):
+    """Seed focus-state.json with an APPROVED daily-priorities list for the test day.
+
+    Mirrors the real focus_state shape (the standup's committed daily 2-3). The nag reads
+    this READ-ONLY; we write it here only to simulate a morning standup having run."""
+    rows = [{"task_id": tid, "title": tid, "position": i + 1}
+            for i, tid in enumerate(task_ids)]
+    doc = {
+        "schema_version": focus_state.SCHEMA_VERSION,
+        "date": reference_date,
+        "status": focus_state.STATUS_APPROVED,
+        "daily_priorities": rows,
+        "holding_tank": [],
+        "vetoed": [],
+    }
+    (state_dir).mkdir(parents=True, exist_ok=True)
+    (state_dir / "focus-state.json").write_text(json.dumps(doc), encoding="utf-8")
+
+
+@pytest.fixture
+def pri_harness(tmp_path, monkeypatch):
+    """A board with a due-today priority + a 20-day-overdue non-priority, REF at the
+    11:00 slot, and a state dir the focus-state + pointer are seeded into per-test."""
+    board = tmp_path / "Work Tasks.md"
+    board.write_text(PRIORITY_BOARD, encoding="utf-8")
+    state = tmp_path / "state"
+    _set_env(monkeypatch, board, state)
+    monkeypatch.setattr(nag_check, "_today", lambda: REF)
+    return board, state
+
+
+def test_u10_due_today_priority_is_nag_eligible(pri_harness):
+    """THE failing-test-first contract: a committed priority due TODAY, not done, NOT yet
+    overdue -> appears in the nag with /start as the primary button. The pre-U10
+    overdue-only logic would SKIP it (it has not crossed its due date)."""
+    board, state = pri_harness
+    # Pre-condition: tsk_pri is NOT crossed (due today, 0 days overdue), so the old
+    # crossed-only selection would never include it.
+    _f, _c, records = task_records.load_records(personal=False)
+    active = {r.canonical_id: r for r in task_records.active_records(records) if r.canonical_id}
+    assert nag_check._crossed(active["tsk_pri"], ref=REF) is None  # confirms the gap
+
+    _approve_priorities(state, ["tsk_pri"])
+    sent = []
+    sender = fake_sender(sent)
+    counts = nag_check.run_nag_check(sender=sender)
+
+    fired = " ".join(text for _t, text in sent)
+    assert "tsk_pri" in fired  # the due-today priority IS nagged now
+    # The priority nag is forward-looking (initiation), not "N days overdue".
+    pri_text = next(text for _t, text in sent if "tsk_pri" in text)
+    assert "overdue" not in pri_text.lower()
+    assert "/start tsk_pri" in pri_text
+    # The Start button leads the priority row.
+    idx = next(i for i, (_t, text) in enumerate(sent) if "tsk_pri" in text)
+    rows = sender.button_rows[idx]
+    assert rows is not None
+    assert rows[0]["value"] == telegram_buttons.encode("start", "tsk_pri")
+    assert rows[0]["label"].startswith("▶️")
+
+
+def test_u10_priority_is_nagged_before_overdue_nonpriority(pri_harness):
+    """Ordering: with a committed priority AND a 20-day-overdue non-priority, the priority
+    is nagged FIRST; the stale overdue item lands in the reduced tail behind it."""
+    board, state = pri_harness
+    _approve_priorities(state, ["tsk_pri"])
+    sent = []
+    nag_check.run_nag_check(sender=fake_sender(sent))
+    texts = [text for _t, text in sent]
+    # Both fire (cap is 3), but the priority leads.
+    assert any("tsk_pri" in t for t in texts)
+    assert any("tsk_old" in t for t in texts)
+    pri_idx = next(i for i, t in enumerate(texts) if "tsk_pri" in t)
+    old_idx = next(i for i, t in enumerate(texts) if "tsk_old" in t)
+    assert pri_idx < old_idx  # priority first
+
+
+def test_u10_pointer_top_is_a_priority_even_without_focus_state(pri_harness):
+    """The U6 tomorrow-pointer #1 is a committed priority too: a due-today task set as
+    tomorrow's #1 is nag-eligible even with no focus_state daily list."""
+    board, state = pri_harness
+    state.mkdir(parents=True, exist_ok=True)
+    monkeypatch_pointer = state / "tomorrow-pointer.json"
+    monkeypatch_pointer.write_text(json.dumps({
+        "schema_version": 1, "task_id": "tsk_pri", "title": "Ship the v0.3 nag",
+        "set_at": "2026-06-18T20:00:00+00:00", "source": "eod",
+    }), encoding="utf-8")
+    sent = []
+    sender = fake_sender(sent)
+    nag_check.run_nag_check(sender=sender)
+    assert any("tsk_pri" in text and "/start tsk_pri" in text for _t, text in sent)
+
+
+def test_u10_volume_invariant_cap_and_quiet(tmp_path, monkeypatch):
+    """The volume invariant (KTD-8: reweight, not add). Total nagged still respects
+    NAG_DISPLAY_LIMIT, and /quiet still suppresses every push."""
+    # A board with 1 priority + 4 overdue non-priorities; cap is 3.
+    lines = ["# Work", "", "## 🟡 Q2",
+             "- [ ] **Priority** task_id::tsk_pri 🗓️2026-06-19 area:: Eng"]
+    for i in range(4):
+        lines.append(f"- [ ] **Old {i}** task_id::tsk_old{i} 🗓️2026-05-30 area:: Ops")
+    board = tmp_path / "Work Tasks.md"
+    board.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    state = tmp_path / "state"
+    _set_env(monkeypatch, board, state)
+    monkeypatch.setattr(nag_check, "_today", lambda: REF)
+    monkeypatch.setenv("NAG_DISPLAY_LIMIT", "3")
+    _approve_priorities(state, ["tsk_pri"])
+
+    sent = []
+    counts = nag_check.run_nag_check(limit=3, sender=fake_sender(sent))
+    assert len(sent) <= 3  # the cap holds with priorities in the mix
+    assert counts["sent"] <= 3
+    assert any("tsk_pri" in text for _t, text in sent)  # priority still fires
+
+    # /quiet suppresses EVERYTHING (the cap path is never reached).
+    import quiet_state  # noqa: PLC0415
+    quiet_state.set_lease("manual", REF + timedelta(hours=2), now=REF)
+    sent2 = []
+    counts2 = nag_check.run_nag_check(limit=3, sender=fake_sender(sent2))
+    assert sent2 == []
+    assert counts2.get("quiet") == 1
+
+
+def test_u10_start_routes_through_handle_start(pri_harness, monkeypatch):
+    """Tapping Start runs the EXISTING handle_start initiation loop (no new logic): the
+    same focus session + cue + quiet machinery. We drive handle_start directly with an
+    injected cron stub (the dispatcher path is asserted in test_callback_dispatch)."""
+    board, state = pri_harness
+    import nag_commands  # noqa: PLC0415
+    created = []
+    result = nag_commands.handle_start(
+        "tsk_pri", create_cron=lambda d: created.append(d) or f"c{len(created)}")
+    assert result["ok"] is True
+    assert result["task_id"] == "tsk_pri"
+    assert "cue" in result and result["cue"]  # a resumption cue is stored
+    assert created  # the focus-session check-in crons were scheduled
+
+
+def test_u10_no_committed_priorities_degrades_to_overdue_tail(pri_harness):
+    """Degrade-safe: no committed priorities (the standup was skipped) -> the nag falls
+    back to the overdue tail rather than going silent. The 20-day-overdue tsk_old fires."""
+    board, state = pri_harness
+    # No focus-state, no pointer -> tier-1 is empty.
+    sent = []
+    counts = nag_check.run_nag_check(sender=fake_sender(sent))
+    fired = " ".join(text for _t, text in sent)
+    assert "tsk_old" in fired  # accountability never disappears
+    assert counts["sent"] >= 1
+
+
+def test_u10_completed_priority_is_not_nagged(pri_harness):
+    """A committed priority already off the active board (done) is NOT nagged -- no
+    nagging completed work, even though it is still listed in focus_state."""
+    board, state = pri_harness
+    # tsk_done is a committed priority but NOT on the board (already completed).
+    _approve_priorities(state, ["tsk_done"])
+    sent = []
+    nag_check.run_nag_check(sender=fake_sender(sent))
+    fired = " ".join(text for _t, text in sent)
+    assert "tsk_done" not in fired  # completed work is never nagged
+
+
+def test_u10_disposition_swap_drops_start_button_for_a_snoozed_priority(pri_harness,
+                                                                        monkeypatch):
+    """When a PRIORITY loop has been snoozed past the disposition threshold, the text swaps
+    to the four-way disposition question -- and the button row MUST match it (Done/Snooze/
+    Reschedule, NOT ▶️ Start). Re-offering Start to a multiply-snoozed task would contradict
+    the 'decide it' ask, so text and keyboard must agree."""
+    import cos_config  # noqa: PLC0415
+    board, state = pri_harness
+    _approve_priorities(state, ["tsk_pri"])
+    # Fire once to open a genuine priority loop, then snooze it past the threshold using an
+    # ALREADY-EXPIRED window so it re-fires next cycle carrying the high snooze_count.
+    nag_check.run_nag_check(sender=fake_sender([]))
+    threshold = cos_config.nag_disposition_after_snoozes()
+    expired = (REF - timedelta(hours=1)).isoformat()
+    _snooze_loop_n_times(state, "tsk_pri", threshold, until=expired)
+    assert _state(state)["tsk_pri"]["snooze_count"] == threshold
+
+    monkeypatch.setattr(nag_check, "_today", lambda: REF + timedelta(hours=5))
+    sent = []
+    sender = fake_sender(sent)
+    nag_check.run_nag_check(sender=sender)
+
+    idx = next(i for i, (_t, text) in enumerate(sent) if "tsk_pri" in text)
+    text = sent[idx][1]
+    assert "blocked" in text.lower()  # the disposition prompt fired (not the Start copy)
+    values = [b["value"] for b in (sender.button_rows[idx] or [])]
+    # The disposition keyboard MATCHES the disposition text: NO Start, the standard nag row.
+    assert all(not v.startswith("tt:start:") for v in values)
+    assert any(v.startswith("tt:done:") for v in values)

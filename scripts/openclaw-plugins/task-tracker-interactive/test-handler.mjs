@@ -59,11 +59,18 @@ console.log("routeTap routing contract:");
   eq(r.args.callback_data, "rsch:tsk_abc:2026-06-24", "rsch-date run carries the full payload incl. the date");
 }
 {
-  // each remaining one-shot action routes to run.
-  for (const a of ["carry", "drop", "appr", "top"]) {
+  // each remaining one-shot action routes to run (incl. U10's `start` initiation button).
+  for (const a of ["start", "carry", "drop", "appr", "top"]) {
     const r = routeTap({ payload: `${a}:tsk_x`, senderId: FAKE_SENDER, topicId: FAKE_TOPIC });
     eq(r.kind, "run", `${a} -> run`);
   }
+}
+{
+  // U10: a `start` tap is a one-shot run carrying the full payload + sender/topic verbatim.
+  const r = routeTap({ payload: "start:tsk_pri", senderId: FAKE_SENDER, topicId: FAKE_TOPIC });
+  eq(r, { kind: "run", taskId: "tsk_pri",
+          args: { callback_data: "start:tsk_pri", sender_id: FAKE_SENDER, topic_id: FAKE_TOPIC } },
+    "start -> run with callback_data/sender_id/topic_id verbatim + taskId");
 }
 // unknown / typo'd action and empty payload -> ignored (never run, never throw).
 eq(routeTap({ payload: "frobnicate:tsk_x", senderId: FAKE_SENDER }), { kind: "ignored", action: "frobnicate" },
@@ -114,6 +121,7 @@ eq(parseResult("", 0), { ok: false, action: "none", error: "no result returned" 
 eq(parseResult("garbage", 1).ok, false, "non-JSON stdout + nonzero -> failure result");
 
 check(ackText({ ok: true, action: "done" }).includes("Done"), "done success ack");
+check(/Focus block started|started/i.test(ackText({ ok: true, action: "start" })), "start success ack (U10 initiation)");
 check(ackText({ ok: true, action: "snooze" }).includes("Snoozed"), "snooze success ack");
 check(ackText({ ok: true, action: "reschedule" }).includes("Rescheduled"), "reschedule success ack");
 check(ackText({ ok: true, action: "carry" }).includes("Carried"), "carry success ack");
@@ -210,6 +218,20 @@ async function callHandler(registration, ctx, { result = "", exit = 0, editThrow
   check(edited && /Done/i.test(edited.text || ""), "message edited to 'Done' (via respond.editMessage)");
   check(cleared, "inline keyboard CLEARED via respond.clearButtons (a resolved task keeps no live buttons)");
   check(logs.some((l) => /disposition=done/.test(l)), "tap outcome logged disposition=done");
+}
+
+// U10 start tap -> runner invoked; message edited to the start ack + buttons CLEARED.
+{
+  rmSync(recPath, { force: true });
+  const { r, edited, cleared } = await callHandler(reg,
+    { callback: { payload: "start:tsk_pri" }, senderId: FAKE_SENDER, threadId: 5 },
+    { result: '{"ok":true,"action":"start","task_id":"tsk_pri"}' });
+  eq(r, { handled: true }, "start tap returns {handled:true}");
+  check(existsSync(recPath), "start tap invoked the runner");
+  const args = JSON.parse(readFileSync(recPath, "utf8"));
+  eq(args.callback_data, "start:tsk_pri", "runner got callback_data=start:tsk_pri");
+  check(edited && /start|focus/i.test(edited.text || ""), "start tap edited to the focus-block ack");
+  check(cleared, "start tap clears the inline keyboard");
 }
 
 // stale done tap -> clean "already actioned" edit, NOT a failure, no second board write claim.

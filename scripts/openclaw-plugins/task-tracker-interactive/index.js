@@ -52,7 +52,7 @@ function namespace() {
 // The actions that run a command once on tap (terminal one-shot). `rsch` is NOT here: a bare
 // `rsch` (no date) opens the date-option keyboard instead of running, so it is handled as an
 // edit. `rsch:<date>` IS a run (the payload carries a colon), routed by hasArg below.
-const ONE_SHOT = new Set(["done", "snz", "carry", "drop", "appr", "top"]);
+const ONE_SHOT = new Set(["done", "start", "snz", "carry", "drop", "appr", "top"]);
 
 // Pure routing decision — NO side effects, NO authorization — so it is unit-testable without a
 // live gateway. `payload` is the "<action>:<task_id>[:<arg>]" part AFTER the namespace; senderId
@@ -167,6 +167,7 @@ export function ackText(result) {
   }
   switch (r.action) {
     case "done": return "✅ Done.";
+    case "start": return "▶️ Focus block started — nag muted while you work.";
     case "snooze": return "😴 Snoozed.";
     case "reschedule": return "🗓️ Rescheduled.";
     case "carry": return "➡️ Carried to tomorrow.";

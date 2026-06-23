@@ -229,6 +229,26 @@ def test_disposition_row_has_four_buttons():
     assert actions == ["done", "carry", "rsch", "drop"]
 
 
+def test_encode_start_round_trips():
+    # U10: the new `start` action (the priority-nag initiation lever) encodes/decodes.
+    data = tb.encode("start", TASK)
+    assert data == f"tt:start:{TASK}"
+    assert tb.decode(data) == ("start", TASK, None)
+
+
+def test_start_is_a_known_action():
+    assert "start" in tb.KNOWN_ACTIONS
+
+
+def test_priority_nag_row_leads_with_start():
+    # U10: the priority nag row leads with Start (initiation), then Done / Snooze.
+    row = tb.priority_nag_row(TASK)
+    actions = [tb.decode(b["value"])[0] for b in row]
+    assert actions == ["start", "done", "snz"]
+    assert row[0]["value"] == f"tt:start:{TASK}"
+    assert row[0]["label"].startswith("▶️")
+
+
 def test_row_builder_omits_over_budget_button_keeps_siblings():
     # Size the id so ``tt:done:<id>`` is exactly 64 bytes (fits) but the longer
     # ``tt:snz:<id>:1d`` overflows -> the snooze button drops while done survives.
