@@ -15,6 +15,7 @@ import harvest_window
 
 CONTACT = "-4242424242"
 RAW_BODY = "raw fixture body that must stay private"
+SENTINEL_BODY = "SENTINEL_SMS_BODY_DO_NOT_LOG"
 
 
 def _resolved(day: date = date(2026, 6, 23)):
@@ -44,14 +45,25 @@ def _db(tmp_path: Path) -> Path:
     return path
 
 
-def _insert(path: Path, dialpad_id: int, direction: str, timestamp: str, text: str, contact: str = CONTACT) -> None:
+def _insert_raw_timestamp(
+    path: Path,
+    dialpad_id: int,
+    direction: str,
+    timestamp: int,
+    text: str,
+    contact: str = CONTACT,
+) -> None:
     conn = sqlite3.connect(path)
     conn.execute(
         "INSERT INTO messages (dialpad_id, contact_number, direction, timestamp, text) VALUES (?, ?, ?, ?, ?)",
-        (dialpad_id, contact, direction, _epoch(timestamp), text),
+        (dialpad_id, contact, direction, timestamp, text),
     )
     conn.commit()
     conn.close()
+
+
+def _insert(path: Path, dialpad_id: int, direction: str, timestamp: str, text: str, contact: str = CONTACT) -> None:
+    _insert_raw_timestamp(path, dialpad_id, direction, _epoch(timestamp), text, contact)
 
 
 def test_three_outbound_messages_emit_one_metadata_only_activity(tmp_path, monkeypatch):
@@ -110,6 +122,19 @@ def test_provider_state_changes_when_thread_changes(tmp_path, monkeypatch):
     assert first[0]["provider_state"] != second[0]["provider_state"]
 
 
+def test_millisecond_epoch_row_is_selected_and_converted_to_pacific(tmp_path, monkeypatch):
+    path = _db(tmp_path)
+    monkeypatch.setenv("DIALPAD_SMS_DB", str(path))
+    timestamp_ms = _epoch("2026-06-23T09:15:00-07:00") * 1000
+    _insert_raw_timestamp(path, 1, "outbound", timestamp_ms, "substantive context " * 12)
+
+    records, failed = dialpad_adapter.harvest(resolved=_resolved(), trigger="test")
+
+    assert failed is False
+    assert len(records) == 1
+    assert records[0]["occurred_at"] == "2026-06-23T09:15:00-07:00"
+
+
 def test_missing_db_degrades_as_failed_source(tmp_path, monkeypatch):
     monkeypatch.setenv("TASK_TRACKER_ERROR_LOG", str(tmp_path / "errors.jsonl"))
     monkeypatch.setenv("DIALPAD_SMS_DB", str(tmp_path / "missing.db"))
@@ -118,6 +143,36 @@ def test_missing_db_degrades_as_failed_source(tmp_path, monkeypatch):
 
     assert records == []
     assert failed is True
+
+
+def test_sqlite_error_log_does_not_include_sms_body(tmp_path, monkeypatch):
+    path = tmp_path / "sms.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        CREATE TABLE messages (
+            contact_number TEXT,
+            direction TEXT,
+            timestamp INTEGER,
+            text TEXT
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO messages (contact_number, direction, timestamp, text) VALUES (?, ?, ?, ?)",
+        (CONTACT, "outbound", _epoch("2026-06-23T09:00:00-07:00"), SENTINEL_BODY),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("DIALPAD_SMS_DB", str(path))
+    monkeypatch.setenv("TASK_TRACKER_ERROR_LOG", str(tmp_path / "errors.jsonl"))
+
+    records, failed = dialpad_adapter.harvest(resolved=_resolved(), trigger="test")
+
+    assert records == []
+    assert failed is True
+    raw_log = (tmp_path / "errors.jsonl").read_text()
+    assert SENTINEL_BODY not in raw_log
 
 
 def test_db_is_opened_read_only(tmp_path, monkeypatch):

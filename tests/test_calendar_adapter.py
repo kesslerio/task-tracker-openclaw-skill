@@ -27,6 +27,8 @@ def _event(
     organizer_self: bool = False,
     all_day: bool = False,
     recurring_id: str | None = None,
+    event_type: str | None = None,
+    ical_uid: str | None = None,
 ) -> dict:
     event = {
         "id": event_id,
@@ -42,6 +44,10 @@ def _event(
     if recurring_id:
         event["recurringEventId"] = recurring_id
         event["originalStartTime"] = {"dateTime": start}
+    if event_type:
+        event["eventType"] = event_type
+    if ical_uid:
+        event["iCalUID"] = ical_uid
     return event
 
 
@@ -137,6 +143,40 @@ def test_declined_cancelled_and_all_day_events_are_excluded(monkeypatch):
     assert records == []
 
 
+def test_tentative_needs_action_event_is_excluded(monkeypatch):
+    event = _event("evt_tentative", "Maybe sync", "2026-06-23T09:00:00-07:00", response="needsAction")
+    event["organizer"] = {"email": "other@example.test"}
+    _configure(
+        monkeypatch,
+        [event],
+    )
+
+    records, failed = calendar_adapter.harvest(resolved=_resolved(), trigger="test")
+
+    assert failed is False
+    assert records == []
+
+
+def test_focus_time_event_is_excluded(monkeypatch):
+    _configure(
+        monkeypatch,
+        [
+            _event(
+                "evt_focus",
+                "Focus block",
+                "2026-06-23T09:00:00-07:00",
+                organizer_self=True,
+                event_type="focusTime",
+            )
+        ],
+    )
+
+    records, failed = calendar_adapter.harvest(resolved=_resolved(), trigger="test")
+
+    assert failed is False
+    assert records == []
+
+
 def test_upcoming_accepted_event_is_commitment(monkeypatch):
     _configure(monkeypatch, [_event("evt_future", "Customer call", "2026-06-23T15:00:00-07:00")])
 
@@ -158,6 +198,40 @@ def test_recurring_occurrences_keep_distinct_provider_ids(monkeypatch):
     records, _failed = calendar_adapter.harvest(resolved=_resolved(), trigger="test")
 
     assert {record["provider_id"] for record in records} == {"series_abc_20260623", "series_abc_20260624"}
+
+
+def test_recurring_occurrences_without_ids_use_original_start_provider_ids(monkeypatch):
+    _configure(
+        monkeypatch,
+        [
+            _event("", "Daily check", "2026-06-23T09:00:00-07:00", recurring_id="series_abc"),
+            _event("", "Daily check", "2026-06-23T10:00:00-07:00", recurring_id="series_abc"),
+        ],
+    )
+
+    records, _failed = calendar_adapter.harvest(resolved=_resolved(), trigger="test")
+
+    assert {record["provider_id"] for record in records} == {
+        "series_abc:2026-06-23T09:00:00-07:00",
+        "series_abc:2026-06-23T10:00:00-07:00",
+    }
+
+
+def test_ical_uid_only_occurrences_include_start_in_provider_id(monkeypatch):
+    _configure(
+        monkeypatch,
+        [
+            _event("", "Daily check", "2026-06-23T09:00:00-07:00", ical_uid="uid_abc"),
+            _event("", "Daily check", "2026-06-23T10:00:00-07:00", ical_uid="uid_abc"),
+        ],
+    )
+
+    records, _failed = calendar_adapter.harvest(resolved=_resolved(), trigger="test")
+
+    assert {record["provider_id"] for record in records} == {
+        "uid_abc:2026-06-23T09:00:00-07:00",
+        "uid_abc:2026-06-23T10:00:00-07:00",
+    }
 
 
 def test_dst_overnight_event_lands_on_start_day(monkeypatch):
@@ -186,3 +260,35 @@ def test_gog_non_zero_records_failed_source_health_without_crashing(tmp_path, mo
     assert result["health"]["calendar"]["status"] == "failed"
     receipt = cos_health.read_health()["standup"]["sources"]["calendar"]
     assert receipt["status"] == "failed"
+
+
+def test_gog_timeout_error_log_redacts_access_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("TASK_MGMT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("TASK_TRACKER_ERROR_LOG", str(tmp_path / "errors.jsonl"))
+    monkeypatch.setenv("GOG_ACCESS_TOKEN", "SENTINELTOKEN123")
+    monkeypatch.setenv(
+        "STANDUP_CALENDARS",
+        json.dumps(
+            {
+                "work": {
+                    "cmd": "gog",
+                    "calendar_id": "cal_fixture",
+                    "account": "owner@example.test",
+                    "access_token_env": "GOG_ACCESS_TOKEN",
+                }
+            }
+        ),
+    )
+
+    def fake_run(cmd, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=10)
+
+    monkeypatch.setattr(calendar_adapter.subprocess, "run", fake_run)
+
+    records, failed = calendar_adapter.harvest(resolved=_resolved(), trigger="test")
+
+    assert records == []
+    assert failed is True
+    raw_log = (tmp_path / "errors.jsonl").read_text()
+    assert "SENTINELTOKEN123" not in raw_log
+    assert "<redacted>" in raw_log

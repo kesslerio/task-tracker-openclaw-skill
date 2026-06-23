@@ -18,6 +18,7 @@ import error_envelope
 import harvest_window
 
 COMPONENT = "standup_harvest:calendar"
+_DENIED_EVENT_TYPES = {"birthday", "focusTime", "outOfOffice", "workingLocation"}
 _SUBPROCESS_FAILURES = (
     subprocess.TimeoutExpired,
     subprocess.CalledProcessError,
@@ -108,7 +109,12 @@ def _provider_id(event: dict[str, Any]) -> str:
     original_start = original.get("dateTime") or original.get("date") or ""
     if recurring_id and original_start:
         return f"{recurring_id}:{original_start}"
-    return str(event.get("iCalUID") or "").strip()
+    ical_uid = str(event.get("iCalUID") or "").strip()
+    start = event.get("start") if isinstance(event.get("start"), dict) else {}
+    start_at = str(start.get("dateTime") or start.get("date") or "").strip()
+    if ical_uid and start_at:
+        return f"{ical_uid}:{start_at}"
+    return ical_uid
 
 
 def _provider_state(event: dict[str, Any], *, account: str | None) -> str:
@@ -171,7 +177,7 @@ def _record_from_event(
     account: str | None,
     now: datetime,
 ) -> dict[str, Any] | None:
-    if event.get("eventType") == "birthday":
+    if event.get("eventType") in _DENIED_EVENT_TYPES:
         return None
     start = _event_start(event)
     if start is None:

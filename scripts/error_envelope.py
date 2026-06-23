@@ -79,6 +79,24 @@ _RETRY_COMMAND = {
     "standup": "daily",
     "weekly_review": "weekly",
 }
+_SECRET_FLAGS = (
+    "access-token",
+    "token",
+    "api-key",
+    "apikey",
+    "password",
+    "secret",
+    "auth-token",
+)
+_SECRET_FLAG_PATTERN = "|".join(re.escape(flag) for flag in _SECRET_FLAGS)
+_SECRET_ARG_RE = re.compile(
+    rf"(?i)(--(?:{_SECRET_FLAG_PATTERN})(?:\s+|=))(\S+)"
+)
+_SECRET_ARGV_RE = re.compile(
+    rf"(?i)((['\"])--(?:{_SECRET_FLAG_PATTERN})\2\s*,\s*(['\"]))(.*?)(\3)"
+)
+_BEARER_RE = re.compile(r"(?i)(\bBearer\s+)([^\s,;]+)")
+_AUTHORIZATION_RE = re.compile(r"(?i)(\bAuthorization\s*:\s*)([^\r\n]+)")
 
 
 def error_log_path() -> Path:
@@ -101,6 +119,16 @@ def _has(blob: str, *patterns: str) -> bool:
     or TRANSIENT, so the on-disk ``error_class`` stays trustworthy for querying.
     """
     return any(re.search(rf"\b{p}\b", blob) for p in patterns)
+
+
+def _redact_secrets(raw: str) -> str:
+    """Redact common secret values while preserving surrounding error context."""
+    if not raw:
+        return raw
+    redacted = _SECRET_ARGV_RE.sub(r"\1<redacted>\5", raw)
+    redacted = _SECRET_ARG_RE.sub(r"\1<redacted>", redacted)
+    redacted = _BEARER_RE.sub(r"\1<redacted>", redacted)
+    return _AUTHORIZATION_RE.sub(r"\1<redacted>", redacted)
 
 
 def classify(exc: BaseException | None, *, stderr: str = "") -> str:
@@ -326,7 +354,7 @@ def log_error(
         "check": check,
         "error_class": error_class,
         "message": message,
-        "raw": (raw or "")[:_RAW_TRUNCATE],
+        "raw": _redact_secrets(raw or "")[:_RAW_TRUNCATE],
         "action_taken": action_taken,
         "delivery_target": delivery_target,
     }

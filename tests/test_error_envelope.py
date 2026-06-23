@@ -373,6 +373,51 @@ def test_subprocess_timeout_expired_classifies_transient():
     assert error_envelope.classify(exc) == error_envelope.TRANSIENT
 
 
+def test_log_degraded_redacts_timeout_cmd_access_token(monkeypatch, tmp_path):
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("TASK_MGMT_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("TASK_TRACKER_ERROR_LOG", str(state_dir / "task-tracker-errors.jsonl"))
+    monkeypatch.setenv("TASK_TRACKER_LEDGER_FILE", str(state_dir / "events.jsonl"))
+    exc = subprocess.TimeoutExpired(
+        cmd=["gog", "calendar", "list", "--access-token", "SENTINELTOKEN123"],
+        timeout=10,
+    )
+
+    error_envelope.log_degraded("calendar", exc, trigger="test", check="calendar")
+
+    entry = _error_log_lines(state_dir)[-1]
+    rendered = json.dumps(entry)
+    assert "SENTINELTOKEN123" not in rendered
+    assert "--access-token" in entry["raw"]
+    assert "<redacted>" in entry["raw"]
+
+
+def test_log_degraded_redacts_called_process_stderr_access_token(monkeypatch, tmp_path):
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("TASK_MGMT_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("TASK_TRACKER_ERROR_LOG", str(state_dir / "task-tracker-errors.jsonl"))
+    monkeypatch.setenv("TASK_TRACKER_LEDGER_FILE", str(state_dir / "events.jsonl"))
+    exc = subprocess.CalledProcessError(
+        1,
+        ["gog", "calendar", "list"],
+        stderr=(
+            "fixture failure --access-token SENTINELTOKEN123; "
+            "Bearer SENTINELBEARER456; Authorization: SENTINELAUTH789"
+        ),
+    )
+
+    error_envelope.log_degraded("calendar", exc, trigger="test", check="calendar")
+
+    entry = _error_log_lines(state_dir)[-1]
+    rendered = json.dumps(entry)
+    assert "SENTINELTOKEN123" not in rendered
+    assert "SENTINELBEARER456" not in rendered
+    assert "SENTINELAUTH789" not in rendered
+    assert "--access-token <redacted>" in entry["raw"]
+    assert "Bearer <redacted>" in entry["raw"]
+    assert "Authorization: <redacted>" in entry["raw"]
+
+
 def test_classify_anchored_patterns_avoid_false_positives():
     # A traceback line that merely contains "403" or the word "connection" inside
     # a larger token must NOT be misclassified.

@@ -21,7 +21,6 @@ import error_envelope
 import harvest_window
 
 COMPONENT = "standup_harvest:dialpad_sms"
-DEFAULT_DB = "/home/art/clawd/logs/sms.db"
 _AUTOMATED_PATTERNS = (
     re.compile(r"\bauto(?:mated)?[- ]?reply\b", re.IGNORECASE),
     re.compile(r"\bout of office\b", re.IGNORECASE),
@@ -41,8 +40,11 @@ class Message:
     text: str
 
 
-def _db_path() -> Path:
-    return Path(os.getenv("DIALPAD_SMS_DB") or DEFAULT_DB).expanduser()
+def _db_path() -> Path | None:
+    # Operator-configured via DIALPAD_SMS_DB (no hardcoded private path in a public
+    # repo). Unset -> the source is "not configured" and contributes no candidates.
+    raw = os.getenv("DIALPAD_SMS_DB")
+    return Path(raw).expanduser() if raw else None
 
 
 def _readonly_connection(path: Path) -> sqlite3.Connection:
@@ -171,6 +173,8 @@ def harvest(
     """Return one metadata-only evidence candidate per substantive SMS thread."""
     del query_start, query_end
     path = _db_path()
+    if path is None:
+        return [], False  # DIALPAD_SMS_DB not configured -> no candidates, not a failure
     try:
         messages = _read_messages(path, resolved)
     except (sqlite3.Error, OSError) as exc:
