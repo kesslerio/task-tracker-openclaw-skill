@@ -123,6 +123,46 @@ def record_success(ritual: str) -> None:
         _write_health(state)
 
 
+def record_source_status(
+    ritual: str,
+    source: str,
+    status: str,
+    *,
+    error_class: str | None = None,
+    trigger: str | None = None,
+) -> None:
+    """Stamp a source-level receipt under ``ritual``.
+
+    U2 uses this for standup GitHub/Gmail harvests. U7 can extend the same nested
+    ``sources`` map to calendar/Dialpad and surface it in ``/health`` without
+    changing the write contract.
+    """
+    if status not in {"ok", "partial", "failed"}:
+        status = "failed"
+    ts = _now_iso()
+    with _health_flock():
+        state = _read_health()
+        entry = _entry(state, ritual)
+        sources = entry.get("sources")
+        if not isinstance(sources, dict):
+            sources = {}
+            entry["sources"] = sources
+        existing = sources.get(source)
+        receipt = dict(existing) if isinstance(existing, dict) else {}
+        receipt.update({"status": status, "ts": ts, "trigger": trigger})
+        if status == "ok":
+            receipt["last_success_ts"] = ts
+        else:
+            receipt["last_failure"] = {
+                "error_class": error_class or f"{source}_{status}",
+                "ts": ts,
+                "trigger": trigger,
+            }
+            receipt["last_failure_ts"] = ts
+        sources[source] = receipt
+        _write_health(state)
+
+
 def record_failure(ritual: str, *, error_class: str, trigger: str | None = None) -> None:
     """Record ``ritual``'s most recent failure (class + ts + trigger).
 

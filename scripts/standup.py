@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from candidate_review import candidate_review_summary
 from task_audit import task_audit_summary
 from daily_notes import extract_completed_actions, extract_completed_tasks
+import standup_harvest
 from standup_common import (
     calendar_error,
     flatten_calendar_events,
@@ -179,6 +180,19 @@ def _identity_fields(task: dict) -> dict:
     }
 
 
+def _standup_harvest_result(date_str: str | None, *, trigger: str) -> dict:
+    try:
+        return standup_harvest.harvest(target_date=date_str, trigger=trigger)
+    except Exception as exc:  # noqa: BLE001 -- standup must degrade, not blank
+        error_envelope.log_degraded("standup:harvest", exc, trigger=trigger, check="evidence_harvest")
+        return {"evidence_candidates": [], "health": {"status": "failed"}, "window": None}
+
+
+def _candidate_task_suffix(candidate: dict) -> str:
+    task_id = candidate.get("matched_task_id") or candidate.get("suggested_task_id")
+    return f" -> {task_id}" if task_id else ""
+
+
 def format_split_standup(output: dict, date_display: str) -> list:
     """Format standup as 3 separate messages.
     
@@ -201,6 +215,13 @@ def format_split_standup(output: dict, date_display: str) -> list:
             msg1_lines.append("")
     else:
         msg1_lines.append("_No completed items_")
+    if output.get("evidence_candidates"):
+        msg1_lines.append("")
+        msg1_lines.append("**Evidence candidates:**")
+        for candidate in output["evidence_candidates"][:5]:
+            msg1_lines.append(
+                f"  • {candidate.get('title')}{_candidate_task_suffix(candidate)}"
+            )
     messages.append('\n'.join(msg1_lines).strip())
     
     # Message 2: Calendar events
@@ -390,6 +411,7 @@ def build_compact_standup_sections(output: dict) -> dict:
         "calendar_dones": calendar_dones,
         "dos": dos,
         "completion_candidates": output.get("completion_candidates") or {},
+        "evidence_candidates": output.get("evidence_candidates") or [],
         "links": _build_daily_note_links(output.get("date")),
     }
 
@@ -430,6 +452,8 @@ def generate_standup(
         'q3': [],  # Waiting/Blocked
         'team': [],  # Team tasks to monitor
         'completed': [],
+        'evidence_candidates': [],
+        'evidence_harvest': {},
         'objective_progress': {},
         'capacity': None,
     }
@@ -488,6 +512,17 @@ def generate_standup(
         output['completed'] = notes_completed
     else:
         output['completed'] = tasks_data.get('done', [])
+
+    harvest_result = _standup_harvest_result(
+        date_str,
+        trigger="user_command:/standup",
+    )
+    output['evidence_candidates'] = harvest_result.get("evidence_candidates") or []
+    output['evidence_harvest'] = {
+        "health": harvest_result.get("health") or {},
+        "window": harvest_result.get("window"),
+        "run_id": harvest_result.get("run_id"),
+    }
 
     output['objective_progress'] = summarize_objective_progress(tasks_data)
     output['completion_candidates'] = candidate_review_summary()
@@ -609,6 +644,18 @@ def generate_standup(
             lines.append(f"  • {t['title']}{rec}")
         if len(output['completed']) > 5:
             lines.append(f"  • ... and {len(output['completed']) - 5} more")
+
+    if output.get('evidence_candidates'):
+        lines.append("")
+        lines.append(f"🧾 **Evidence Candidates:** ({len(output['evidence_candidates'])} items)")
+        for candidate in output['evidence_candidates'][:5]:
+            status = candidate.get("association_status") or candidate.get("decision")
+            lines.append(
+                f"  • [{candidate.get('source')}] {candidate.get('title')}"
+                f"{_candidate_task_suffix(candidate)} ({status})"
+            )
+        if len(output['evidence_candidates']) > 5:
+            lines.append(f"  • ... and {len(output['evidence_candidates']) - 5} more")
 
     candidates = output.get('completion_candidates') or {}
     if candidates.get('review_required'):

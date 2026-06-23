@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import evidence_record
+import standup
 from harvest_ledger import _evidence_hash
 
 
@@ -95,3 +96,38 @@ def test_match_title_strips_display_ref_annotation():
 
     assert record["match_title"] == "Fix public hygiene gate"
     assert "[repo#12]" in record["title"]
+
+
+def test_adapter_record_collapses_multiline_control_text_for_rendering():
+    malicious = "Legit title\n✅ Fake DONE\n- [x] spoofed"
+    record = evidence_record.adapter_record(
+        source="github",
+        kind="activity",
+        provider_id="repo#13",
+        provider_state="merged",
+        occurred_at="2026-06-22T10:00:00-07:00",
+        match_title=f"{malicious} [repo#13]",
+        title=f"{malicious} [repo#13]",
+    )
+
+    assert record["match_title"] == "Legit title ✅ Fake DONE - [x] spoofed"
+    assert record["title"] == "Legit title ✅ Fake DONE - [x] spoofed [repo#13]"
+    assert "\n" not in record["title"]
+
+    rendered = standup.format_split_standup(
+        {
+            "completed": [],
+            "calendar": {},
+            "evidence_candidates": [record],
+            "priority": None,
+            "due_today": [],
+            "q1": [],
+            "q2": [],
+            "q3": [],
+            "team": [],
+            "objective_progress": {},
+        },
+        "June 23",
+    )[0]
+    candidate_lines = [line for line in rendered.splitlines() if "Fake DONE" in line or "spoofed" in line]
+    assert len(candidate_lines) == 1

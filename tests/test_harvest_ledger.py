@@ -390,6 +390,93 @@ def test_all_sources_empty_no_push(env, monkeypatch):
     assert "ledger_draft_pushed" not in _ledger_event_types(env["ledger"])
 
 
+def test_weekly_harvest_does_not_ingest_commits_alongside_prs(env, monkeypatch):
+    class Completed:
+        returncode = 0
+        stderr = ""
+
+        def __init__(self, stdout):
+            self.stdout = stdout
+
+    calls = {"commits": 0}
+
+    def fake_run(cmd, **_kwargs):
+        joined = " ".join(cmd)
+        if "search prs" in joined:
+            return Completed(json.dumps([{
+                "title": "Add social updates to World Cup skill",
+                "number": 7,
+                "repository": {"nameWithOwner": "kesslerio/world-cup-soccer-openclaw-skill"},
+                "url": "https://example.test/pr/7",
+            }]))
+        if "search commits" in joined:
+            calls["commits"] += 1
+            return Completed(json.dumps([{
+                "sha": "abc123def456",
+                "repository": {"nameWithOwner": "kesslerio/world-cup-soccer-openclaw-skill"},
+                "url": "https://example.test/commit/abc123def456",
+                "commit": {
+                    "message": "Add social updates to World Cup skill\n\nPR commit",
+                    "committer": {"date": "2026-06-23T17:00:00Z"},
+                },
+            }]))
+        if cmd[0] == "gog":
+            return Completed(json.dumps({"threads": []}))
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(harvest_ledger.subprocess, "run", fake_run)
+
+    result = harvest_ledger.run_harvest("week", since_override=None, dry_run=True, trigger="t")
+
+    assert calls["commits"] == 0
+    assert result["evidence_count"] == 1
+    assert [match["source_type"] for match in result["matches"]] == ["pr"]
+
+
+def test_harvest_parsers_tolerate_bare_string_payload(env, monkeypatch):
+    class Completed:
+        returncode = 0
+        stderr = ""
+        stdout = json.dumps("not-a-container")
+
+    monkeypatch.setattr(harvest_ledger.subprocess, "run", lambda *_args, **_kwargs: Completed())
+
+    github, github_failed = harvest_ledger.harvest_github(
+        "2026-06-23",
+        trigger="t",
+        harvest_commits=True,
+    )
+    gmail, gmail_failed = harvest_ledger.harvest_gmail("2026-06-23", trigger="t")
+
+    assert github == []
+    assert gmail == []
+    assert github_failed is False
+    assert gmail_failed is False
+
+
+def test_gmail_messages_without_real_ids_are_skipped(env, monkeypatch):
+    class Completed:
+        returncode = 0
+        stderr = ""
+        stdout = json.dumps({
+            "threads": [{
+                "id": "thread-1",
+                "subject": "Thread subject",
+                "messages": [
+                    {"subject": "First", "internalDate": "1782200000000"},
+                    {"subject": "Second", "internalDate": "1782200000001"},
+                ],
+            }]
+        })
+
+    monkeypatch.setattr(harvest_ledger.subprocess, "run", lambda *_args, **_kwargs: Completed())
+
+    evidence, failed = harvest_ledger.harvest_gmail("2026-06-23", trigger="t")
+
+    assert evidence == []
+    assert failed is False
+
+
 # --- dedup + weekly reset ----------------------------------------------------
 
 
