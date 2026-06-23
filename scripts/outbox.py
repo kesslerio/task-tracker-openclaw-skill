@@ -83,13 +83,14 @@ def make_idem_key(kind: str, *parts: str) -> str:
 
     ``kind`` must be a known kind (today only ``"nag"``); ``parts`` are the
     identity that makes one logical delivery unique -- for a nag that is
-    ``(task_id, period)`` where ``period`` is the scheduled cron cycle (local
-    date+hour). The identity is deliberately DURABLE: it omits the random
+    ``(task_id, period)`` where ``period`` is the scheduled cron SLOT the fire falls
+    into (``date + slot-hour``; see ``nag_check._nag_slot_period``), NOT the raw
+    wall-clock hour. The identity is deliberately DURABLE: it omits the random
     ``nag_loop_id`` (which is minted before the loop is persisted), so a same-cycle
     retry dedupes to one send EVEN IF the loop state was never written -- closing the
-    first-fire double-send window. A later cycle (new ``period``) is a NEW delivery,
-    so the 11/14/17 re-nag cadence is preserved; only a duplicate of the SAME fire
-    (same task, same cycle) is suppressed.
+    first-fire double-send window. A later slot (new ``period``) is a NEW delivery, so
+    the 11/16 re-nag cadence is preserved; every fire of the SAME slot (the cron fire,
+    a retry, an out-of-band manual run before the next slot) is suppressed to one send.
     """
     if kind not in _KNOWN_KINDS:
         raise ValueError(f"unknown outbox idem-key kind {kind!r}")
@@ -139,7 +140,7 @@ def _prune_outbox(state: dict[str, Any]) -> None:
     """Drop entries older than the retention window so ``outbox.json`` stays flat.
 
     The outbox only needs RECENT periods to dedupe a same-cycle retry; a key from
-    days ago can never collide with a current ``(task_id, date+hour)`` key, so it is
+    days ago can never collide with a current ``(task_id, date+slot)`` key, so it is
     dead weight on every read-modify-write. Pruned in place on write.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(days=outbox_retention_days())
