@@ -49,37 +49,62 @@ MAX_BYTES = 64
 # a fixed field count and ``decode`` is unambiguous.
 _SEP = ":"
 
-# The known actions (KTD-3 table). A frozen set so an unknown/typo'd action is rejected
-# at ``encode`` (returns ``None``) rather than emitting a value the dispatcher can't route.
+# The known actions (KTD-3 table) mapped to their ARG POLICY. ``encode`` enforces the
+# policy so a value carrying an arg the action never takes (or missing a required one) is
+# rejected -- the codec emits ONLY the canonical shapes the row builders produce, and
+# ``decode`` (which U2 imports as the trust-boundary shape check) rejects any forged
+# callback_data outside that set. An unknown/typo'd action is rejected outright.
 #
-# * ``done``  -> mark a task done            (nag, EOD disposition)
-# * ``snz``   -> snooze (arg is the span, e.g. ``1d``)   (nag)
-# * ``rsch``  -> reschedule; no arg = open date options, arg = a target date  (nag, EOD)
-# * ``carry`` -> carry to tomorrow           (EOD disposition)
-# * ``drop``  -> drop to the parking lot      (EOD disposition)
-# * ``appr``  -> confirm a detected completion (EOD confirm-gate)
-# * ``top``   -> set as tomorrow's #1          (EOD)
-KNOWN_ACTIONS: frozenset[str] = frozenset(
-    {"done", "snz", "rsch", "carry", "drop", "appr", "top"}
-)
+# Policies:
+# * ``"none"``     -> the action is task-only; an arg is forbidden.
+# * ``"required"`` -> the action is meaningless without its arg.
+# * ``"optional"`` -> the arg may be present or absent (two distinct canonical forms).
+#
+# * ``done``  none      -> mark a task done                       (nag, EOD disposition)
+# * ``snz``   required  -> snooze; arg is the span, e.g. ``1d``    (nag)
+# * ``rsch``  optional  -> reschedule; no arg = open date options, arg = a target date
+# * ``carry`` none      -> carry to tomorrow                       (EOD disposition)
+# * ``drop``  none      -> drop to the parking lot                 (EOD disposition)
+# * ``appr``  none      -> confirm a detected completion           (EOD confirm-gate)
+# * ``top``   none      -> set as tomorrow's #1                    (EOD)
+_ARG_POLICY: dict[str, str] = {
+    "done": "none",
+    "snz": "required",
+    "rsch": "optional",
+    "carry": "none",
+    "drop": "none",
+    "appr": "none",
+    "top": "none",
+}
+
+# The known actions, derived from the policy map so the two can never drift.
+KNOWN_ACTIONS: frozenset[str] = frozenset(_ARG_POLICY)
 
 
 def encode(action: str, task_id: str, arg: str | None = None) -> str | None:
     """Build a ``tt:<action>:<task_id>[:<arg>]`` callback value, or ``None`` if invalid.
 
     Returns ``None`` (never raises, never a malformed ``tt:`` value) when the action is
-    unknown, the ``task_id``/``arg`` is empty / not a string / contains ``:``, or the
-    assembled value exceeds 64 UTF-8 BYTES. A ``None`` tells the row-builder to drop the
-    button and keep the text command (the drop-fallback).
+    unknown, the ``task_id``/``arg`` is empty / not a string / contains ``:``, the
+    action's ARG POLICY is violated (an arg on a task-only action, or a missing required
+    arg), or the assembled value exceeds 64 UTF-8 BYTES. A ``None`` tells the row-builder
+    to drop the button and keep the text command (the drop-fallback).
     """
-    if action not in KNOWN_ACTIONS:
+    policy = _ARG_POLICY.get(action)
+    if policy is None:  # unknown action
         return None
     if not _is_clean_field(task_id):
         return None
-    parts = [NAMESPACE, action, task_id]
-    if arg is not None:
+    if arg is None:
+        if policy == "required":  # e.g. snooze without its span is meaningless
+            return None
+    else:
+        if policy == "none":  # e.g. done/carry/drop/appr/top never carry an arg
+            return None
         if not _is_clean_field(arg):
             return None
+    parts = [NAMESPACE, action, task_id]
+    if arg is not None:
         parts.append(arg)
     data = _SEP.join(parts)
     if len(data.encode("utf-8")) > MAX_BYTES:

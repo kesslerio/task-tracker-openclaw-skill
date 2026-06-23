@@ -40,10 +40,12 @@ def test_encode_snooze_span_round_trips():
 
 
 def test_every_known_action_round_trips():
+    # snz REQUIRES an arg (its span); the rest round-trip in their no-arg canonical form.
     for action in tb.KNOWN_ACTIONS:
-        data = tb.encode(action, TASK)
+        arg = "1d" if action == "snz" else None
+        data = tb.encode(action, TASK, arg)
         assert data is not None
-        assert tb.decode(data) == (action, TASK, None)
+        assert tb.decode(data) == (action, TASK, arg)
 
 
 # --- byte guard (BYTES, not chars) ----------------------------------------
@@ -80,6 +82,32 @@ def test_encode_at_exactly_64_bytes_is_accepted():
 
 def test_encode_unknown_action_returns_none():
     assert tb.encode("bogus", TASK) is None
+
+
+# --- per-action arg policy (encode emits only canonical KTD-3 shapes) -------
+
+def test_encode_task_only_action_rejects_an_arg():
+    """done/carry/drop/appr/top are task-only -- an arg is not a shape any row builder
+    emits, so encode rejects it (and decode therefore rejects the raw value too)."""
+    for action in ("done", "carry", "drop", "appr", "top"):
+        assert tb.encode(action, TASK) is not None        # the canonical no-arg form is valid
+        assert tb.encode(action, TASK, "x") is None        # an arg is rejected
+        assert tb.decode(f"tt:{action}:{TASK}:x") is None   # round-trip guard rejects it
+
+
+def test_encode_snooze_requires_an_arg():
+    """snz is meaningless without its span -- a bare tt:snz:<id> is not a canonical form."""
+    assert tb.encode("snz", TASK, "1d") is not None  # with a span: valid
+    assert tb.encode("snz", TASK) is None             # without a span: rejected
+    assert tb.decode(f"tt:snz:{TASK}") is None         # round-trip guard rejects the raw value
+
+
+def test_encode_reschedule_arg_is_optional():
+    """rsch has two canonical forms: open picker (no arg) and a target date (arg)."""
+    assert tb.encode("rsch", TASK) is not None                # open picker
+    assert tb.encode("rsch", TASK, "2026-06-24") is not None  # to a date
+    assert tb.decode(f"tt:rsch:{TASK}") == ("rsch", TASK, None)
+    assert tb.decode(f"tt:rsch:{TASK}:2026-06-24") == ("rsch", TASK, "2026-06-24")
 
 
 def test_encode_empty_action_returns_none():
@@ -133,14 +161,14 @@ def test_decode_rejects_missing_task_id():
 
 # --- decode is a TRUE inverse for hostile / raw input ----------------------
 
-def test_decode_only_returns_tuples_encode_can_produce():
-    """The round-trip guard's guarantee: decode NEVER returns a triple that encode could
-    not emit. tt:done:tsk_a:b IS a legitimate encode output -- of (done, task_id='tsk_a',
-    arg='b') -- so decode returns that canonical triple and re-encoding it reproduces the
-    input. (A task_id literally containing ':' is unrepresentable in the scheme and the
-    board never generates one, so there is no ambiguity in practice.)"""
-    assert tb.decode("tt:done:tsk_a:b") == ("done", "tsk_a", "b")
-    assert tb.encode("done", "tsk_a", "b") == "tt:done:tsk_a:b"  # the exact inverse holds
+def test_decode_rejects_arg_on_task_only_action():
+    """The round-trip guard + arg-policy: a task-only action (done/carry/drop/appr/top)
+    never carries an arg, so tt:done:tsk_a:b is NOT an encode output -> decode rejects it
+    (it would otherwise mis-split a ':'-bearing id into task_id+arg). This is what closes
+    the mis-parse for the no-arg actions."""
+    assert tb.encode("done", "tsk_a", "b") is None  # done never carries an arg
+    assert tb.decode("tt:done:tsk_a:b") is None      # so decode rejects the raw value
+    assert tb.decode("tt:carry:tsk_a:x") is None
 
 
 def test_decode_rejects_value_with_extra_colons_in_arg():
