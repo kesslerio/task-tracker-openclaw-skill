@@ -59,6 +59,98 @@ def capacity_line(records=None):
         return None
 
 
+def tomorrow_pointer_line(records=None) -> str:
+    """The standup's OPENING line: tomorrow's #1, resolved from the U6 pointer.
+
+    This is the read side of the standup<->EOD daily loop (KTD-6 / R2). The EOD sets
+    "tomorrow's #1" in ``tomorrow-pointer.json``; this line resolves that pointer against
+    the LIVE active board and opens the standup with it. Four outcomes, mirroring
+    ``tomorrow_pointer.resolve_to_record``:
+
+    * a still-active pointer -> ``🎯 **Today's #1 (set last night):** <live title>``,
+    * an explicit "none" pointer or no pointer file -> ``🎯 **No #1 set — pick one today.**``
+      (the EOD ran on an empty board, or never ran),
+    * a since-completed/dropped pointer -> ``🎯 **Last night's #1 is done — pick a fresh
+      one.**`` (degrade cleanly; NEVER resurface a dead #1).
+
+    NEVER crashes the standup: any resolution failure degrades to the "pick one" line
+    rather than raising, so a broken pointer can never blank the morning standup.
+    """
+    try:
+        import tomorrow_pointer
+
+        if records is None:
+            from task_records import load_records
+
+            _, _, records = load_records(personal=False)
+        resolved = tomorrow_pointer.resolve_to_record(records)
+    except Exception:
+        # A pointer/board read failure must not break the standup: degrade to the
+        # neutral "pick one" line (the same posture read_pointer/resolve already take).
+        return "🎯 **No #1 set — pick one today.**"
+
+    status = resolved.get("status")
+    if status == tomorrow_pointer.STATUS_ACTIVE:
+        return f"🎯 **Today's #1 (set last night):** {resolved.get('title')}"
+    if status == tomorrow_pointer.STATUS_STALE:
+        return "🎯 **Last night's #1 is done — pick a fresh one.**"
+    # STATUS_NONE / STATUS_NO_POINTER both degrade to the same clean prompt.
+    return "🎯 **No #1 set — pick one today.**"
+
+
+# --- U8 deterministic cron descriptor (CODE-ONLY -- no live registration) -------
+#
+# The 8am morning standup runs the task-tracker ``daily`` command as a DETERMINISTIC
+# command cron (``payload.kind == "command"``), replacing the legacy Lobster
+# ``Daily Interactive Work Standup`` agentTurn. This is the deterministic-standup half
+# of R2: the entry the 8am cron runs is the same ``telegram-commands.sh daily`` a user
+# runs by hand -- no LLM relay. The descriptor below is a CODE-ONLY TEMPLATE the operator
+# hands to ``openclaw cron add``; nothing here registers a live cron, edits
+# ``openclaw.json``, or restarts the gateway (the cron swap + the legacy-cron deletion
+# are DEFERRED OPERATOR steps, gated on the U8 parity check). The env-var NAMES (not
+# values) are embedded so the operator resolves the live target at registration time --
+# no real chat id is committed (public-repo hygiene).
+
+# The 8am morning-standup command-cron HOUR (local).
+STANDUP_CRON_HOUR = 8
+
+# The standup announces to the Productivity STANDUP thread (topic 2) -- the working
+# standup surface, NOT the DONE thread the EOD posts to. Env-var NAMES only.
+STANDUP_CHAT_ID_ENV = "TELEGRAM_CHAT_ID_PRODUCTIVITY"
+STANDUP_TOPIC_ID_ENV = "OPENCLAW_TOPIC_PRODUCTIVITY_STANDUP"
+
+
+def standup_cron_descriptor(
+    *, chat_id_env: str = STANDUP_CHAT_ID_ENV, topic_env: str = STANDUP_TOPIC_ID_ENV,
+    scripts_dir: str = "/data/.openclaw/skills/task-tracker/scripts",
+) -> dict:
+    """The deterministic-command-cron descriptor for the 8am standup (CODE-ONLY template).
+
+    Mirrors the U4-nag / U7-EOD cron shape: ``payload.kind == "command"`` (a deterministic
+    argv, NOT an LLM agentTurn), running ``telegram-commands.sh daily`` in the skill's
+    scripts dir, with ``delivery.mode == "announce"`` to the Productivity STANDUP thread.
+    This is a TEMPLATE the operator hands to ``openclaw cron add``; nothing here registers
+    a live cron, edits ``openclaw.json``, or restarts the gateway (a deferred OPERATOR
+    step, gated on the parity check). The env-var NAMES (not values) are embedded so the
+    operator resolves the live target at registration time -- no real chat id is committed.
+    """
+    return {
+        "schedule": {"kind": "daily", "hour": STANDUP_CRON_HOUR, "minute": 0},
+        "payload": {
+            "kind": "command",
+            "argv": [
+                "sh", "-lc",
+                f"cd {scripts_dir} && bash telegram-commands.sh daily",
+            ],
+        },
+        "delivery": {
+            "mode": "announce",
+            "chat_id_env": chat_id_env,
+            "topic_env": topic_env,
+        },
+    }
+
+
 def group_by_area(tasks):
     """Group tasks by area (falls back to department for objectives format tasks)."""
     areas = {}
@@ -400,7 +492,12 @@ def generate_standup(
     output['objective_progress'] = summarize_objective_progress(tasks_data)
     output['completion_candidates'] = candidate_review_summary()
     output['task_audit'] = task_audit_summary(limit=3)
-    
+
+    # U8: the standup OPENS with tomorrow's #1 (the EOD-set pointer), resolved against
+    # the live board. Degrades cleanly (never crashes) to "no #1 set" / "pick a fresh
+    # one". Loads its own records so a pointer read can't be coupled to capacity loading.
+    output['tomorrow_pointer_line'] = tomorrow_pointer_line(records=capacity_records)
+
     if json_output:
         return output
     
@@ -409,7 +506,12 @@ def generate_standup(
     
     # Format as markdown (single message)
     lines = [f"📋 **Daily Standup — {date_display}**\n"]
-    
+
+    # U8: open with tomorrow's #1 (set the prior evening at the EOD), the first content
+    # line of the standup -- the read side of the daily loop.
+    lines.append(output['tomorrow_pointer_line'])
+    lines.append("")
+
     # Calendar events
     cal_err = calendar_error(output['calendar'])
     all_events = flatten_calendar_events(output['calendar'])

@@ -172,3 +172,66 @@ def is_none_pointer(pointer: dict[str, Any] | None) -> bool:
     ``is_none_pointer`` True (explicit none -> clean board), or a real ``task_id``.
     """
     return pointer is not None and pointer.get("task_id") is None
+
+
+# --- U8 read side: resolve the pointer to a live board task -------------------
+#
+# The morning standup (U8) opens with tomorrow's #1. The pointer is the EOD's
+# decision; resolving it against the LIVE board is the read side -- a since-completed
+# (or dropped/rescheduled-off) pointer must NOT show a dead #1, it degrades to
+# "pick one". These statuses are the only contract the standup branches on.
+
+# No pointer file (the EOD never ran) -> standup says "no #1 set -- pick one".
+STATUS_NO_POINTER = "no_pointer"
+# Explicit ``task_id: null`` record (the EOD ran on an empty board) -> "no #1 set".
+STATUS_NONE = "none"
+# The pointer's task is still active on the board -> show it as today's #1.
+STATUS_ACTIVE = "active"
+# The pointer's task is no longer active (done/dropped/rescheduled off) -> degrade
+# to "pick a fresh #1" rather than resurfacing a since-completed item.
+STATUS_STALE = "stale"
+
+
+def resolve_to_record(records: Any) -> dict[str, Any]:
+    """Resolve the persisted pointer against the LIVE active board -- NEVER raises.
+
+    ``records`` is the parsed work-task record list (``task_records.active_records``
+    input). Returns ``{"status", "task_id", "title"}`` where ``status`` is one of the
+    four ``STATUS_*`` constants. This is the standup's read side of the daily loop:
+
+    * ``STATUS_NO_POINTER`` -- no pointer file (the EOD never ran).
+    * ``STATUS_NONE``       -- explicit "none" pointer (EOD ran, empty board).
+    * ``STATUS_ACTIVE``     -- the pointer's task is still active; ``title`` is the
+      LIVE board title (not the stale stored one), so a renamed task shows correctly.
+    * ``STATUS_STALE``      -- the pointer names a task that is no longer active (it was
+      completed / dropped / rescheduled off the board since the EOD set it); the standup
+      degrades to "pick a fresh #1" rather than resurfacing a dead #1.
+
+    A corrupt/missing pointer fails toward ``STATUS_NO_POINTER`` (``read_pointer`` already
+    never raises). A board that cannot be resolved (no records) falls through to ``STALE``
+    for a real pointer -- never a crash and never a confident dead #1.
+    """
+    pointer = read_pointer()
+    if pointer is None:
+        return {"status": STATUS_NO_POINTER, "task_id": None, "title": ""}
+    if is_none_pointer(pointer):
+        return {"status": STATUS_NONE, "task_id": None, "title": ""}
+
+    task_id = pointer.get("task_id")
+    try:
+        from task_records import active_records
+
+        for record in active_records(records or []):
+            if record.canonical_id == task_id:
+                # The LIVE title wins over the stored one (a since-renamed task).
+                return {"status": STATUS_ACTIVE, "task_id": task_id, "title": record.title}
+    except Exception:
+        # A board read/parse failure must never crash the standup: treat an
+        # unresolvable pointer as stale (the standup prompts for a fresh #1).
+        pass
+
+    return {
+        "status": STATUS_STALE,
+        "task_id": task_id,
+        "title": str(pointer.get("title") or ""),
+    }
