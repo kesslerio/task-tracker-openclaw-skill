@@ -79,6 +79,14 @@ def _done_argv(task_id: str, arg: str | None, topic_id: str) -> list[str]:
     return ["done", "--", task_id]
 
 
+def _start_argv(task_id: str, arg: str | None, topic_id: str) -> list[str]:
+    # ``start -- <task_id>``: the default button form (no duration, no cue) -> handle_start
+    # uses the configured default block + the ``Work on: <title>`` cue. The ``start``
+    # subparser slurps ``rest`` with nargs="*", so the ``--`` guard makes a flag-shaped id a
+    # literal positional, and the lone task_id is parsed as the start target.
+    return ["start", "--", task_id]
+
+
 def _snooze_argv(task_id: str, arg: str | None, topic_id: str) -> list[str]:
     return ["snooze", "--", task_id, arg or ""]
 
@@ -108,6 +116,11 @@ def _approve_argv(task_id: str, arg: str | None, topic_id: str) -> list[str]:
 
 _ACTION_TO_COMMAND: dict[str, tuple[str, ArgvBuilder]] = {
     "done": ("nag_commands.py", _done_argv),
+    # U10 priority nag: the ``▶️ Start`` button routes to the EXISTING H7 ``start`` verb
+    # (handle_start) -- the initiation lever for today's committed priorities. No new
+    # initiation logic; a stale tap (task not on the active board) is refused by
+    # handle_start as a structured non-ok result, not pointed at a dead id.
+    "start": ("nag_commands.py", _start_argv),
     "snz": ("nag_commands.py", _snooze_argv),
     "rsch": ("nag_commands.py", _reschedule_argv),
     "appr": ("harvest_ledger.py", _approve_argv),

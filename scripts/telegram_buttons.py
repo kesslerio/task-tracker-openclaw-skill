@@ -61,6 +61,7 @@ _SEP = ":"
 # * ``"optional"`` -> the arg may be present or absent (two distinct canonical forms).
 #
 # * ``done``  none      -> mark a task done                       (nag, EOD disposition)
+# * ``start`` none      -> begin a focus block (the H7 initiation) (PRIORITY nag, U10)
 # * ``snz``   required  -> snooze; arg is the span, e.g. ``1d``    (nag)
 # * ``rsch``  optional  -> reschedule; no arg = open date options, arg = a target date
 # * ``carry`` none      -> carry to tomorrow                       (EOD disposition)
@@ -69,6 +70,7 @@ _SEP = ":"
 # * ``top``   none      -> set as tomorrow's #1                    (EOD)
 _ARG_POLICY: dict[str, str] = {
     "done": "none",
+    "start": "none",
     "snz": "required",
     "rsch": "optional",
     "carry": "none",
@@ -183,6 +185,16 @@ def done_button(task_id: str) -> dict[str, Any] | None:
     return _button("Done", "done", task_id)
 
 
+def start_button(task_id: str) -> dict[str, Any] | None:
+    """``tt:start:<id>`` -- begin a focus block on the task (U10 priority-nag initiation).
+
+    The PRIMARY action on a priority nag: a tap routes through the existing H7
+    ``handle_start`` (cue + timer + muted nag), turning the nag from a guilt-reminder
+    into an initiation lever. ``▶️ Start`` leads the priority row before Done/Snooze.
+    """
+    return _button("▶️ Start", "start", task_id)
+
+
 def snooze_button(task_id: str, span: str = "1d") -> dict[str, Any] | None:
     """``tt:snz:<id>:<span>`` -- snooze the task (nag); default span ``1d``."""
     return _button(f"Snooze {span}", "snz", task_id, span)
@@ -219,11 +231,25 @@ def set_top_button(task_id: str) -> dict[str, Any] | None:
 
 
 def nag_row(task_id: str, *, snooze_span: str = "1d") -> list[dict[str, Any]]:
-    """The nag action row: Done / Snooze / Reschedule. Drops any over-budget button."""
+    """The overdue nag action row: Done / Snooze / Reschedule. Drops any over-budget button."""
     return _row(
         done_button(task_id),
         snooze_button(task_id, snooze_span),
         reschedule_button(task_id),
+    )
+
+
+def priority_nag_row(task_id: str, *, snooze_span: str = "1d") -> list[dict[str, Any]]:
+    """The PRIORITY nag row (U10): ``▶️ Start`` FIRST (initiation), then Done / Snooze.
+
+    Used for today's committed priorities (the ``focus_state`` daily 2-3 + the
+    tomorrow-pointer #1). Start leads because the lever the user needs is INITIATION,
+    not another overdue reminder (KTD-8). A dropped (over-budget) button degrades to the
+    text command exactly as ``nag_row`` does."""
+    return _row(
+        start_button(task_id),
+        done_button(task_id),
+        snooze_button(task_id, snooze_span),
     )
 
 

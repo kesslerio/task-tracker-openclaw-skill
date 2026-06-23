@@ -60,12 +60,14 @@ from typing import Any, Callable
 
 import cos_config
 import error_envelope
+import focus_state
 import nag_delivery
 import nag_state
 import outbox
 import quiet_state
 import task_ledger
 import telegram_buttons
+import tomorrow_pointer
 from task_ledger import append_event, new_event
 from task_records import active_records, load_records
 
@@ -191,6 +193,136 @@ def _sorted_crossed(active: dict[str, Any], *, ref: datetime
     return crossed
 
 
+# --- U10 priority-first targeting (KTD-8) ----------------------------------
+#
+# The intraday nag stops being purely backward-looking (chase the worst-overdue) and
+# becomes PRIORITY-FIRST: tier 1 is today's COMMITTED priorities -- the morning
+# standup's daily 2-3 (focus_state) plus the EOD-set tomorrow-pointer #1 -- that are
+# not yet done, eligible EVEN AT ZERO DAYS OVERDUE (the gap the old crossed-due-only
+# logic left: a task chosen as today's #1 got no nag until it was already late). Tier 2
+# is a REDUCED overdue tail (interim, until U5's EOD disposition is the proven home for
+# stale items), capped WELL UNDER the display limit. This is a REWEIGHT, not an add: the
+# total still respects NAG_DISPLAY_LIMIT, the H5 cadence/slots are untouched, and /quiet
+# still suppresses -- the nag VOLUME does not rise (KTD-8 constraint).
+
+# The overdue tail is capped to a small fraction of the display limit so a long debris
+# pile cannot crowd out the priority tier (or re-inflate volume). At least 1 so a board
+# with no committed priorities still surfaces the worst overdue item (degrade-safe).
+_OVERDUE_TAIL_FRACTION = 0.5
+
+
+def _committed_priority_ids(*, ref: datetime) -> list[str]:
+    """Today's COMMITTED priority task_ids, in nag order: the tomorrow-pointer #1 first,
+    then the focus_state daily 2-3. READ-ONLY over both state files (U10 never writes
+    focus-state.json; the pointer is U6-owned).
+
+    Order matters: the EOD-set #1 leads (it is the single most deliberate commitment),
+    then the standup's daily priorities in their committed order. De-duplicated so a task
+    that is both the pointer #1 AND a daily priority appears once. A missing/stale/skipped
+    standup (focus_state not current or not approved) yields no daily priorities; a missing
+    pointer yields no #1 -- both degrade cleanly to an empty tier-1 (the caller then falls
+    back to the overdue tail, never silent).
+    """
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def _add(task_id: object) -> None:
+        if isinstance(task_id, str) and task_id and task_id not in seen:
+            seen.add(task_id)
+            ordered.append(task_id)
+
+    # The EOD-set tomorrow-pointer #1 leads. A None/none/corrupt pointer contributes
+    # nothing (read_pointer never raises). The explicit "none" record has task_id=None.
+    pointer = tomorrow_pointer.read_pointer()
+    if isinstance(pointer, dict):
+        _add(pointer.get("task_id"))
+
+    # The standup's committed daily 2-3, but ONLY when the proposal is for TODAY and the
+    # user APPROVED it -- a stale (yesterday's) or merely-proposed-not-approved list is not
+    # a commitment to chase. status_for_today() applies the stale-date rule for us.
+    state = focus_state.load_focus_state()
+    if focus_state.status_for_today(state, reference_date=ref.date().isoformat()) \
+            == focus_state.STATUS_APPROVED:
+        for row in (state or {}).get("daily_priorities", []):
+            if isinstance(row, dict):
+                _add(row.get("task_id"))
+    return ordered
+
+
+def _priority_candidates(active: dict[str, Any], priority_ids: list[str], *, ref: datetime
+                         ) -> list[tuple[str, Any, str, int]]:
+    """Tier-1 candidates: today's committed priorities still on the active board, as
+    ``(task_id, record, section, overdue)`` in committed order.
+
+    ``priority_ids`` is the cycle's committed-priority order computed ONCE by the caller
+    (so focus-state + the pointer are not re-read here). A priority is eligible even at
+    ZERO (or negative) days overdue -- the whole point of U10 (the old logic fired only on
+    CROSSED due dates). ``overdue`` is the raw scalar (clamped at >=0; a not-yet-due
+    priority reads 0). ``section`` is the task's threshold section for downstream metadata,
+    defaulting to its quadrant. A priority NOT on the active board (already done/dropped)
+    is skipped -- completed work is never nagged.
+    """
+    candidates: list[tuple[str, Any, str, int]] = []
+    for task_id in priority_ids:
+        record = active.get(task_id)
+        if record is None:
+            continue  # done / off the board -> not nagged (no nagging completed work)
+        section = _threshold_section(record) or "q2"
+        overdue = max(0, _overdue_days(record.due, ref=ref) or 0)
+        candidates.append((task_id, record, section, overdue))
+    return candidates
+
+
+def _two_tier_candidates(active: dict[str, Any], priority_ids: list[str], *,
+                         ref: datetime, limit: int | None
+                         ) -> list[tuple[str, Any, str, int, bool]]:
+    """The U10 candidate order: tier-1 committed priorities (Start-first), then a REDUCED
+    overdue tail, as ``(task_id, record, section, overdue, is_priority)``.
+
+    ``priority_ids`` is the cycle's committed-priority order computed ONCE by the caller
+    (shared with the resolve pass), so the two passes never disagree about which tasks are
+    priorities and the source files are read once per cycle. The overdue tail EXCLUDES any
+    task already in tier-1 (a priority that is also overdue is nagged ONCE, as a priority)
+    and is capped well under ``limit`` so debris never crowds out -- or re-inflates past --
+    the priority tier. The combined list is still sliced to ``limit`` by the caller, so the
+    total respects NAG_DISPLAY_LIMIT (KTD-8: a reweight, never a volume increase). When
+    there are NO committed priorities the tail is the full sorted-crossed list capped only
+    by the caller's ``limit``, so accountability never goes silent (degrade-safe)."""
+    priorities = _priority_candidates(active, priority_ids, ref=ref)
+    priority_id_set = {c[0] for c in priorities}
+
+    tail = [c for c in _sorted_crossed(active, ref=ref) if c[0] not in priority_id_set]
+    # Cap the INTERIM overdue tail (KTD-8: until U5's EOD disposition is the proven home
+    # for stale items). The cap applies ONLY when committed priorities exist -- the tail is
+    # then a small fraction of the limit (>=1) so debris cannot crowd out the priority tier
+    # or re-inflate volume. With NO committed priorities the nag DEGRADES to the full
+    # overdue surface (capped only by the caller's ``limit``), so a skipped standup never
+    # SHRINKS accountability below the prior baseline (degrade-safe; never silent).
+    if limit is not None and priority_id_set:
+        tail = tail[:max(1, int(limit * _OVERDUE_TAIL_FRACTION))]
+
+    combined: list[tuple[str, Any, str, int, bool]] = []
+    combined.extend((tid, rec, sec, ov, True) for tid, rec, sec, ov in priorities)
+    combined.extend((tid, rec, sec, ov, False) for tid, rec, sec, ov in tail)
+    return combined
+
+
+def _is_nag_target(task_id: str, record, *, ref: datetime,
+                   priority_ids: set[str]) -> bool:
+    """True if this loop's task is STILL a nag target this cycle -- a committed priority
+    OR a threshold-crossed overdue task. Used by the resolve pass so a priority loop that
+    is not (yet) overdue is NOT recycled-closed: under the old overdue-only logic the
+    resolve pass cleared any loop whose task was no longer crossed, which would
+    immediately recycle a fresh priority nag. A priority stays a live target until it is
+    done (off the board) or de-committed (dropped from focus_state / the pointer).
+
+    ``priority_ids`` is computed ONCE per cycle by the caller (not re-read per loop) so the
+    resolve pass does not re-open focus-state.json / the pointer for every open loop."""
+    if task_id in priority_ids:
+        return True
+    return _crossed(record, ref=ref) is not None
+
+
 def _firable(entry: dict[str, Any] | None, *, ref: datetime) -> bool:
     """Would this crossed task actually fire this cycle, or is it paused/closed?
 
@@ -237,10 +369,17 @@ def _nag_sent_already_logged(idem_key: str) -> bool:
                for e in events)
 
 
-def _nag_text(record, section: str, overdue: int, *, snooze_count: int = 0) -> str:
+def _nag_text(record, section: str, overdue: int, *, snooze_count: int = 0,
+              priority: bool = False) -> str:
     """Wording for a nag push. Deterministic here; the cron prompt LLM-varies the
     phrasing per fire to reduce habituation (spec §2.1) -- this is the fallback /
     dry-run body and the audit record of what was pushed.
+
+    U10 PRIORITY TIER (KTD-8): a committed priority is reframed FORWARD-LOOKING -- "Your
+    #1 today is X -- start it?" with ``/start`` as the lead action -- instead of the
+    backward-looking "X is N days overdue". The lever for today's commitments is
+    INITIATION, not a guilt reminder. The disposition-after-snoozes escalation still
+    applies on top (a priority snoozed enough times still gets the four-way prompt).
 
     H5 attention-budget: once a loop has been snoozed ``nag_disposition_after_snoozes``
     times (default 2), the review says STOP re-asking the same way and ask for a
@@ -251,6 +390,8 @@ def _nag_text(record, section: str, overdue: int, *, snooze_count: int = 0) -> s
     """
     if snooze_count >= cos_config.nag_disposition_after_snoozes():
         return _disposition_text(record, snooze_count)
+    if priority:
+        return _priority_text(record)
     title = record.title or record.canonical_id or "(untitled)"
     plural = "s" if overdue != 1 else ""
     return (
@@ -258,6 +399,24 @@ def _nag_text(record, section: str, overdue: int, *, snooze_count: int = 0) -> s
         f'"{title}" [{record.canonical_id}] is {overdue} day(s) overdue.\n'
         f"Reply /done {record.canonical_id}, /reschedule {record.canonical_id} <date>, "
         f"or /snooze {record.canonical_id} 1d to clear this."
+    )
+
+
+def _priority_text(record) -> str:
+    """The forward-looking PRIORITY nag (U10): chase initiation of today's commitment.
+
+    Reframes "X is N days overdue" into "Your #1 today is X -- start it?" and leads with
+    ``/start`` (the H7 initiation loop -- cue + timer + muted nag), keeping /done as the
+    quick close. This is the targeting change the Oracle "guilt machine" critique asked
+    for: the surface chases STARTING today's priority, not reminding about old debris.
+    """
+    title = record.title or record.canonical_id or "(untitled)"
+    cid = record.canonical_id
+    return (
+        f"🎯 Your priority today: \"{title}\" [{cid}]\n\n"
+        "Start it? A focus block mutes the nag while you work.\n"
+        f"• /start {cid} -- begin a focus block (the lever is initiation)\n"
+        f"• /done {cid} -- already finished it"
     )
 
 
@@ -285,7 +444,7 @@ def _disposition_text(record, snooze_count: int) -> str:
 
 
 def _authorise_nag(record, section: str, overdue: int, *, dry_run: bool,
-                   snooze_count: int = 0) -> dict[str, Any]:
+                   snooze_count: int = 0, priority: bool = False) -> dict[str, Any]:
     """Prove+gate+assert ONE nag, returning the authorised target + text.
 
     This is the proof chain that MUST pass before any byte leaves: an env-missing /
@@ -300,7 +459,7 @@ def _authorise_nag(record, section: str, overdue: int, *, dry_run: bool,
     and manufacture a phantom undoable nag that was never sent. A dry-run touches
     no append-only state, honouring its documented "preview, no write" contract.
     """
-    text = _nag_text(record, section, overdue, snooze_count=snooze_count)
+    text = _nag_text(record, section, overdue, snooze_count=snooze_count, priority=priority)
     if dry_run:
         proof = nag_delivery.resolve_target()
         if not proof["ok"]:
@@ -309,8 +468,9 @@ def _authorise_nag(record, section: str, overdue: int, *, dry_run: bool,
                 "delivery_target": proof["delivery_target"], "text": text}
 
     task_id = record.canonical_id
-    gated = nag_delivery.prove_and_gate("nag_sent", task_id=task_id,
-                                        metadata={"section": section, "overdue_days": overdue})
+    gated = nag_delivery.prove_and_gate(
+        "nag_sent", task_id=task_id,
+        metadata={"section": section, "overdue_days": overdue, "priority": priority})
     if not gated["ok"]:
         return {"ok": False, "reason": gated["reason"], "stage": gated.get("stage")}
 
@@ -370,6 +530,14 @@ def run_nag_check(*, dry_run: bool = False, limit: int | None = None,
     active = {r.canonical_id: r for r in active_records(records) if r.canonical_id}
     counts = {"open": 0, "sent": 0, "closed": 0, "blocked": 0, "deferred": 0}
 
+    # Compute today's committed priority ids ONCE (read focus-state + the pointer once per
+    # cycle) in committed order. The resolve pass uses the SET to keep a not-yet-overdue
+    # priority loop open instead of recycling it the moment it fires; the fire pass uses the
+    # ORDERED list so tier-1 keeps its committed order (U10). Sharing one computation keeps
+    # the two passes consistent and reads the source files once.
+    priority_ids = _committed_priority_ids(ref=ref)
+    priority_id_set = set(priority_ids)
+
     # 1. Resolve GENUINE open nag loops (those that have actually fired). No push
     #    on resolve. A body-double-only stub (nag_count==0) is NOT a nag loop and
     #    must not be touched here. Two outcomes:
@@ -390,21 +558,27 @@ def run_nag_check(*, dry_run: bool = False, limit: int | None = None,
             if not dry_run:
                 _close(task_id, nag_state.CLOSED_VERIFIED_DONE, entry)
             counts["closed"] += 1
-        elif _crossed(record, ref=ref) is None:
+        # U10: a loop is recycled only when its task is NO LONGER a nag target -- neither a
+        # committed priority NOR threshold-crossed. Keying solely off ``_crossed`` would
+        # recycle a fresh priority nag the moment it fired (a not-yet-overdue #1 is not
+        # crossed), so a priority stays open until it is done (off the board) or
+        # de-committed. Stale overdue still recycles once it falls below threshold.
+        elif not _is_nag_target(task_id, record, ref=ref, priority_ids=priority_id_set):
             if not dry_run:
                 _recycle(task_id, entry)
             counts["closed"] += 1
 
-    # 2. Open / re-fire loops for the worst-overdue tasks that are actually FIRABLE
-    #    this cycle (not acked, not snoozed), capped at ``limit``. Filtering before
-    #    the slice is what makes the cap a top-N-FIRABLE bound rather than
-    #    top-N-CROSSED: a snoozed/acked leader yields its slot so the next real task
-    #    surfaces instead of the surface going silent (the snooze-starvation hole).
-    #    Tasks past the cap are deferred (counted for the "+K more" pointer); paused/
-    #    closed ones are simply not slotted (the user already snoozed/acked them).
-    #    ``max(0, ...)`` keeps a stray negative ``limit`` from slicing off the tail.
+    # 2. Open / re-fire loops for the U10 two-tier candidate set that is actually FIRABLE
+    #    this cycle (not acked, not snoozed), capped at ``limit``. The candidate order is
+    #    PRIORITY-FIRST (KTD-8): today's committed priorities (Start-first) lead, then a
+    #    REDUCED overdue tail -- a reweight, never a volume increase (the cap, /quiet and
+    #    cadence are untouched). Filtering before the slice keeps the cap a top-N-FIRABLE
+    #    bound: a snoozed/acked leader yields its slot so the next real task surfaces
+    #    instead of the surface going silent (the snooze-starvation hole). Tasks past the
+    #    cap are deferred (counted for the "+K more" pointer); paused/closed ones are not
+    #    slotted. ``max(0, ...)`` keeps a stray negative ``limit`` from slicing the tail.
     snapshot = nag_state.read_state()
-    firable = [c for c in _sorted_crossed(active, ref=ref)
+    firable = [c for c in _two_tier_candidates(active, priority_ids, ref=ref, limit=limit)
                if _firable(snapshot.get(c[0]), ref=ref)]
     to_fire = firable if limit is None else firable[:max(0, limit)]
     counts["deferred"] = len(firable) - len(to_fire)
@@ -414,10 +588,11 @@ def run_nag_check(*, dry_run: bool = False, limit: int | None = None,
     # dry-run never delivers, so it appends no pointer (the preview is unchanged).
     pointer = (_more_pointer_line(counts["deferred"])
                if counts["deferred"] > 0 and to_fire and not dry_run else None)
-    for index, (task_id, record, section, overdue) in enumerate(to_fire):
+    for index, (task_id, record, section, overdue, is_priority) in enumerate(to_fire):
         suffix = pointer if index == len(to_fire) - 1 else None
         _fire_one(task_id, record, section, overdue, counts,
-                  ref=ref, dry_run=dry_run, sender=sender, more_pointer=suffix)
+                  ref=ref, dry_run=dry_run, sender=sender, more_pointer=suffix,
+                  priority=is_priority)
 
     return counts
 
@@ -425,7 +600,7 @@ def run_nag_check(*, dry_run: bool = False, limit: int | None = None,
 def _fire_one(task_id, record, section, overdue, counts, *,
               ref: datetime, dry_run: bool,
               sender: Callable[[dict[str, Any], str], dict[str, Any]] | None,
-              more_pointer: str | None = None) -> None:
+              more_pointer: str | None = None, priority: bool = False) -> None:
     """Fire (or skip) ONE task's nag, deciding ack/snooze UNDER the lock.
 
     The whole decision -- re-check ack/snooze, prove+gate+assert, the
@@ -434,6 +609,11 @@ def _fire_one(task_id, record, section, overdue, counts, *,
     acked/snoozed when the lock is held, NO message is sent, NO gate act is logged,
     and state is untouched (closing the 'said /done, got nagged again' trust window
     AND the phantom-gate-act audit hole).
+
+    ``priority`` (U10) selects the forward-looking priority copy + the Start-first button
+    row; it flows straight to ``_authorise_nag`` / ``telegram_buttons``, changing only the
+    PRESENTATION of the same gated, receipted, idempotent send (never the dedup key or
+    cadence).
 
     A dry-run takes no lock and never gates/sends -- it only previews. To stay a
     FAITHFUL preview it applies the same ack/snooze skip the real fire does, so a
@@ -446,7 +626,7 @@ def _fire_one(task_id, record, section, overdue, counts, *,
             return  # the real run would skip this -- preview must too
         snooze_count = int(current.get("snooze_count") or 0) if isinstance(current, dict) else 0
         outcome = _authorise_nag(record, section, overdue, dry_run=True,
-                                 snooze_count=snooze_count)
+                                 snooze_count=snooze_count, priority=priority)
         if outcome["ok"]:
             counts["open"] += 1
         else:
@@ -455,12 +635,13 @@ def _fire_one(task_id, record, section, overdue, counts, *,
 
     result = nag_state.transition(
         lambda live: _fire_locked(live, task_id, record, section, overdue,
-                                  ref=ref, sender=sender, more_pointer=more_pointer))
+                                  ref=ref, sender=sender, more_pointer=more_pointer,
+                                  priority=priority))
     _apply_fire_result(result, task_id, section, counts)
 
 
 def _fire_locked(live, task_id, record, section, overdue, *, ref, sender,
-                 more_pointer=None):
+                 more_pointer=None, priority=False):
     """The under-lock fire decision for ONE task (runs inside nag_state.transition).
 
     Returns a small result dict the caller turns into ledger events + counts. The
@@ -547,7 +728,7 @@ def _fire_locked(live, task_id, record, section, overdue, *, ref, sender,
     # reflects the persisted snooze history, not a stale snapshot.
     snooze_count = int(current.get("snooze_count") or 0) if isinstance(current, dict) else 0
     authorised = _authorise_nag(record, section, overdue, dry_run=False,
-                                snooze_count=snooze_count)
+                                snooze_count=snooze_count, priority=priority)
     if not authorised["ok"]:
         # Carry the act_id + stage through (Fix C): an ASSERT-stage block means gate()
         # already fired (executed act logged) but the seam asserted out, so the caller
@@ -581,13 +762,22 @@ def _fire_locked(live, task_id, record, section, overdue, *, ref, sender,
     # -- no separate ungated pointer push. Appended here so the pointer is part of the
     # exact bytes deliver_once sends and records under the idem-key.
     text = authorised["text"] + (f"\n\n{more_pointer}" if more_pointer else "")
-    # U3: attach the tappable nag action row (Done / Snooze 1d / Reschedule). The
-    # builder drops any over-budget button and keeps the text command as the fallback,
-    # so the existing ``/done``/``/snooze``/``/reschedule`` reply path in the nag body
-    # still works if a button can't be encoded. ``buttons`` is NOT part of the idem-key
-    # (a button message and its text-only twin are the SAME delivery), so it never
-    # changes the dedup behaviour above. An empty row degrades to a plain-text send.
-    buttons = telegram_buttons.nag_row(task_id) or None
+    # U3/U10: attach the tappable nag action row, MATCHED to the rendered text.
+    #   * disposition swap (snoozed >= the H5 threshold): the body asks the four-way
+    #     "blocked/unclear/too big/done?" question and routes to /done or /reschedule, so
+    #     the row is the standard Done/Snooze/Reschedule -- NOT the priority Start row.
+    #     Re-offering ``▶️ Start`` to a multiply-snoozed task contradicts the disposition
+    #     ask (the lever there is decide, not re-initiate), so Start is withheld here.
+    #   * a fresh PRIORITY nag leads with ``▶️ Start`` (the H7 initiation lever) then
+    #     Done/Snooze; an overdue nag keeps Done/Snooze/Reschedule.
+    # The builder drops any over-budget button and keeps the text command as the fallback.
+    # ``buttons`` is NOT part of the idem-key (a button message and its text-only twin are
+    # the SAME delivery), so it never changes the dedup behaviour above.
+    in_disposition = snooze_count >= cos_config.nag_disposition_after_snoozes()
+    if priority and not in_disposition:
+        buttons = telegram_buttons.priority_nag_row(task_id) or None
+    else:
+        buttons = telegram_buttons.nag_row(task_id) or None
     try:
         receipt = outbox.deliver_once(target, text, idem_key, sender=sender,
                                       buttons=buttons)
