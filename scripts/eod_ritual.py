@@ -17,14 +17,28 @@ detection is read-only. The actual confirmation happens later, when the user tap
 a Confirm button -> the U2 dispatcher invokes the existing ``harvest_ledger.approve``
 through the topic-guarded, reversible path. ``eod_ritual`` never auto-approves.
 
-Scope boundary: this module now spans detect + confirm (U4), the forced disposition
-(U5), AND setting tomorrow's #1 (U6). It does NOT build the delivery / cron / Obsidian
-summary (U7) or the morning-standup reader (U8). ``main`` produces the structured
-detect + confirm output, the disposition step, and the tomorrow's-#1 step; live
-delivery is wired by U7. ``eod_review.py`` already parses the daily note for
+Scope boundary: this module spans detect + confirm (U4), the forced disposition (U5),
+setting tomorrow's #1 (U6), AND -- as of U7 -- the live DELIVERY of the assembled ritual
+through the receipt-backed seam, the human-readable Obsidian ``## EOD Summary``, the
+``eod_review`` health record, and the deterministic-cron descriptor. It does NOT build
+the morning-standup reader (U8). ``eod_review.py`` already parses the daily note for
 done/not-done; this unit reuses ``run_harvest`` rather than re-implementing evidence
 detection, and leaves daily-note parsing to ``eod_review`` where the later EOD slices
 need it.
+
+U7 -- delivery + summary + health + cron (KTD-1, KTD-5): the assembled EOD (the detect,
+disposition, and tomorrow's-#1 steps' text + buttons) is delivered through the SAME
+prove -> gate -> assert -> ``outbox.deliver_once`` seam the weekly digest uses
+(``ledger_delivery.deliver_auto_digest``), keyed on the local DATE so a same-day re-fire
+never double-sends. The board mutations U4/U5/U6 commit happen ONLY on the user's taps and
+are NOT coupled to this send: an env-unset / gate-blocked delivery returns a clean reason
+with NO partial send, and the confirmed taps already stand on the board regardless. On a
+delivered EOD the human-readable ``## EOD Summary`` (done today / still-open / tomorrow's
+#1) is upserted to the Obsidian daily note (``eod_summary``; IDEMPOTENT -- a re-run
+REPLACES the section, never appends). ``run_main`` records the REAL ``eod_review`` health
+success/failure (the key is already in ``cos_manifest.EXPECTED_RITUALS``). The
+deterministic cron is a CODE-ONLY descriptor template (``eod_cron_descriptor``) +
+shape-asserting test; live ``openclaw cron add`` registration is a deferred OPERATOR step.
 
 U6 -- set tomorrow's #1 (the loop's WRITE side, KTD-6): the EOD proposes a #1 from the
 board's priority/capacity and renders it with a "Set as tomorrow's #1" button
@@ -54,21 +68,42 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import autonomy_gate
+import cos_config
+import delivery_target
+import eod_summary
 import error_envelope
 import harvest_ledger
 import harvest_state
+import outbox
 import telegram_buttons
 import tomorrow_pointer
+from task_ledger import append_event, new_event
 from task_records import active_records, load_records
 
 COMPONENT = "eod_review"
 TRIGGER = "cron:eod_review"
+ACTOR = "niemand-work"
+
+# The act type the EOD send is gated under: a reversible, message-only push that makes
+# NO board write (the board changes only on the user's later taps). Registered in
+# autonomy_gate.DEFAULT_ACT_TYPE_RUNGS (rung 3) + PUSH_NO_BOARD_WRITE_ACTS.
+EOD_ACT_TYPE = "eod_review_sent"
+
+# The outbox idem-key kind + the env vars the EOD delivery target is proven from. The
+# EOD posts to the Productivity DONE thread (KTD-5 / plan U7: the DONE=DAILY thread is
+# the deploy-time default), the SAME target the weekly ledger digest proves -- so the
+# delivery seam reuses harvest_ledger's exact prove pattern.
+DELIVERY_KIND = "eod"
+CHAT_ID_ENV = "TELEGRAM_CHAT_ID_PRODUCTIVITY"
+TOPIC_ID_ENV = "OPENCLAW_TOPIC_PRODUCTIVITY_DONE"
 
 # The confirm-gate accepts a detection only when the harvest CONFIDENTLY linked it
 # to an open board task -- an ``evidence-link`` (a PR/mail that closes a tracked
@@ -413,6 +448,232 @@ def build_tomorrow_step(*, personal: bool = False) -> dict[str, Any]:
     }
 
 
+# --- U7: assemble the full ritual, deliver it, summarise, record health --------
+
+
+def _assemble(*, personal: bool = False) -> dict[str, Any]:
+    """Run the three EOD steps and bundle their text + buttons into ONE ritual payload.
+
+    Reuses the U4/U5/U6 builders verbatim -- this only composes their structured output.
+    The disposition + tomorrow's-#1 steps may write the empty-board "none" pointer (U6),
+    but NO board task is mutated here: every board change still requires a user tap.
+    """
+    confirm = build_confirm_step()
+    disposition = build_disposition_step(personal=personal)
+    tomorrow = build_tomorrow_step(personal=personal)
+    message = "\n\n".join(
+        step["message"] for step in (confirm, disposition, tomorrow)
+    )
+    # The buttons that ride the send: every detection's Confirm + every open task's
+    # disposition row + the tomorrow's-#1 proposal buttons, in ritual order.
+    buttons: list[dict[str, Any]] = []
+    for det in confirm["detections"]:
+        buttons.extend(det["buttons"])
+    for item in disposition["items"]:
+        buttons.extend(item["buttons"])
+    for cand in tomorrow["candidates"]:
+        buttons.extend(cand["buttons"])
+    return {
+        "confirm": confirm,
+        "disposition": disposition,
+        "tomorrow": tomorrow,
+        "message": message,
+        "buttons": buttons,
+    }
+
+
+def _summary_inputs(assembled: dict[str, Any]) -> dict[str, Any]:
+    """Derive the ``## EOD Summary`` groups from the assembled ritual (no I/O).
+
+    * done today -- the confirmable detections (the work the harvest linked to an open
+      task; the canonical wins live in the ledger, this is the human-readable echo).
+    * still open -- every task the disposition step lists (the board's open set at EOD).
+    * tomorrow's #1 -- the proposed top, or ``None`` on an empty board.
+    """
+    done_today = [det["title"] for det in assembled["confirm"]["detections"]]
+    still_open = [item["title"] for item in assembled["disposition"]["items"]]
+    top = assembled["tomorrow"]["top"]
+    tomorrow_top = top["title"] if top else None
+    return {"done_today": done_today, "still_open": still_open,
+            "tomorrow_top": tomorrow_top}
+
+
+def _resolve_target() -> dict[str, Any]:
+    """Prove the EOD delivery target (the Productivity DONE thread) from env.
+
+    Mirrors ``harvest_ledger._resolve_push_target``: an unset/garbage
+    ``TELEGRAM_CHAT_ID_PRODUCTIVITY`` / ``OPENCLAW_TOPIC_PRODUCTIVITY_DONE`` returns a
+    BLOCKED result and NO send happens -- never a guessed target.
+    """
+    chat_id = os.getenv(CHAT_ID_ENV)
+    topic_id = os.getenv(TOPIC_ID_ENV)
+    return delivery_target.prove_delivery_target(chat_id, topic_id, agent_id=ACTOR)
+
+
+def _prove_gate_authorise() -> dict[str, Any]:
+    """Prove -> gate -> assert the EOD delivery target, returning an authorised target.
+
+    The same proof chain ``nag_delivery``/``harvest_ledger`` use: env proof, then
+    ``autonomy_gate.gate`` (re-proves the target inside the gate, binds an ``act_id``),
+    then ``assert_send_target`` (the gated target is the SOLE permitted destination).
+    Returns ``{"ok": True, "delivery_target", "act_id"}`` or ``{"ok": False, "reason"}``
+    -- a non-ok result means the caller delivers NOTHING (no partial send).
+    """
+    proof = _resolve_target()
+    if not proof["ok"]:
+        return {"ok": False, "reason": proof.get("reason", "env_missing")}
+    gated = autonomy_gate.gate(
+        EOD_ACT_TYPE, delivery_target=proof["delivery_target"], unit="U7",
+        agent_id=ACTOR,
+    )
+    if not gated["ok"]:
+        return {"ok": False, "reason": gated.get("reason", "gate_blocked")}
+    target = gated["delivery_target"]
+    asserted = autonomy_gate.assert_send_target(gated["act_id"], target)
+    if not asserted["ok"]:
+        return {"ok": False, "reason": asserted.get("reason", "target-mismatch")}
+    return {"ok": True, "delivery_target": target, "act_id": gated["act_id"]}
+
+
+def _eod_idem_key(now=None) -> str:
+    """The outbox idem-key for one EOD: ``eod:<YYYY-MM-DD>`` in the local zone.
+
+    Keyed on the local calendar DATE so one EOD delivers per day: a same-day cron retry
+    (or a manual re-fire before midnight) short-circuits to the recorded receipt and
+    never double-sends the evening ritual.
+    """
+    day = (now or cos_config.local_now()).strftime("%Y-%m-%d")
+    return outbox.make_idem_key(DELIVERY_KIND, day)
+
+
+def deliver(
+    assembled: dict[str, Any],
+    *,
+    sender: Callable[..., dict[str, Any]] | None = None,
+    now=None,
+) -> dict[str, Any]:
+    """Deliver the assembled EOD through the receipt-backed seam AT MOST ONCE per day.
+
+    Proves + gates + asserts the DONE-thread target, then hands the ritual text + buttons
+    to ``outbox.deliver_once`` (idempotent, receipt-capturing). A blocked proof/gate
+    returns ``{"ok": False, "reason"}`` with NO send (no partial delivery). A transport
+    failure (the sender raises) is caught and returned as ``{"ok": False,
+    "reason": "delivery_failed:..."}`` -- the board mutations the user already confirmed
+    via taps are NEVER coupled to this send. A successful send (fresh OR an idempotent
+    short-circuit) returns ``{"ok": True, "message_id", "idempotent"}``.
+    """
+    authorised = _prove_gate_authorise()
+    if not authorised["ok"]:
+        return {"ok": False, "reason": authorised["reason"]}
+    idem_key = _eod_idem_key(now=now)
+    try:
+        receipt = outbox.deliver_once(
+            authorised["delivery_target"], assembled["message"], idem_key,
+            sender=sender or outbox.openclaw_sender, buttons=assembled["buttons"],
+        )
+    except Exception as exc:  # noqa: BLE001 -- a send failure is a delivery block, not a
+        # crash: nothing partial leaves, the confirmed taps already stand on the board.
+        return {"ok": False, "reason": f"delivery_failed:{type(exc).__name__}",
+                "message": str(exc)}
+    return {
+        "ok": True,
+        "message_id": receipt.get("message_id"),
+        "idempotent": bool(receipt.get("idempotent")),
+        "delivery_target": authorised["delivery_target"],
+    }
+
+
+def run(*, personal: bool = False, sender: Callable[..., dict[str, Any]] | None = None,
+        now=None) -> dict[str, Any]:
+    """The full U7 EOD: assemble -> deliver -> upsert ## EOD Summary -> audit.
+
+    Returns ``{"ok", "delivered", "reason"?, "summary_path", "message_id"?}``. The board
+    mutations from U4/U5/U6 already committed ONLY on the user's taps and are independent
+    of delivery: a blocked/failed send leaves ``ok: False`` (so ``run_main`` records an
+    ``eod_review`` health FAILURE) but never partially sends and never touches those
+    confirmed taps. The ``## EOD Summary`` is upserted ONLY on a delivered EOD (idempotent
+    -- a re-fire replaces the section, never appends), and the ``eod_summary_written``
+    audit event carries the receipt id + the note path so a replay can prove the ritual
+    ran end-to-end.
+    """
+    assembled = _assemble(personal=personal)
+    delivered = deliver(assembled, sender=sender, now=now)
+    if not delivered["ok"]:
+        return {"ok": False, "delivered": False, "reason": delivered["reason"]}
+
+    summary_inputs = _summary_inputs(assembled)
+    written = eod_summary.write_summary(
+        done_today=summary_inputs["done_today"],
+        still_open=summary_inputs["still_open"],
+        tomorrow_top=summary_inputs["tomorrow_top"],
+    )
+    append_event(new_event(
+        "eod_summary_written", actor=ACTOR, source="agent_autonomous",
+        metadata={
+            "message_id": delivered.get("message_id"),
+            "summary_path": written["path"],
+            "idempotent_send": delivered["idempotent"],
+            "done_count": len(summary_inputs["done_today"]),
+            "open_count": len(summary_inputs["still_open"]),
+        },
+    ))
+    return {
+        "ok": True,
+        "delivered": True,
+        "idempotent": delivered["idempotent"],
+        "message_id": delivered.get("message_id"),
+        "summary_path": written["path"],
+        "summary_changed": written["changed"],
+    }
+
+
+# --- U7 deterministic cron descriptor (CODE-ONLY -- no live registration) -------
+
+# The 18:00 EOD command-cron HOUR (local). A documented template only; the OPERATOR
+# registers the live cron with ``openclaw cron add`` -- this code never calls it.
+EOD_CRON_HOUR = 18
+
+
+def eod_cron_descriptor(
+    *, chat_id_env: str = CHAT_ID_ENV, topic_env: str = TOPIC_ID_ENV,
+    scripts_dir: str = "/data/.openclaw/skills/task-tracker/scripts",
+) -> dict[str, Any]:
+    """The deterministic-command-cron descriptor for the EOD (CODE-ONLY template).
+
+    Mirrors the U4-nag cron shape: ``payload.kind == "command"`` (a deterministic argv,
+    NOT an LLM agentTurn), running ``telegram-commands.sh eod`` in the skill's scripts
+    dir, with ``delivery.mode == "announce"`` to the Productivity DONE thread. This is a
+    TEMPLATE the operator hands to ``openclaw cron add``; nothing here registers a live
+    cron, edits ``openclaw.json``, or restarts the gateway (a deferred OPERATOR step). The
+    env-var NAMES (not values) are embedded so the operator resolves the live target at
+    registration time -- no real chat id is committed.
+    """
+    return {
+        "schedule": {"kind": "daily", "hour": EOD_CRON_HOUR, "minute": 0},
+        "payload": {
+            "kind": "command",
+            "argv": [
+                "sh", "-lc",
+                f"cd {scripts_dir} && bash telegram-commands.sh eod",
+            ],
+        },
+        "delivery": {
+            "mode": "announce",
+            "chat_id_env": chat_id_env,
+            "topic_env": topic_env,
+        },
+    }
+
+
+def _render_run_text(payload: dict[str, Any]) -> str:
+    """Plain-text rendering for the full EOD run (the delivery + summary outcome)."""
+    if not payload["delivered"]:
+        return error_envelope.degraded_notice("eod review")
+    summary = "summary updated" if payload.get("summary_changed") else "summary unchanged"
+    dedup = " (already delivered today)" if payload.get("idempotent") else ""
+    return f"EOD delivered{dedup}; {summary}."
+
+
 def _render_text(payload: dict[str, Any]) -> str:
     """The plain-text rendering for a non-JSON CLI run (the message + a count line)."""
     lines = [payload["message"]]
@@ -448,11 +709,13 @@ def _render_tomorrow_text(payload: dict[str, Any]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="EOD ritual: detect completions (confirm) + force a disposition + set tomorrow's #1"
+        description="EOD ritual: deliver the full evening ritual (default), or preview one step"
     )
     parser.add_argument("--json", action="store_true", help="Structured JSON output")
-    parser.add_argument("--step", choices=["detect", "disposition", "tomorrow"], default="detect",
-                        help="which EOD step to render (default: detect)")
+    parser.add_argument(
+        "--step", choices=["detect", "disposition", "tomorrow"], default=None,
+        help="preview ONE step (read-only, no delivery); default is the full delivered run",
+    )
     args = parser.parse_args(argv)
 
     if args.step == "disposition":
@@ -461,9 +724,20 @@ def main(argv: list[str] | None = None) -> int:
     elif args.step == "tomorrow":
         payload = build_tomorrow_step()
         render = _render_tomorrow_text
-    else:
+    elif args.step == "detect":
         payload = build_confirm_step()
         render = _render_text
+    else:
+        # The default (the `eod` command): assemble + DELIVER the full ritual, upsert the
+        # ## EOD Summary, and let run_main record eod_review health. A blocked/failed
+        # delivery returns ok:False -> a nonzero exit -> run_main records a health FAILURE
+        # (the confirmed taps already stand on the board; nothing partial leaves).
+        payload = run()
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        else:
+            print(_render_run_text(payload))
+        return 0 if payload["ok"] else 1
     if args.json:
         print(json.dumps(payload, indent=2, sort_keys=True, default=str))
     else:

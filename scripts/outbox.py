@@ -63,7 +63,10 @@ from utils import _atomic_write
 #   period) is the dedupe identity: one digest per window per kind, so a cron retry
 #   AFTER a successful send short-circuits to the recorded receipt and never
 #   double-sends the same Friday digest.
-_KNOWN_KINDS: frozenset[str] = frozenset({"nag", "checkin", "ledger"})
+# * ``eod`` -- a U7 EOD ritual delivery, keyed on the local CALENDAR DATE. One EOD per
+#   day: a same-day cron retry (or a manual re-fire before midnight) short-circuits to
+#   the recorded receipt and never double-sends the evening ritual.
+_KNOWN_KINDS: frozenset[str] = frozenset({"nag", "checkin", "ledger", "eod"})
 
 
 def _now_iso() -> str:

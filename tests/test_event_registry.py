@@ -39,6 +39,9 @@ REQUIRED_NEW_TYPES = [
     # U6 -- set tomorrow's #1 (the loop's write side). Dual-registration contract:
     # MUST also be in task_ledger.KNOWN_EVENT_TYPES (this test asserts both match).
     "eod_tomorrow_top_set",
+    # U7 -- the EOD delivered + ## EOD Summary upserted (end-to-end proof). Dual-
+    # registration contract: MUST also be in task_ledger.KNOWN_EVENT_TYPES.
+    "eod_summary_written",
 ]
 
 

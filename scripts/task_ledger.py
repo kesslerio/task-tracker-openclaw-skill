@@ -153,6 +153,12 @@ KNOWN_EVENT_TYPES: frozenset[str] = frozenset({
     # of WHICH task became tomorrow's #1 and when. MUST stay in lockstep with
     # tests/test_event_registry.REQUIRED_NEW_TYPES.
     "eod_tomorrow_top_set",
+    # U7 -- the EOD is DELIVERED through the receipt-backed seam and its human-readable
+    # ## EOD Summary is upserted to the Obsidian daily note. This event is the proof the
+    # full EOD ran end-to-end (delivered + summarised), carrying the receipt message_id +
+    # the summary note path. MUST stay in lockstep with
+    # tests/test_event_registry.REQUIRED_NEW_TYPES.
+    "eod_summary_written",
 })
 
 # Canonical actor sources. "agent_autonomous" is the source every agent-initiated

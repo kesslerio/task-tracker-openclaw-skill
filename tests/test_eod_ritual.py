@@ -245,11 +245,13 @@ def test_broken_harvest_source_still_completes(env, monkeypatch):
 # --- CLI: main() emits the structured payload and exits 0 --------------------
 
 
-def test_main_json_exits_zero_and_emits_payload(env, monkeypatch, capsys):
+def test_main_json_detect_step_exits_zero_and_emits_payload(env, monkeypatch, capsys):
+    # The detect/confirm preview is now behind `--step detect` (the default is the full
+    # delivered run, U7). The read-only preview never delivers, so a stubbed harvest is enough.
     _set_productivity_env(monkeypatch)
     _stub_sources(monkeypatch, gh_payload=[PR_EVIDENCE])
 
-    rc = eod_ritual.main(["--json"])
+    rc = eod_ritual.main(["--json", "--step", "detect"])
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
     assert out["step"] == "detect_confirm"
@@ -457,3 +459,236 @@ def test_tomorrow_main_step_flag_emits_payload(env, capsys):
     assert out["step"] == "tomorrow_top"
     assert out["has_open"] is True
     assert out["top"]["buttons"][0]["value"].startswith("tt:top:")
+
+
+# --- U7: delivery seam + ## EOD Summary upsert + health + cron descriptor ---------
+
+
+class _StubSender:
+    """A fake receipt-returning sender: records every (target, text, buttons) call.
+
+    Mirrors the production ``openclaw_sender`` contract -- returns ``{"message_id": ...}``
+    -- so ``deliver_once`` records a real receipt and the idem-key dedup is exercised.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, target, text, buttons=None):
+        self.calls.append({"target": target, "text": text, "buttons": buttons})
+        return {"message_id": f"msg-{len(self.calls)}"}
+
+
+def _read_summary(env):
+    """Read the day's daily note (the ## EOD Summary lands here), or '' if absent."""
+    from cos_config import local_today
+
+    note = env["daily"] / f"{local_today().strftime('%Y-%m-%d')}.md"
+    return note.read_text() if note.exists() else ""
+
+
+def test_full_eod_run_delivers_one_receipted_message_and_upserts_summary(env, monkeypatch):
+    """A full EOD run delivers exactly ONE receipted message (stubbed sender) carrying the
+    ritual's buttons, upserts a ## EOD Summary to the daily note, and records the
+    end-to-end eod_summary_written audit event -- the U7 happy path."""
+    import cos_health
+
+    _set_productivity_env(monkeypatch)
+    _stub_sources(monkeypatch, gh_payload=[PR_EVIDENCE])
+    sender = _StubSender()
+
+    result = eod_ritual.run(sender=sender)
+
+    assert result["ok"] is True
+    assert result["delivered"] is True
+    assert result["idempotent"] is False
+    # Exactly one receipted send, carrying the ritual buttons (>=1: the confirm + the
+    # disposition rows + the tomorrow's-#1 proposal all ride one message).
+    assert len(sender.calls) == 1
+    assert sender.calls[0]["buttons"]
+    assert sender.calls[0]["target"]["chat_id"] == PRODUCTIVITY
+    assert sender.calls[0]["target"]["topic_id"] == DONE_TOPIC
+
+    # The ## EOD Summary was upserted to the daily note (done today / still-open / #1).
+    summary = _read_summary(env)
+    assert summary.count("## EOD Summary") == 1
+    assert "Done today" in summary and "Still open" in summary and "Tomorrow's #1" in summary
+
+    # The end-to-end audit event carries the receipt id + the summary path.
+    types = _ledger_event_types(env["ledger"])
+    assert "eod_summary_written" in types
+
+    # eod_review health SUCCESS is recorded when the full run delivers under the envelope
+    # (eod_review is already in cos_manifest.EXPECTED_RITUALS -- U7 wires the REAL signal).
+    monkeypatch.setattr(eod_ritual.outbox, "openclaw_sender", sender)
+    rc = eod_ritual.error_envelope.run_main("eod_review", lambda: eod_ritual.main([]), trigger="cron:eod_review")
+    assert rc == 0
+    assert "last_success_ts" in cos_health.read_health()["eod_review"]
+
+
+def test_confirmed_taps_are_not_coupled_to_delivery(env, monkeypatch):
+    """The board mutations U4/U5/U6 commit happen ONLY on taps; a delivery never mutates
+    the board. A full run with a working sender leaves the board byte-for-byte unchanged
+    (the EOD only RENDERS buttons; the user's taps -- elsewhere -- are what mutate)."""
+    _set_productivity_env(monkeypatch)
+    _stub_sources(monkeypatch, gh_payload=[PR_EVIDENCE])
+    board_before = env["work"].read_text()
+
+    result = eod_ritual.run(sender=_StubSender())
+    assert result["delivered"] is True
+
+    # No board mutation rode the delivery -- both tasks are still open + unchecked.
+    assert env["work"].read_text() == board_before
+
+
+def test_env_unset_blocks_clean_no_partial_send(env, monkeypatch):
+    """Env unset -> the EOD is BLOCKED with a clear reason, NO partial send, and NO
+    ## EOD Summary written. The confirmed taps (elsewhere) are untouched -- delivery
+    failure is decoupled from board state."""
+    # Deliberately do NOT set the productivity env; clear any inherited value.
+    monkeypatch.delenv("TELEGRAM_CHAT_ID_PRODUCTIVITY", raising=False)
+    monkeypatch.delenv("OPENCLAW_TOPIC_PRODUCTIVITY_DONE", raising=False)
+    _stub_sources(monkeypatch, gh_payload=[PR_EVIDENCE])
+    sender = _StubSender()
+
+    result = eod_ritual.run(sender=sender)
+
+    assert result["ok"] is False
+    assert result["delivered"] is False
+    assert result["reason"] == "env_missing"
+    # NOTHING left: no send, no summary file, no end-to-end audit event.
+    assert sender.calls == []
+    assert _read_summary(env) == ""
+    assert "eod_summary_written" not in _ledger_event_types(env["ledger"])
+
+
+def test_forced_failure_records_eod_review_health_failure(env, monkeypatch):
+    """A forced failure inside the EOD records an eod_review health FAILURE through the
+    run_main envelope (so /health flags it), with no raw error leak."""
+    import cos_health
+
+    _set_productivity_env(monkeypatch)
+    _stub_sources(monkeypatch, gh_payload=[PR_EVIDENCE])
+
+    def boom():
+        raise RuntimeError("forced EOD failure")
+
+    monkeypatch.setattr(eod_ritual, "run", boom)
+    rc = eod_ritual.error_envelope.run_main("eod_review", lambda: eod_ritual.main([]), trigger="cron:eod_review")
+    # The envelope swallows the crash to a friendly exit 0...
+    assert rc == 0
+    # ...but the machine-visible health is a FAILURE.
+    entry = cos_health.read_health()["eod_review"]
+    assert "last_failure" in entry
+
+
+def test_blocked_delivery_returns_nonzero_so_run_main_records_failure(env, monkeypatch):
+    """A blocked delivery (env unset) makes main() return nonzero, which run_main turns
+    into an eod_review health FAILURE -- a blocked EOD must not false-green."""
+    import cos_health
+
+    monkeypatch.delenv("TELEGRAM_CHAT_ID_PRODUCTIVITY", raising=False)
+    monkeypatch.delenv("OPENCLAW_TOPIC_PRODUCTIVITY_DONE", raising=False)
+    _stub_sources(monkeypatch, gh_payload=[])
+
+    # main() returns 1 on a blocked delivery; run_main records the FAILURE and returns the
+    # diagnostic code verbatim (coercing the cron-relay exit-0 is the shell wrapper's job).
+    rc = eod_ritual.error_envelope.run_main("eod_review", lambda: eod_ritual.main([]), trigger="cron:eod_review")
+    assert rc == 1
+    assert "last_failure" in cos_health.read_health()["eod_review"]
+
+
+def test_refire_does_not_double_send_or_duplicate_summary(env, monkeypatch):
+    """Re-firing the EOD in the same day does NOT double-send (the outbox idem-key is the
+    local date) and does NOT duplicate the ## EOD Summary (the upsert REPLACES, never
+    appends) -- the idempotency guarantee."""
+    _set_productivity_env(monkeypatch)
+    _stub_sources(monkeypatch, gh_payload=[PR_EVIDENCE])
+    sender = _StubSender()
+
+    first = eod_ritual.run(sender=sender)
+    second = eod_ritual.run(sender=sender)
+
+    assert first["delivered"] is True and first["idempotent"] is False
+    # The second fire short-circuits on the recorded receipt -- delivered, but idempotent.
+    assert second["delivered"] is True and second["idempotent"] is True
+    # The sender was called exactly ONCE across both fires (the second deduped).
+    assert len(sender.calls) == 1
+    # Exactly ONE ## EOD Summary on disk -- the re-run replaced, never appended.
+    assert _read_summary(env).count("## EOD Summary") == 1
+
+
+def test_summary_upsert_is_idempotent_replaces_not_appends(env):
+    """The ## EOD Summary writer REPLACES its section on a re-run (idempotent), never
+    appends a second one -- proven directly on the writer (no delivery dependency)."""
+    import eod_summary
+
+    first = eod_summary.write_summary(
+        done_today=["A"], still_open=["B"], tomorrow_top="C"
+    )
+    assert first["changed"] is True
+    # Same inputs -> byte-identical file (no change, no second section).
+    second = eod_summary.write_summary(
+        done_today=["A"], still_open=["B"], tomorrow_top="C"
+    )
+    assert second["changed"] is False
+    note = Path(first["path"])
+    assert note.read_text().count("## EOD Summary") == 1
+
+    # Changed inputs -> the section is REPLACED in place (still exactly one).
+    third = eod_summary.write_summary(
+        done_today=["A", "X"], still_open=[], tomorrow_top=None
+    )
+    assert third["changed"] is True
+    text = note.read_text()
+    assert text.count("## EOD Summary") == 1
+    assert "- X" in text
+    assert "_No #1 set_" in text  # empty tomorrow renders the explicit placeholder
+    assert "_Board is clear_" in text  # empty still-open renders its placeholder
+
+
+def test_summary_upsert_preserves_surrounding_sections(env):
+    """An existing daily note keeps its other sections; only ## EOD Summary is swapped."""
+    import eod_summary
+    from cos_config import local_today
+
+    note = env["daily"] / f"{local_today().strftime('%Y-%m-%d')}.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text("# Daily\n\n## Notes\n- keep me\n\n## EOD Summary\n\nold\n")
+
+    eod_summary.write_summary(done_today=["new"], still_open=[], tomorrow_top=None)
+
+    text = note.read_text()
+    assert "## Notes" in text and "- keep me" in text  # neighbour section preserved
+    assert text.count("## EOD Summary") == 1
+    assert "- new" in text and "old" not in text  # the summary body was replaced
+
+
+# --- U7 cron descriptor: CODE-ONLY shape (no live registration) ------------------
+
+
+def test_eod_cron_descriptor_is_a_command_cron_to_the_done_thread():
+    """The EOD cron descriptor is a DETERMINISTIC command cron (payload.kind == 'command')
+    that runs telegram-commands.sh eod and announces to the Productivity DONE thread --
+    asserted on the descriptor JSON (this is CODE-ONLY; no live openclaw cron add)."""
+    desc = eod_ritual.eod_cron_descriptor()
+
+    # Deterministic command cron -- NOT an LLM agentTurn.
+    assert desc["payload"]["kind"] == "command"
+    argv = desc["payload"]["argv"]
+    assert argv[0] == "sh" and argv[1] == "-lc"
+    assert "telegram-commands.sh eod" in argv[2]
+    # Announce delivery to the Productivity DONE thread (env-var NAMES, no real ids).
+    assert desc["delivery"]["mode"] == "announce"
+    assert desc["delivery"]["chat_id_env"] == "TELEGRAM_CHAT_ID_PRODUCTIVITY"
+    assert desc["delivery"]["topic_env"] == "OPENCLAW_TOPIC_PRODUCTIVITY_DONE"
+    # No real chat id is baked into the descriptor -- only env-var names.
+    assert "-100" not in json.dumps(desc)
+
+
+def test_eod_cron_descriptor_carries_no_committed_chat_id():
+    """The descriptor must embed env-var NAMES, never a literal -100xxxxxxxx chat id
+    (public-repo hygiene): a serialised descriptor carries no production id."""
+    serialised = json.dumps(eod_ritual.eod_cron_descriptor())
+    assert "TELEGRAM_CHAT_ID_PRODUCTIVITY" in serialised
+    assert PRODUCTIVITY not in serialised  # not even the fake test id is hardcoded
