@@ -1,0 +1,13 @@
+{
+  "id": "task-tracker-interactive",
+  "name": "Task Tracker Interactive",
+  "description": "Routes task-tracker Telegram inline-button taps (tt:<action>:<task_id>) into the skill's existing deterministic commands, then edits the message to show the resolution. Auth is enforced downstream by the skill command + topic guard (KTD-4); the plugin forwards senderId and topic id verbatim and authorizes nothing.",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
