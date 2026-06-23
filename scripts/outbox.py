@@ -208,7 +208,8 @@ def deliver_once(
     text: str,
     idem_key: str,
     *,
-    sender: Callable[[dict[str, Any], str], dict[str, Any]],
+    sender: Callable[..., dict[str, Any]],
+    buttons: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Deliver ``text`` to ``delivery_target`` AT MOST ONCE per ``idem_key``.
 
@@ -219,10 +220,18 @@ def deliver_once(
     * ``idem_key`` already recorded -> return the stored receipt with
       ``idempotent: True`` and DO NOT call ``sender`` (the message was already
       delivered; re-sending would spam the user).
-    * unseen ``idem_key`` -> call ``sender(delivery_target, text)`` (which returns
-      ``{"message_id": str}`` or RAISES on a transport failure), record
+    * unseen ``idem_key`` -> call ``sender(delivery_target, text, buttons)`` (which
+      returns ``{"message_id": str}`` or RAISES on a transport failure), record
       ``{message_id, target, ts}`` atomically, and return it with
       ``idempotent: False``.
+
+    ``buttons`` (U1) is an OPTIONAL list of presentation button dicts. It is NOT part of
+    the idem-key, because a button message and its text-only twin for the same logical
+    send are the SAME delivery -- adding buttons to the key would let an identical
+    re-fire double-send. When ``buttons`` is empty (``None`` or ``[]``) the sender is
+    called with the SAME two positional args as before (``sender(target, text)``) -- so
+    every existing two-arg ``sender`` keeps working untouched; only a NON-EMPTY buttons
+    list passes the third positional, which the production ``openclaw_sender`` accepts.
 
     A ``sender`` that raises propagates OUT of the lock having recorded NOTHING --
     the caller treats it as a delivery failure and leaves the nag loop OPEN. Only a
@@ -240,7 +249,16 @@ def deliver_once(
                 "ts": recorded.get("ts"),
                 "idempotent": True,
             }
-        receipt = sender(delivery_target, text)
+        # A no-buttons send (``None`` or an empty list) stays the historical two-arg call
+        # ``sender(target, text)`` so existing two-arg senders and test fakes are
+        # unaffected; only a non-empty buttons list passes the third positional. The
+        # truthiness guard matches ``openclaw_sender``'s own ``if buttons:`` so ``[]``
+        # means "no buttons" identically at both layers.
+        receipt = (
+            sender(delivery_target, text, buttons)
+            if buttons
+            else sender(delivery_target, text)
+        )
         entry = {
             "message_id": str(receipt["message_id"]),
             "target": delivery_target,
@@ -303,7 +321,29 @@ def _extract_message_id(stdout: str) -> str:
     raise OpenclawSendError("openclaw send response carried no messageId")
 
 
-def openclaw_sender(delivery_target: dict[str, Any], text: str) -> dict[str, Any]:
+def _presentation_json(text: str, buttons: list[dict[str, Any]]) -> str:
+    """Build the ``--presentation`` MessagePresentation JSON: a text block + buttons row.
+
+    Per the openclaw presentation contract (docs/plugins/message-presentation): a
+    ``MessagePresentation`` is ``{title?, tone?, blocks:[...]}`` where each button block
+    is ``{type:"buttons", buttons:[{label, value, ...}]}`` and a button's ``value`` is
+    the ``callback_data`` routed back through the channel. The plain ``--message`` text
+    stays the fallback the channel degrades to; this layers the inline buttons on top.
+    """
+    presentation = {
+        "blocks": [
+            {"type": "text", "text": text},
+            {"type": "buttons", "buttons": buttons},
+        ]
+    }
+    return json.dumps(presentation)
+
+
+def openclaw_sender(
+    delivery_target: dict[str, Any],
+    text: str,
+    buttons: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """PRODUCTION sender: ``openclaw message send`` to the PROVEN target.
 
     List-form args (never ``shell=True`` with interpolated text) so the message body
@@ -311,6 +351,13 @@ def openclaw_sender(delivery_target: dict[str, Any], text: str) -> dict[str, Any
     non-zero exit, missing receipt, or unparseable output this raises
     ``OpenclawSendError`` so the caller leaves the loop OPEN; it returns
     ``{"message_id": str}`` only on a proven send.
+
+    ``buttons`` (U1) is an OPTIONAL list of presentation button dicts. When it is a
+    NON-EMPTY list, a ``--presentation <json>`` flag carrying a text+buttons
+    MessagePresentation is appended so Telegram renders inline action buttons; the plain
+    ``--message`` body is kept as the channel's text fallback. When ``buttons`` is
+    ``None`` or empty, the argv is BYTE-FOR-BYTE the historical plain-text send (no
+    ``--presentation`` flag at all), so every existing caller is unaffected.
     """
     args = [
         "openclaw", "message", "send",
@@ -320,6 +367,18 @@ def openclaw_sender(delivery_target: dict[str, Any], text: str) -> dict[str, Any
         "--message", text,
         "--json",
     ]
+    if buttons:
+        # ``_presentation_json`` -> ``json.dumps`` raises ``TypeError`` on a
+        # non-serializable button ``value`` (a stray datetime/set a future hand-built
+        # caller could pass). Convert it to ``OpenclawSendError`` so the documented
+        # delivery-failure contract holds: a caller catching ``OpenclawSendError`` leaves
+        # the loop OPEN instead of taking an unhandled ``TypeError`` that crashes the run.
+        # This runs before ``subprocess.run`` so no phantom receipt can be recorded.
+        try:
+            presentation = _presentation_json(text, buttons)
+        except (TypeError, ValueError) as exc:
+            raise OpenclawSendError(f"buttons could not be serialised: {exc}") from exc
+        args += ["--presentation", presentation]
     try:
         result = subprocess.run(args, capture_output=True, text=True, check=False,
                                 timeout=nag_send_timeout_seconds())

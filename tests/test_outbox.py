@@ -354,3 +354,183 @@ def test_deliver_once_prunes_stale_periods(state, monkeypatch):
     assert "nag:old:2026-05-01-11" not in box       # stale dropped
     assert "nag:recent:2026-06-21-11" in box         # recent kept
     assert "nag:newtask:2026-06-22-11" in box        # new recorded
+
+
+# --- U1: optional inline buttons (--presentation) ---------------------------
+
+# Mirrors the KTD-3 scheme: a button dict is {"label", "value"} with the value carrying
+# the tt: callback_data. The codec that produces these is exercised in
+# test_telegram_buttons.py; here we only assert the SEND/THREAD plumbing.
+BUTTONS = [
+    {"label": "Done", "value": "tt:done:tsk_abc"},
+    {"label": "Snooze 1d", "value": "tt:snz:tsk_abc:1d"},
+]
+
+
+def _capture_run(stdout='{"messageId":"7"}', returncode=0, stderr=""):
+    """A subprocess.run stub that records the argv it was called with."""
+    captured = {}
+
+    def _run(args, **kwargs):
+        captured["args"] = args
+        captured["shell"] = kwargs.get("shell", False)
+        return types.SimpleNamespace(args=args, returncode=returncode,
+                                     stdout=stdout, stderr=stderr)
+
+    return captured, _run
+
+
+def test_openclaw_sender_no_buttons_argv_is_byte_for_byte_unchanged(monkeypatch):
+    """Characterization: the no-buttons argv carries NO --presentation flag and is
+    exactly the historical plain-text send. Calling with buttons=None must equal calling
+    with no buttons arg at all, so every existing caller is unaffected by U1."""
+    cap_default, run_default = _capture_run()
+    monkeypatch.setattr(outbox.subprocess, "run", run_default)
+    outbox.openclaw_sender(TARGET, "the nag text")
+    argv_default = cap_default["args"]
+
+    cap_none, run_none = _capture_run()
+    monkeypatch.setattr(outbox.subprocess, "run", run_none)
+    outbox.openclaw_sender(TARGET, "the nag text", None)
+    argv_none = cap_none["args"]
+
+    cap_empty, run_empty = _capture_run()
+    monkeypatch.setattr(outbox.subprocess, "run", run_empty)
+    outbox.openclaw_sender(TARGET, "the nag text", [])  # empty list is also no-buttons
+    argv_empty = cap_empty["args"]
+
+    assert "--presentation" not in argv_default
+    assert argv_default == argv_none == argv_empty  # byte-for-byte identical
+
+
+def test_openclaw_sender_with_buttons_appends_presentation_json(monkeypatch):
+    """A buttons-bearing send appends --presentation carrying the expected
+    MessagePresentation: a text block then a buttons block whose button values are the
+    callback_data. The plain --message body is preserved as the text fallback, and the
+    proven target/thread are unchanged."""
+    captured, run = _capture_run()
+    monkeypatch.setattr(outbox.subprocess, "run", run)
+    receipt = outbox.openclaw_sender(TARGET, "Your #1 today", buttons=BUTTONS)
+
+    args = captured["args"]
+    assert captured["shell"] is False  # still never shell=True
+    assert "--presentation" in args
+    # --message text fallback is preserved alongside the presentation block.
+    assert "--message" in args and "Your #1 today" in args
+    # Target/thread still point at the proven delivery target.
+    assert "--target" in args and TARGET["chat_id"] in args
+    assert "--thread-id" in args and TARGET["topic_id"] in args
+    # The --presentation value parses to the documented shape.
+    presentation = json.loads(args[args.index("--presentation") + 1])
+    assert presentation == {
+        "blocks": [
+            {"type": "text", "text": "Your #1 today"},
+            {"type": "buttons", "buttons": BUTTONS},
+        ]
+    }
+    # A proven send still returns the captured receipt.
+    assert receipt == {"message_id": "7"}
+
+
+def test_openclaw_sender_with_buttons_raises_on_failure_no_receipt(monkeypatch):
+    """A transport failure with buttons present is still a delivery FAILURE: it raises
+    OpenclawSendError and fabricates no receipt (unchanged failure semantics)."""
+    monkeypatch.setattr(outbox.subprocess, "run",
+                        _fake_run(returncode=1, stderr="gateway down"))
+    with pytest.raises(outbox.OpenclawSendError):
+        outbox.openclaw_sender(TARGET, "x", buttons=BUTTONS)
+
+    # Unparseable stdout with buttons present also raises (no messageId -> no proof).
+    monkeypatch.setattr(outbox.subprocess, "run",
+                        _fake_run(stdout="no json here"))
+    with pytest.raises(outbox.OpenclawSendError):
+        outbox.openclaw_sender(TARGET, "x", buttons=BUTTONS)
+
+
+def test_openclaw_sender_unserialisable_button_raises_openclaw_send_error(monkeypatch):
+    """A non-JSON-serializable button value makes the presentation build raise; it must
+    surface as OpenclawSendError (the documented delivery-failure type), NOT a raw
+    TypeError that would crash the caller's run. subprocess.run is never reached."""
+    def _must_not_run(*a, **k):
+        raise AssertionError("subprocess.run must not be called on a serialisation failure")
+
+    monkeypatch.setattr(outbox.subprocess, "run", _must_not_run)
+    bad_buttons = [{"label": "Done", "value": object()}]  # object() is not JSON-serializable
+    with pytest.raises(outbox.OpenclawSendError):
+        outbox.openclaw_sender(TARGET, "x", buttons=bad_buttons)
+
+
+def test_deliver_once_with_buttons_sender_failure_records_nothing(state):
+    """The at-most-once / no-phantom-receipt invariant must hold on the BUTTONS branch too:
+    a sender that raises with buttons present propagates out, records nothing, and a later
+    clean retry with the SAME key still delivers."""
+    key = outbox.make_idem_key("nag", "tsk_btn", "2026-06-22-11")
+
+    def boom(target, text, buttons=None):
+        raise outbox.OpenclawSendError("gateway down")
+
+    with pytest.raises(outbox.OpenclawSendError):
+        outbox.deliver_once(TARGET, "nag", key, sender=boom, buttons=BUTTONS)
+    assert key not in _outbox(state)  # no phantom receipt on the buttons path
+
+    # A later clean retry with the same key delivers (the failure did not poison it).
+    calls = []
+
+    def ok(target, text, buttons=None):
+        calls.append((text, buttons))
+        return {"message_id": FAKE_ID}
+
+    receipt = outbox.deliver_once(TARGET, "nag", key, sender=ok, buttons=BUTTONS)
+    assert receipt["message_id"] == FAKE_ID and calls == [("nag", BUTTONS)]
+
+
+def test_deliver_once_threads_buttons_to_sender(state):
+    """deliver_once passes the buttons list to the sender as a third positional, records
+    one receipt, and a same-key re-fire dedupes off it WITHOUT re-sending -- buttons are
+    not part of the idem-key."""
+    calls = []
+
+    def sender(target, text, buttons=None):
+        calls.append((text, buttons))
+        return {"message_id": FAKE_ID}
+
+    key = outbox.make_idem_key("nag", "tsk_abc", "2026-06-22-11")
+    first = outbox.deliver_once(TARGET, "nag text", key, sender=sender, buttons=BUTTONS)
+    assert first["idempotent"] is False and first["message_id"] == FAKE_ID
+    assert calls == [("nag text", BUTTONS)]  # buttons threaded through
+
+    # A re-fire with the SAME key (even different buttons) does NOT re-call the sender.
+    second = outbox.deliver_once(TARGET, "nag text", key, sender=sender, buttons=[])
+    assert second["idempotent"] is True
+    assert len(calls) == 1  # sender called exactly once -- buttons don't change the key
+
+
+def test_deliver_once_no_buttons_calls_sender_with_two_args(state):
+    """When buttons is omitted, deliver_once calls the sender with the historical TWO
+    positional args, so an existing two-arg sender (the common test fake) keeps working."""
+    seen = []
+
+    def two_arg_sender(target, text):  # no buttons parameter at all
+        seen.append((target, text))
+        return {"message_id": FAKE_ID}
+
+    key = outbox.make_idem_key("nag", "tsk_x", "2026-06-22-11")
+    receipt = outbox.deliver_once(TARGET, "hi", key, sender=two_arg_sender)
+    assert receipt["message_id"] == FAKE_ID
+    assert seen == [(TARGET, "hi")]  # two-arg call, no buttons positional
+
+
+def test_deliver_once_empty_buttons_first_fire_calls_two_arg_sender(state):
+    """An empty buttons list on a FIRST fire is "no buttons": deliver_once calls the
+    two-arg sender (no third positional), matching openclaw_sender's `if buttons:` guard
+    so a two-arg fake never sees a surprise third arg."""
+    seen = []
+
+    def two_arg_sender(target, text):  # would TypeError if passed a third positional
+        seen.append((target, text))
+        return {"message_id": FAKE_ID}
+
+    key = outbox.make_idem_key("nag", "tsk_empty", "2026-06-22-11")
+    receipt = outbox.deliver_once(TARGET, "hi", key, sender=two_arg_sender, buttons=[])
+    assert receipt["message_id"] == FAKE_ID
+    assert seen == [(TARGET, "hi")]  # empty list -> two-arg call, no buttons positional
