@@ -36,6 +36,9 @@ REQUIRED_NEW_TYPES = [
     # in task_ledger.KNOWN_EVENT_TYPES (this test asserts both sides match).
     "eod_disposition_done", "eod_disposition_carry",
     "eod_disposition_reschedule", "eod_disposition_drop",
+    # U6 -- set tomorrow's #1 (the loop's write side). Dual-registration contract:
+    # MUST also be in task_ledger.KNOWN_EVENT_TYPES (this test asserts both match).
+    "eod_tomorrow_top_set",
 ]
 
 

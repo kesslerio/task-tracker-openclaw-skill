@@ -33,7 +33,9 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import eod_ritual
 import harvest_ledger
 import harvest_state
+import nag_commands
 import telegram_buttons
+import tomorrow_pointer
 import utils
 
 # Fake id: valid chat-id shape but not -100xxxxxxxx, so the hygiene grep is clean.
@@ -350,3 +352,108 @@ def test_recurring_done_disposition_spawns_next_not_a_carried_dup(env, monkeypat
     assert content.count("Send weekly update") == 1
     assert "🗓️2026-05-27" in content
     assert "carried::" not in content
+
+
+# --- U6 set tomorrow's #1: propose (read-only) + tap writes the single pointer ----
+
+
+def test_tomorrow_step_proposes_a_top_with_a_set_button(env):
+    """The EOD proposes a #1 from the open board, rendered with a tt:top Set-as-#1
+    button plus alternatives. Proposing writes NOTHING (the pointer is set on a tap)."""
+    payload = eod_ritual.build_tomorrow_step()
+
+    assert payload["step"] == "tomorrow_top"
+    assert payload["has_open"] is True
+    # The top pick carries a tt:top:<id> button.
+    top = payload["top"]
+    assert top["task_id"] in {"tsk_abc123", "tsk_def456"}
+    assert top["buttons"][0]["value"] == telegram_buttons.encode("top", top["task_id"])
+    assert top["buttons"][0]["value"].startswith("tt:top:")
+    # Alternatives are offered (both open tasks are candidates).
+    ids = {c["task_id"] for c in payload["candidates"]}
+    assert ids == {"tsk_abc123", "tsk_def456"}
+    # Proposing wrote NO pointer (no change until a tap).
+    assert tomorrow_pointer.read_pointer() is None
+    assert "tomorrow's #1" in payload["message"]
+
+
+def test_tapping_a_proposed_top_writes_the_pointer_source_eod(env, monkeypatch):
+    """Tapping a proposed #1 (-> set-top command) writes tomorrow-pointer.json with the
+    task + source:'eod'. This is the U2-dispatcher-resolved write side."""
+    payload = eod_ritual.build_tomorrow_step()
+    top_id = payload["top"]["task_id"]
+
+    result = nag_commands.handle_set_top(top_id)
+    assert result["ok"] is True
+    assert result["source"] == "eod"
+
+    pointer = tomorrow_pointer.read_pointer()
+    assert pointer["task_id"] == top_id
+    assert pointer["source"] == "eod"
+    # The ledger recorded WHICH task became tomorrow's #1.
+    assert "eod_tomorrow_top_set" in _ledger_event_types(env["ledger"])
+    # set-top writes only the pointer -- the board is untouched.
+    assert top_id in env["work"].read_text()
+
+
+def test_retapping_a_different_task_overwrites_single_pointer(env):
+    """Re-tapping a DIFFERENT task overwrites the pointer (single canonical pointer,
+    never appended)."""
+    nag_commands.handle_set_top("tsk_abc123")
+    nag_commands.handle_set_top("tsk_def456")
+
+    pointer = tomorrow_pointer.read_pointer()
+    assert pointer["task_id"] == "tsk_def456"
+    # One canonical record on disk, not an appended pair.
+    raw = (env["state_dir"] / "tomorrow-pointer.json").read_text()
+    assert raw.count('"task_id"') == 1
+
+
+def test_no_open_tasks_writes_explicit_none_pointer(env):
+    """An empty board records an explicit 'none' pointer so the standup shows a clean
+    board, not a stale prior-day #1."""
+    env["work"].write_text("# Work\n\n## 🔴 Q1\n")
+
+    payload = eod_ritual.build_tomorrow_step()
+    assert payload["has_open"] is False
+    assert payload["wrote_none"] is True
+    assert "board is clear" in payload["message"]
+
+    pointer = tomorrow_pointer.read_pointer()
+    assert tomorrow_pointer.is_none_pointer(pointer) is True
+    assert pointer["task_id"] is None
+
+
+def test_empty_board_none_overwrites_a_stale_prior_pointer(env):
+    """A stale prior-day pointer is overwritten by the empty-board 'none' -- never a
+    leftover stale #1 the standup would resurface."""
+    # A real #1 is set first (a prior day).
+    nag_commands.handle_set_top("tsk_abc123")
+    assert tomorrow_pointer.read_pointer()["task_id"] == "tsk_abc123"
+
+    # Next EOD runs against an empty board.
+    env["work"].write_text("# Work\n\n## 🔴 Q1\n")
+    eod_ritual.build_tomorrow_step()
+
+    pointer = tomorrow_pointer.read_pointer()
+    assert tomorrow_pointer.is_none_pointer(pointer) is True
+    assert "tsk_abc123" not in (env["state_dir"] / "tomorrow-pointer.json").read_text()
+
+
+def test_set_top_stale_tap_refused_no_dead_pointer(env):
+    """A tap to set a task that is no longer active (already done) is refused -- no dead
+    pointer the standup would resolve to nothing."""
+    nag_commands.handle_done("tsk_abc123")
+    result = nag_commands.handle_set_top("tsk_abc123")
+    assert result["ok"] is False
+    assert result["reason"] == "not-active"
+    assert tomorrow_pointer.read_pointer() is None
+
+
+def test_tomorrow_main_step_flag_emits_payload(env, capsys):
+    rc = eod_ritual.main(["--json", "--step", "tomorrow"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["step"] == "tomorrow_top"
+    assert out["has_open"] is True
+    assert out["top"]["buttons"][0]["value"].startswith("tt:top:")

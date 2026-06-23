@@ -63,9 +63,11 @@ _COMMAND_TIMEOUT_S = 30.0
 # wrong-topic). ``snz``/``rsch`` map to the verbs ``snooze``/``reschedule`` so the result's
 # ``action`` (``command_argv[0]``) matches the plugin's ackText keys.
 #
-# ``carry`` / ``drop`` are wired in U5 (their nag_commands verbs now exist). ``top`` (set tomorrow's
-# #1) lands in U6 and is deliberately NOT mapped yet. An unmapped (but decodable) action returns a
-# clean ``not_yet_available`` result -- never a crash -- and U6 adds both its command and the row.
+# ``carry`` / ``drop`` are wired in U5 (their nag_commands verbs exist). ``top`` (set tomorrow's
+# #1) is wired in U6: it maps to the ``set-top`` verb, which writes the tomorrow-pointer (no board
+# mutation -- a STALE tap on an already-actioned task is refused as a structured non-ok result, not
+# silently pointed at a dead id). Every action in the KTD-3 table is now mapped; an unknown/forged
+# action still returns a clean ``ok:false`` (``decode`` is the trust boundary).
 ArgvBuilder = Callable[[str, "str | None", str], "list[str]"]
 
 
@@ -93,6 +95,10 @@ def _drop_argv(task_id: str, arg: str | None, topic_id: str) -> list[str]:
     return ["drop", "--", task_id]
 
 
+def _set_top_argv(task_id: str, arg: str | None, topic_id: str) -> list[str]:
+    return ["set-top", "--", task_id]
+
+
 def _approve_argv(task_id: str, arg: str | None, topic_id: str) -> list[str]:
     # ``approve --topic-id <inbound topic> -- <task_id>``: the inbound topic id is forwarded so the
     # downstream topic guard (the authority) can accept or reject. We never gate it here. The
@@ -107,10 +113,12 @@ _ACTION_TO_COMMAND: dict[str, tuple[str, ArgvBuilder]] = {
     "appr": ("harvest_ledger.py", _approve_argv),
     # U5 EOD forced disposition: carry (keep active, stamp carried::) and drop (move to
     # the parking lot) route to the new nag_commands verbs. ``top`` (set tomorrow's #1)
-    # stays UNMAPPED -- it lands in U6 and returns a clean ``not_yet_available`` until
-    # then (the row that emits it ships with its command).
+    # is U6: it routes to the ``set-top`` verb, which writes the tomorrow-pointer the
+    # morning standup reads (no board mutation -- a stale tap is refused, not pointed at
+    # a dead id). The ``--`` guard protects the task id exactly as the sibling verbs do.
     "carry": ("nag_commands.py", _carry_argv),
     "drop": ("nag_commands.py", _drop_argv),
+    "top": ("nag_commands.py", _set_top_argv),
 }
 
 

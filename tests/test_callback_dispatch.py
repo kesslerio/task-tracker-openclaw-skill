@@ -17,8 +17,8 @@ These assert the invariants, not the implementation path:
 * U5 DISPOSITION: a decodable ``carry`` / ``drop`` tap routes to the new nag_commands verbs and
   mutates the board through the existing reversible path (carry keeps it active + stamps carried::;
   drop moves it to the parking lot).
-* NOT-YET-AVAILABLE: a decodable ``top`` (command lands in U6) returns a clean
-  ``not_yet_available`` result, not a crash.
+* U6 SET-TOP: a decodable ``top`` tap routes to the ``set-top`` verb, which writes the
+  tomorrow-pointer the morning standup reads (no board mutation).
 
 Public-repo hygiene: the only chat/topic ids here are FAKE values that do NOT match the
 -100[0-9]{8,} pattern the CI hygiene grep flags. Real ids are env-sourced at runtime.
@@ -246,15 +246,28 @@ def test_drop_tap_moves_task_to_parking_lot(env, monkeypatch):
     assert text.index("tsk_abc123") > text.index("Parking Lot")
 
 
-# --- not-yet-available actions (U6 wires the command) ---------------------------------------
+# --- U6 set-top: a top tap writes the tomorrow-pointer (no board mutation) -------------------
 
-def test_top_action_is_clean_not_a_crash(env):
+def test_top_tap_writes_tomorrow_pointer(env):
+    res = _result("top:tsk_abc123")
+    assert res["ok"] is True
+    assert res["action"] == "set-top"
+    assert res["task_id"] == "tsk_abc123"
+    # The pointer file was written under the state dir with the tapped task + source eod.
+    pointer = json.loads((env["state"] / "tomorrow-pointer.json").read_text())
+    assert pointer["task_id"] == "tsk_abc123"
+    assert pointer["source"] == "eod"
+    # No board mutation: the task is untouched (set-top only writes the pointer).
+    assert "tsk_abc123" in env["work"].read_text()
+
+
+def test_stale_top_tap_is_clean_no_pointer_for_dead_id(env):
+    # A tap on a task no longer active (already done first) must NOT set a dead pointer.
+    _result("done:tsk_abc123")
     res = _result("top:tsk_abc123")
     assert res["ok"] is False
-    assert res["reason"] == "not_yet_available"
-    assert res["task_id"] == "tsk_abc123"
-    # Nothing was mutated for the unwired action.
-    assert "tsk_abc123" in env["work"].read_text()
+    assert res["reason"] == "not-active"
+    assert not (env["state"] / "tomorrow-pointer.json").exists()
 
 
 # --- no raw error leak: a malformed args JSON is a friendly line, exit 0, no traceback -------
@@ -295,6 +308,6 @@ def test_dispatch_unit_decode_miss(env):
 def test_dispatch_unit_namespace_reprepended(env):
     # The plugin hands the payload WITHOUT the ``tt:`` prefix (the gateway split it off); dispatch
     # re-prepends it so decode (the single source of truth for the scheme) accepts it. ``top`` is
-    # still unwired (U6), so its decode round-trips and routes to the clean not_yet_available path.
+    # wired in U6, so its decode round-trips and routes to the ``set-top`` command verb.
     res = callback_dispatch.dispatch({"callback_data": "top:tsk_abc123", "sender_id": "x", "topic_id": "5"})
-    assert res["action"] == "top" and res["reason"] == "not_yet_available"
+    assert res["action"] == "set-top" and res["ok"] is True

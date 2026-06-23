@@ -17,13 +17,24 @@ detection is read-only. The actual confirmation happens later, when the user tap
 a Confirm button -> the U2 dispatcher invokes the existing ``harvest_ledger.approve``
 through the topic-guarded, reversible path. ``eod_ritual`` never auto-approves.
 
-Scope boundary: this module now spans detect + confirm (U4) AND the forced
-disposition (U5). It does NOT build the tomorrow-pointer (U6) or the delivery / cron
-/ Obsidian summary (U7). ``main`` produces the structured detect + confirm output
-plus the disposition step; live delivery is wired by U7. ``eod_review.py`` already
-parses the daily note for done/not-done; this unit reuses ``run_harvest`` rather than
-re-implementing evidence detection, and leaves daily-note parsing to ``eod_review``
-where the later EOD slices need it.
+Scope boundary: this module now spans detect + confirm (U4), the forced disposition
+(U5), AND setting tomorrow's #1 (U6). It does NOT build the delivery / cron / Obsidian
+summary (U7) or the morning-standup reader (U8). ``main`` produces the structured
+detect + confirm output, the disposition step, and the tomorrow's-#1 step; live
+delivery is wired by U7. ``eod_review.py`` already parses the daily note for
+done/not-done; this unit reuses ``run_harvest`` rather than re-implementing evidence
+detection, and leaves daily-note parsing to ``eod_review`` where the later EOD slices
+need it.
+
+U6 -- set tomorrow's #1 (the loop's WRITE side, KTD-6): the EOD proposes a #1 from the
+board's priority/capacity and renders it with a "Set as tomorrow's #1" button
+(``tt:top:<id>``) plus a couple of alternatives. A tap routes through the U2 dispatcher
+to the ``set-top`` command, which writes ``tomorrow-pointer.json`` (the morning standup,
+U8, reads it). When the board has NO open task to nominate, the EOD writes an EXPLICIT
+"none" pointer here directly (there is nothing to tap), so the standup shows a clean
+board rather than a stale prior-day #1. Proposing is otherwise READ-ONLY -- no pointer
+is written until the user taps (mirroring the no-change-without-confirm invariant), with
+the one deliberate exception of the empty-board "none" record.
 
 U5 -- forced disposition: every task still open at EOD is rendered with a disposition
 button row (``tt:done`` / ``tt:carry`` / ``tt:rsch`` / ``tt:drop``). NOTHING is
@@ -53,6 +64,7 @@ import error_envelope
 import harvest_ledger
 import harvest_state
 import telegram_buttons
+import tomorrow_pointer
 from task_records import active_records, load_records
 
 COMPONENT = "eod_review"
@@ -290,6 +302,117 @@ def build_disposition_step(*, personal: bool = False) -> dict[str, Any]:
     }
 
 
+# --- U6: set tomorrow's #1 (the loop's write side) -------------------------
+
+# Section rank for proposing tomorrow's #1: the most urgent open work first. q1
+# (urgent & important) outranks q2, q2 outranks q3; anything else (team/today/etc.)
+# falls to the back. The PROPOSAL is a hint -- the user taps the actual choice (or an
+# alternative), so a coarse ranking is enough; we do NOT re-implement the full standup
+# capacity model here (U8 owns the morning surface).
+_SECTION_RANK: dict[str, int] = {"q1": 0, "q2": 1, "q3": 2}
+_DEFAULT_SECTION_RANK = 9
+
+# How many proposal candidates the EOD surfaces: the top pick plus a couple of
+# alternatives, so the user can tap a different #1 without typing an id. Kept small so
+# the button surface stays tappable (the ADHD-focused UX), not a wall of choices.
+_TOP_PROPOSAL_COUNT = 3
+
+
+def _proposal_key(record: Any) -> tuple[int, str, str]:
+    """Rank an open task for the tomorrow's-#1 proposal: section, then due, then id.
+
+    Most-urgent section first (q1<q2<q3<other); within a section the EARLIEST due date
+    first (a task with no due date sorts after dated ones via the high sentinel); the
+    canonical id is the final stable tie-break so the proposal is deterministic.
+    """
+    section_rank = _SECTION_RANK.get(record.section, _DEFAULT_SECTION_RANK)
+    due = record.due or "9999-99-99"
+    return (section_rank, due, record.canonical_id or "")
+
+
+def propose_tomorrow_top(*, personal: bool = False) -> dict[str, Any]:
+    """Propose tomorrow's #1 from the open board -- READ-ONLY (no pointer written).
+
+    Ranks the open tasks (most-urgent section, then earliest due) and returns the top
+    pick plus a couple of alternatives, each carrying a ``tt:top:<id>`` "Set as #1"
+    button. NOTHING is written here: the pointer is set only when the user TAPS a button
+    (which the U2 dispatcher routes to ``set-top``). An EMPTY board yields no candidates
+    (``has_open == False``); the caller (``build_tomorrow_step``) then writes the
+    explicit "none" pointer, since there is nothing to tap. NEVER raises -- a missing
+    board degrades to no candidates.
+    """
+    open_tasks = _open_tasks(personal=personal)
+    ranked = sorted(open_tasks, key=_proposal_key)
+    candidates: list[dict[str, Any]] = []
+    for record in ranked[:_TOP_PROPOSAL_COUNT]:
+        task_id = record.canonical_id
+        if not task_id:
+            continue
+        button = telegram_buttons.set_top_button(task_id)
+        candidates.append({
+            "task_id": task_id,
+            "title": record.title,
+            "section": record.section,
+            "due": record.due,
+            # A list (uniform with the other steps' rows); an over-budget callback
+            # drops the button and leaves the text command as the fallback.
+            "buttons": [button] if button is not None else [],
+        })
+    return {
+        "ok": True,
+        "has_open": bool(candidates),
+        "candidates": candidates,
+        "top": candidates[0] if candidates else None,
+    }
+
+
+def _tomorrow_message(proposal: dict[str, Any], *, none_written: bool) -> str:
+    """The user-facing tomorrow's-#1 text (buttons ride the send, not the text).
+
+    With candidates: name the proposed #1 + alternatives and make the tap-to-set
+    contract explicit. With no open task: a single clean "board is clear" line -- the
+    EOD has already recorded the explicit "none" pointer, so the standup opens clean.
+    """
+    if not proposal["has_open"]:
+        return ("EOD — tomorrow's #1\n\n"
+                "No open tasks to set as tomorrow's #1 — your board is clear. "
+                "The morning standup will start fresh.")
+    top = proposal["top"]
+    lines = ["EOD — tomorrow's #1",
+             "",
+             f"Proposed #1: {top['title']}",
+             "Tap to set it as tomorrow's #1 (or pick an alternative):"]
+    for alt in proposal["candidates"][1:]:
+        lines.append(f"• {alt['title']}")
+    return "\n".join(lines)
+
+
+def build_tomorrow_step(*, personal: bool = False) -> dict[str, Any]:
+    """Assemble the EOD set-tomorrow's-#1 step (structured, no live delivery).
+
+    The U6 deliverable: a structured payload carrying the proposal ``message`` text and
+    the per-candidate ``tt:top`` buttons. With open tasks it writes NOTHING (the pointer
+    is set on a TAP -> ``set-top``). With an EMPTY board it writes the EXPLICIT "none"
+    pointer here -- there is nothing to tap, and the standup must see a deliberate "no #1"
+    record, not a stale prior-day pointer (single canonical pointer, OVERWRITTEN never
+    appended). Returns ``wrote_none`` so the caller/audit can see the empty-board write.
+    """
+    proposal = propose_tomorrow_top(personal=personal)
+    wrote_none = False
+    if not proposal["has_open"]:
+        tomorrow_pointer.set_none(source=tomorrow_pointer.SOURCE_EOD)
+        wrote_none = True
+    return {
+        "ok": True,
+        "step": "tomorrow_top",
+        "message": _tomorrow_message(proposal, none_written=wrote_none),
+        "candidates": proposal["candidates"],
+        "has_open": proposal["has_open"],
+        "top": proposal["top"],
+        "wrote_none": wrote_none,
+    }
+
+
 def _render_text(payload: dict[str, Any]) -> str:
     """The plain-text rendering for a non-JSON CLI run (the message + a count line)."""
     lines = [payload["message"]]
@@ -314,18 +437,30 @@ def _render_disposition_text(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _render_tomorrow_text(payload: dict[str, Any]) -> str:
+    """Plain-text rendering for a non-JSON tomorrow's-#1 run (message + a hint line)."""
+    lines = [payload["message"]]
+    if payload["has_open"]:
+        lines.append("")
+        lines.append("Tap a Set-as-#1 button to set tomorrow's #1.")
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="EOD ritual: detect completions (confirm) + force a disposition on every open task"
+        description="EOD ritual: detect completions (confirm) + force a disposition + set tomorrow's #1"
     )
     parser.add_argument("--json", action="store_true", help="Structured JSON output")
-    parser.add_argument("--step", choices=["detect", "disposition"], default="detect",
+    parser.add_argument("--step", choices=["detect", "disposition", "tomorrow"], default="detect",
                         help="which EOD step to render (default: detect)")
     args = parser.parse_args(argv)
 
     if args.step == "disposition":
         payload = build_disposition_step()
         render = _render_disposition_text
+    elif args.step == "tomorrow":
+        payload = build_tomorrow_step()
+        render = _render_tomorrow_text
     else:
         payload = build_confirm_step()
         render = _render_text
