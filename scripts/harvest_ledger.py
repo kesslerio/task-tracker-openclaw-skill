@@ -221,6 +221,7 @@ def harvest_github(
     trigger: str,
     query_start: datetime | None = None,
     query_end: datetime | None = None,
+    harvest_commits: bool = False,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Harvest merged PRs and direct commits authored by the user since ``since`` (``gh``).
 
@@ -228,7 +229,7 @@ def harvest_github(
     errored (so a source error is not mistaken for a clean-empty week)."""
 
     def parse_prs(payload: Any) -> list[dict[str, Any]]:
-        items = payload if isinstance(payload, list) else payload.get("items", [])
+        items = payload if isinstance(payload, list) else payload.get("items", []) if isinstance(payload, dict) else []
         evidence: list[dict[str, Any]] = []
         for pr in items:
             repo = pr.get("repository") or {}
@@ -271,9 +272,11 @@ def harvest_github(
         "--limit", "100",
     ]
     pr_evidence, pr_failed = _harvest("github", pr_cmd, parse_prs, trigger=trigger)
+    if not harvest_commits:
+        return pr_evidence, pr_failed
 
     def parse_commits(payload: Any) -> list[dict[str, Any]]:
-        items = payload if isinstance(payload, list) else payload.get("items", [])
+        items = payload if isinstance(payload, list) else payload.get("items", []) if isinstance(payload, dict) else []
         evidence: list[dict[str, Any]] = []
         for commit in items:
             repo = commit.get("repository") or {}
@@ -333,13 +336,17 @@ def harvest_gmail(
         threads = payload.get("threads", []) if isinstance(payload, dict) else payload if isinstance(payload, list) else []
         evidence: list[dict[str, Any]] = []
         for thread in threads:
+            if not isinstance(thread, dict):
+                continue
             thread_id = thread.get("id")
             subject = thread.get("subject") or ""
             messages = thread.get("messages") if isinstance(thread.get("messages"), list) else []
             if not messages:
                 messages = [thread]
             for message in messages:
-                message_id = message.get("id") or message.get("messageId") or thread_id
+                if not isinstance(message, dict):
+                    continue
+                message_id = message.get("id") or message.get("messageId")
                 msg_subject = message.get("subject") or subject
                 if not message_id or not msg_subject:
                     continue
@@ -406,7 +413,7 @@ def harvest_all_for_window(
     since = _since_date_for_window(resolved)
     query_start, query_end = harvest_windows.source_query_window(resolved)
     gh_evidence, gh_failed = harvest_github(
-        since, trigger=trigger, query_start=query_start, query_end=query_end
+        since, trigger=trigger, query_start=query_start, query_end=query_end, harvest_commits=True
     )
     gmail_evidence, gmail_failed = harvest_gmail(
         since, trigger=trigger, query_start=query_start, query_end=query_end

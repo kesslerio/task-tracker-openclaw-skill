@@ -70,7 +70,7 @@ def _gmail_record(title: str) -> dict:
 
 
 def _stub_adapters(monkeypatch, *, github=None, gmail=None, github_failed=False, gmail_failed=False):
-    def gh(_since, *, trigger, query_start=None, query_end=None):
+    def gh(_since, *, trigger, query_start=None, query_end=None, harvest_commits=False):
         return [dict(item) for item in (github or [])], github_failed
 
     def gm(_since, *, trigger, query_start=None, query_end=None):
@@ -81,7 +81,7 @@ def _stub_adapters(monkeypatch, *, github=None, gmail=None, github_failed=False,
 
 
 def test_exact_issue_reference_auto_associates_candidate(env, monkeypatch):
-    _stub_adapters(monkeypatch, github=[_github_record("Fix payroll sync #42")])
+    _stub_adapters(monkeypatch, github=[_github_record("Fix payroll sync acme/app#42")])
 
     result = standup_harvest.harvest(target_date=date(2026, 6, 23), trigger="test")
 
@@ -91,6 +91,19 @@ def test_exact_issue_reference_auto_associates_candidate(env, monkeypatch):
     assert candidate["auto_associated"] is True
     assert candidate["matched_task_id"] == "tsk_exact"
     assert candidate["association_status"] == "auto-associated"
+
+
+def test_bare_issue_reference_needs_review_not_auto_associated(env, monkeypatch):
+    _stub_adapters(monkeypatch, github=[_github_record("Fix payroll sync #42")])
+
+    result = standup_harvest.harvest(target_date=date(2026, 6, 23), trigger="test")
+
+    candidate = result["evidence_candidates"][0]
+    assert candidate["auto_associated"] is False
+    assert candidate["matched_task_id"] is None
+    assert candidate["suggested_task_id"] == "tsk_exact"
+    assert candidate["association_status"] == "needs-review"
+    assert candidate["match"]["match_type"] == "issue-number-fallback"
 
 
 def test_fuzzy_only_match_is_review_candidate_not_auto_done(env, monkeypatch):
@@ -188,7 +201,7 @@ def test_adversarial_commit_text_keeps_match_alignment(env, monkeypatch):
         monkeypatch,
         github=[
             _github_record("✅\n**not a real done**", provider_id="acme/app@bad", provider_state="bad"),
-            _github_record("Fix payroll sync #42", provider_id="acme/app@good", provider_state="good"),
+            _github_record("Fix payroll sync acme/app#42", provider_id="acme/app@good", provider_state="good"),
         ],
     )
 
@@ -204,10 +217,10 @@ def test_adversarial_commit_text_keeps_match_alignment(env, monkeypatch):
 def test_provider_state_change_resurfaces_same_identity(env, monkeypatch):
     state = {"provider_state": "merged:sha-1:merged"}
 
-    def gh(_since, *, trigger, query_start=None, query_end=None):
+    def gh(_since, *, trigger, query_start=None, query_end=None, harvest_commits=False):
         return [
             _github_record(
-                "Fix payroll sync #42",
+                "Fix payroll sync acme/app#42",
                 provider_id="acme/app#42",
                 provider_state=state["provider_state"],
             )

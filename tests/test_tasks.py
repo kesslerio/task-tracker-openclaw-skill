@@ -103,6 +103,17 @@ def test_extract_inline_identifiers_accepts_trailing_punctuation():
     assert "legacy-1" in identifiers["exact"]
 
 
+def test_extract_inline_identifiers_github_issue_fallback_parity():
+    fix = extract_inline_identifiers("Fix #42")
+    start = extract_inline_identifiers("#42")
+    qualified = extract_inline_identifiers("acme/app#42")
+
+    assert "gh-issue-num:42" in fix["fallback"]
+    assert "gh-issue-num:42" in start["fallback"]
+    assert "gh:acme/app#42" in qualified["exact"]
+    assert "gh-issue-num:42" in qualified["fallback"]
+
+
 def test_add_task_legacy_priority_section(tmp_path, monkeypatch, capsys):
     tasks_file = tmp_path / 'Work Tasks.md'
     tasks_file.write_text("""# Weekly TODOs

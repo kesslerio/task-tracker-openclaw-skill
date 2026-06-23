@@ -62,6 +62,13 @@ def extract_inline_identifiers(text: str) -> dict[str, set[str]]:
             exact_identifiers.add(f"gh:{owner}/{repo}#{issue_num}")
             fallback_identifiers.add(f"gh-issue-num:{issue_num}")
 
+    for owner, repo, issue_num in re.findall(
+        r"\b([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)#(\d+)\b",
+        text,
+    ):
+        exact_identifiers.add(f"gh:{owner.casefold()}/{repo.casefold()}#{issue_num}")
+        fallback_identifiers.add(f"gh-issue-num:{issue_num}")
+
     for match in re.findall(r"(?<!\w)#(\d+)\b", text):
         fallback_identifiers.add(f"gh-issue-num:{match}")
 

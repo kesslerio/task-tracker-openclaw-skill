@@ -147,7 +147,9 @@ def record_source_status(
         if not isinstance(sources, dict):
             sources = {}
             entry["sources"] = sources
-        receipt = {"status": status, "ts": ts, "trigger": trigger}
+        existing = sources.get(source)
+        receipt = dict(existing) if isinstance(existing, dict) else {}
+        receipt.update({"status": status, "ts": ts, "trigger": trigger})
         if status == "ok":
             receipt["last_success_ts"] = ts
         else:

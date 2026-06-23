@@ -133,12 +133,12 @@ def _apply_attribution_policy(candidate: dict[str, Any]) -> dict[str, Any]:
 
     The shared matcher can mark normalized-title or high-fuzzy matches as
     ``evidence-link``. For the standup candidate surface, only explicit
-    identifiers/links and issue-number references auto-associate. Everything else
+    identifiers/links auto-associate. Everything else
     remains a standalone review candidate with only a suggested task id.
     """
     matched_task_id = candidate.get("matched_task_id")
     match_type = candidate.get("match_type")
-    explicit = bool(matched_task_id and match_type in {"exact-id-or-link", "issue-number-fallback"})
+    explicit = bool(matched_task_id and match_type == "exact-id-or-link")
 
     candidate["suggested_task_id"] = matched_task_id
     candidate["auto_associated"] = explicit
@@ -172,6 +172,7 @@ def _harvest_source(
             trigger=trigger,
             query_start=query_start,
             query_end=query_end,
+            harvest_commits=True,
         )
     if source == "gmail":
         return harvest_ledger.harvest_gmail(

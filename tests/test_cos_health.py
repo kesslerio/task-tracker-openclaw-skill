@@ -83,6 +83,25 @@ def test_record_failure_trigger_defaults_to_none():
     assert cos_health.read_health()["weekly_review"]["last_failure"]["trigger"] is None
 
 
+def test_record_source_status_ok_preserves_prior_failure():
+    cos_health.record_source_status(
+        "standup",
+        "github",
+        "failed",
+        error_class="github_harvest_failed",
+        trigger="cron:first",
+    )
+    failure = cos_health.read_health()["standup"]["sources"]["github"]["last_failure"]
+
+    cos_health.record_source_status("standup", "github", "ok", trigger="cron:next")
+    receipt = cos_health.read_health()["standup"]["sources"]["github"]
+
+    assert receipt["status"] == "ok"
+    assert receipt["last_success_ts"]
+    assert receipt["last_failure"] == failure
+    assert receipt["last_failure_ts"] == failure["ts"]
+
+
 # --- read_health fail-soft --------------------------------------------------
 
 

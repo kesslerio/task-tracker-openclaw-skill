@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import sys
+import unicodedata
 from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any, Literal
@@ -30,10 +31,20 @@ GATE_ONLY_KIND = "accomplishment"
 VALID_SOURCES = frozenset({"github", "gmail", "calendar", "dialpad_sms"})
 AUTO_DONE_NEVER_SOURCES: set[str] = {"calendar", "dialpad_sms"}
 _DISPLAY_REF_RE = re.compile(r"\s*\[[^\]]+#\d+\]\s*$")
+_WHITESPACE_RE = re.compile(r"\s+")
 
 
 def _clean_match_title(value: str) -> str:
     return _DISPLAY_REF_RE.sub("", value).strip()
+
+
+def _single_line(value: Any) -> str:
+    text = str(value or "")
+    without_controls = "".join(
+        " " if unicodedata.category(char) in {"Cc", "Cf"} else char
+        for char in text
+    )
+    return _WHITESPACE_RE.sub(" ", without_controls).strip()
 
 
 def _occurred_at_iso(value: str | datetime | date) -> str:
@@ -72,9 +83,10 @@ def _base_record(
         raise ValueError("provider_id is required")
     if not provider_state.strip():
         raise ValueError("provider_state is required")
-    clean_title = _clean_match_title(match_title)
+    clean_title = _clean_match_title(_single_line(match_title))
     if not clean_title:
         raise ValueError("match_title is required")
+    display_title = _single_line(title) if title is not None else clean_title
 
     record = _evidence(source, clean_title, provider_id, url)
     record.update(
@@ -88,7 +100,7 @@ def _base_record(
             "evidence_hash": _evidence_hash(source, provider_id),
             "occurred_at": _occurred_at_iso(occurred_at),
             "match_title": clean_title,
-            "title": (title or clean_title).strip(),
+            "title": display_title or clean_title,
             "url": url,
             "match": match,
             "auto_done_eligible": (
