@@ -7,7 +7,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
@@ -481,7 +481,15 @@ def generate_standup(
     if tasks_data is None:
         _, tasks_data = load_tasks()
 
-    requested_date = resolve_standup_date(date_str) if date_str else None
+    # Only a VALID explicit date selects an explicit (target-date) window; a missing
+    # OR malformed date_str falls through to the implicit prior-workday standup window
+    # (a typo must NOT silently retarget the evidence window to today).
+    requested_date: date | None = None
+    if date_str:
+        try:
+            requested_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            requested_date = None
     standup_window = harvest_window.resolve_standup_window(target_date=requested_date)
     standup_date = standup_window.plan_date
     date_display = standup_date.strftime("%A, %B %d")

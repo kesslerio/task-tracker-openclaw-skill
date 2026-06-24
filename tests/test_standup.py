@@ -335,3 +335,30 @@ def test_harvest_degrade_still_exposes_deterministic_week_window(env, monkeypatc
     assert output["date_display"] == "Tuesday, June 23"
     assert output["week_id"] == "2026-W26"
     assert output["evidence_harvest"]["window"]["window_id"] == "2026-W26:2026-06-23:standup"
+
+
+def test_invalid_date_string_uses_implicit_prior_workday_window(env, monkeypatch):
+    # A typo'd date (/standup 2026-99-99) must NOT silently retarget the evidence
+    # window to today; it falls through to the implicit prior-workday standup window.
+    captured = {}
+
+    def harvest(date_str, *, trigger, resolved_window=None):
+        captured["resolved_window"] = resolved_window
+        return {"evidence_candidates": [], "health": {}, "window": resolved_window.as_dict()}
+
+    # Tuesday 2026-06-23 Pacific -> implicit evidence window = Monday 2026-06-22.
+    monkeypatch.setattr(cos_config, "local_now", lambda: datetime.fromisoformat("2026-06-23T08:00:00-07:00"))
+    monkeypatch.setattr(standup, "_standup_harvest_result", harvest)
+
+    output = standup.generate_standup(
+        date_str="2026-99-99",
+        json_output=True,
+        tasks_data=_tasks_data(),
+        capacity_records=[],
+    )
+
+    assert output["date_display"] == "Tuesday, June 23"
+    assert output["standup_window"]["plan_date"] == "2026-06-23"
+    # The implicit window summarizes the PRIOR workday, not today (the bug would be today).
+    assert output["standup_window"]["evidence_date"] == "2026-06-22"
+    assert captured["resolved_window"].evidence_date.isoformat() == "2026-06-22"
