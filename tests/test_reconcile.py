@@ -276,3 +276,14 @@ def test_reconcile_is_idempotent_for_completed_and_remaining_sets():
     assert second_remaining == first_remaining
     assert rerun_completed == first_completed
     assert rerun_remaining == first_remaining
+
+
+def test_punctuation_only_variants_dedupe_to_one_completed():
+    # "follow up" vs "follow-up" are the same accomplishment; normalize_title keeps
+    # the hyphen, so reconcile uses a punctuation-insensitive key to collapse them.
+    user_stated = [_claim("Ship the follow up"), _claim("Ship the follow-up")]
+
+    completed, remaining = reconcile.merge(user_stated, [])
+
+    assert len(completed) == 1
+    assert remaining == []

@@ -40,7 +40,7 @@ def _dedupe_user_stated(user_stated: list[dict[str, Any]]) -> list[dict[str, Any
     by_title: dict[str, dict[str, Any]] = {}
 
     for item in user_stated:
-        normalized = normalize_title(str(item.get("title") or ""))
+        normalized = _title_key(str(item.get("title") or ""))
         if not normalized:
             continue
         existing = by_title.get(normalized)
@@ -77,7 +77,7 @@ def _matches(item: dict[str, Any], candidate: dict[str, Any]) -> bool:
     if candidate_task_id and candidate_task_id in _item_task_ids(item):
         return True
 
-    normalized_title = normalize_title(str(item.get("title") or ""))
+    normalized_title = _title_key(str(item.get("title") or ""))
     return _is_specific_title(normalized_title) and _candidate_normalized_title(candidate) == normalized_title
 
 
@@ -86,6 +86,18 @@ def _is_specific_title(normalized: str) -> bool:
     if len(tokens) < 3:
         return False
     return not all(token in _GENERIC_TITLES for token in tokens)
+
+
+def _title_key(title: str) -> str:
+    """Reconcile-specific dedup/match key: normalize_title PLUS punctuation-insensitive.
+
+    ``normalize_title`` preserves ``-`` and ``/``, so "follow up" and "follow-up"
+    would otherwise stay distinct. For deduping confirmed completions and matching
+    evidence by title we treat hyphen/slash as whitespace so common punctuation
+    variants of the same accomplishment collapse to one (the documented contract).
+    """
+    normalized = normalize_title(str(title or ""))
+    return re.sub(r"\s+", " ", re.sub(r"[-/]+", " ", normalized)).strip()
 
 
 def _item_hashes(item: dict[str, Any]) -> set[str]:
@@ -134,7 +146,7 @@ def _candidate_normalized_title(candidate: dict[str, Any]) -> str:
     for key in ("normalized_title", "match_title", "title"):
         value = candidate.get(key)
         if value:
-            return normalize_title(str(value))
+            return _title_key(str(value))
     return ""
 
 
