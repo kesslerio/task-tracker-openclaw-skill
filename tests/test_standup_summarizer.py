@@ -489,3 +489,22 @@ def test_enable_flag_off_uses_fallback_without_http(state_dir):
 
     assert result["translated"] is False
     assert result["bullets"][0]["bullet"] == "Ship summarizer cache"
+
+
+def test_cache_write_failure_does_not_abort_summarize(state_dir, monkeypatch):
+    # The model call succeeds but the cache write fails (disk full / perms / rename).
+    # The summarizer must still return the translated draft, not raise (fail-open).
+    items = [{"evidence_id": "sha256:github:one", "area": "eng", "bullet": "Shipped the summarizer"}]
+
+    def ok_post(url, payload, timeout):
+        return _envelope(items)
+
+    def boom(*_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(standup_summarizer, "_store_cache", boom)
+
+    result = standup_summarizer.summarize([_candidate()], http_post=ok_post)
+
+    assert result["translated"] is True
+    assert result["bullets"][0]["evidence_id"] == "sha256:github:one"

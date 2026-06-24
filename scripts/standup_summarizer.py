@@ -363,5 +363,8 @@ def summarize(
         "draft": True,
         "confirmed": False,
     }
-    _store_cache(key, result)
+    try:
+        _store_cache(key, result)
+    except Exception:  # noqa: BLE001 -- best-effort cache; a write failure must not abort the standup
+        pass
     return result
