@@ -89,6 +89,46 @@ def test_user_done_without_matching_evidence_stays_unchanged():
     assert remaining == evidence
 
 
+def test_generic_short_title_does_not_absorb_unrelated_title_candidate():
+    candidate = _candidate("Update", evidence_hash="sha256:test-generic-update")
+
+    completed, remaining = reconcile.merge([_claim("Update")], [candidate])
+
+    assert completed == [_claim("Update")]
+    assert remaining == [candidate]
+
+
+def test_specific_multi_word_title_matches_evidence_by_title():
+    candidate = _candidate("Ship monthly billing reconcile", evidence_hash="sha256:test-specific-title")
+
+    completed, remaining = reconcile.merge([_claim("Ship monthly billing reconcile")], [candidate])
+
+    assert remaining == []
+    assert completed[0]["title"] == "Ship monthly billing reconcile"
+    assert completed[0]["provenance"][1]["evidence_hash"] == "sha256:test-specific-title"
+
+
+def test_short_title_still_matches_by_evidence_hash_or_task_id():
+    evidence_hash_candidate = _candidate("Unrelated hash evidence", evidence_hash="sha256:test-short-title")
+    task_id_candidate = _candidate(
+        "Unrelated task id evidence",
+        evidence_hash="sha256:test-short-title-task",
+        matched_task_id="tsk_4242424242",
+    )
+
+    completed, remaining = reconcile.merge(
+        [_claim("Fix", evidence_hash="sha256:test-short-title", task_id="tsk_4242424242")],
+        [evidence_hash_candidate, task_id_candidate],
+    )
+
+    assert remaining == []
+    assert completed[0]["title"] == "Fix"
+    assert [entry["evidence_hash"] for entry in completed[0]["provenance"][1:]] == [
+        "sha256:test-short-title",
+        "sha256:test-short-title-task",
+    ]
+
+
 def test_calendar_matching_confirmed_item_supplements_but_calendar_alone_stays_candidate():
     confirmed_calendar = _candidate(
         "Met with Finance review",
@@ -159,6 +199,49 @@ def test_explicit_task_ref_matches_daily_note_text_claim():
     assert remaining == []
     assert completed[0]["title"] == "Closed payroll sync task_id::tsk_payroll"
     assert completed[0]["provenance"][1]["evidence_hash"] == "sha256:test-text-ref"
+
+
+def test_url_embedded_task_id_does_not_match_daily_note_text_claim():
+    candidate = _candidate(
+        "Different github activity",
+        evidence_hash="sha256:test-url-id",
+        matched_task_id="tsk_4242424242",
+    )
+
+    completed, remaining = reconcile.merge(
+        [
+            _claim(
+                "Did unrelated local thing",
+                raw_line="- [x] Did unrelated local thing; see https://example.test/t?id::tsk_4242424242",
+            )
+        ],
+        [candidate],
+    )
+
+    assert completed == [
+        _claim(
+            "Did unrelated local thing",
+            raw_line="- [x] Did unrelated local thing; see https://example.test/t?id::tsk_4242424242",
+        )
+    ]
+    assert remaining == [candidate]
+
+
+def test_space_preceded_task_id_matches_daily_note_text_claim():
+    candidate = _candidate(
+        "Different github activity",
+        evidence_hash="sha256:test-space-id",
+        matched_task_id="tsk_4242424242",
+    )
+
+    completed, remaining = reconcile.merge(
+        [_claim("Did the thing", raw_line="- [x] did the thing task_id:: tsk_4242424242")],
+        [candidate],
+    )
+
+    assert remaining == []
+    assert completed[0]["title"] == "Did the thing"
+    assert completed[0]["provenance"][1]["matched_task_id"] == "tsk_4242424242"
 
 
 def test_candidate_with_no_claim_and_no_ref_stays_candidate():

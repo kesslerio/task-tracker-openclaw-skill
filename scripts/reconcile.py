@@ -9,6 +9,9 @@ from typing import Any
 from evidence_matching import normalize_title
 
 
+_GENERIC_TITLES = frozenset({"update", "fix", "wip", "standup", "misc", "cleanup", "chores", "notes", "done", "review"})
+
+
 def merge(user_stated: list[dict[str, Any]], evidence_candidates: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Return confirmed completions enriched with matching evidence.
 
@@ -74,7 +77,15 @@ def _matches(item: dict[str, Any], candidate: dict[str, Any]) -> bool:
     if candidate_task_id and candidate_task_id in _item_task_ids(item):
         return True
 
-    return _candidate_normalized_title(candidate) == normalize_title(str(item.get("title") or ""))
+    normalized_title = normalize_title(str(item.get("title") or ""))
+    return _is_specific_title(normalized_title) and _candidate_normalized_title(candidate) == normalized_title
+
+
+def _is_specific_title(normalized: str) -> bool:
+    tokens = normalized.split()
+    if len(tokens) < 3:
+        return False
+    return not all(token in _GENERIC_TITLES for token in tokens)
 
 
 def _item_hashes(item: dict[str, Any]) -> set[str]:
@@ -115,7 +126,7 @@ def _item_task_ids(item: dict[str, Any]) -> set[str]:
 def _inline_task_ids(text: str) -> set[str]:
     if not text:
         return set()
-    pattern = r"\b(?:task_id|id)::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$|[),.;!?])"
+    pattern = r"(?:^|\s)(?:task_id|id)::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$|[),.;!?])"
     return set(re.findall(pattern, text, flags=re.IGNORECASE))
 
 
