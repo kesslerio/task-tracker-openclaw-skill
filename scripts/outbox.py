@@ -66,7 +66,15 @@ from utils import _atomic_write
 # * ``eod`` -- a U7 EOD ritual delivery, keyed on the local CALENDAR DATE. One EOD per
 #   day: a same-day cron retry (or a manual re-fire before midnight) short-circuits to
 #   the recorded receipt and never double-sends the evening ritual.
-_KNOWN_KINDS: frozenset[str] = frozenset({"nag", "checkin", "ledger", "eod"})
+# * ``initiation`` -- a v0.4 initiation nudge ("you said X was today's #1, it's 2pm,
+#   not started -- Start it?"), keyed on (focus_episode_id, stage) where
+#   ``focus_episode_id`` is the deterministic committed-#1 episode SLOT
+#   (``<user_scope>:<task_id>:<local_date>`` -- see ``initiation_contract``) and
+#   ``stage`` is ``cold_start`` | ``cold_start_renudge``. The slot+stage (NOT a clock
+#   period, and NOT a focus-session id -- a cold-start nudge fires BEFORE any focus
+#   session exists) is the dedupe identity: a deterministic-dispatcher cron RETRY can
+#   never double-send the same stage's nudge for the day's #1.
+_KNOWN_KINDS: frozenset[str] = frozenset({"nag", "checkin", "ledger", "eod", "initiation"})
 
 
 def _now_iso() -> str:

@@ -51,6 +51,18 @@ def test_make_idem_key_rejects_unknown_kind():
         outbox.make_idem_key("bogus", "tsk_x")
 
 
+def test_make_idem_key_initiation_is_known_and_namespaced():
+    # v0.4-C: the initiation nudge key is (focus_episode_id, stage); the
+    # focus_episode_id slot carries user_scope, so the colon-joined key stays
+    # namespaced distinctly from nag/checkin/ledger/eod.
+    key = outbox.make_idem_key("initiation", "work:tsk_x:2026-06-24", "cold_start")
+    assert key == "initiation:work:tsk_x:2026-06-24:cold_start"
+
+
+def test_initiation_is_a_known_kind():
+    assert "initiation" in outbox._KNOWN_KINDS
+
+
 # --- deliver_once idempotency ----------------------------------------------
 
 def test_deliver_once_calls_sender_exactly_once_per_key(state):
