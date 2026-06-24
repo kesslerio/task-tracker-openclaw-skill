@@ -292,3 +292,32 @@ def test_gog_timeout_error_log_redacts_access_token(tmp_path, monkeypatch):
     raw_log = (tmp_path / "errors.jsonl").read_text()
     assert "SENTINELTOKEN123" not in raw_log
     assert "<redacted>" in raw_log
+
+
+def test_partial_multi_calendar_failure_marks_source_failed(monkeypatch):
+    # Two calendars; one gog call fails, the other returns an accepted event. The
+    # successful event is still returned, but failed=True so the orchestrator records a
+    # degraded calendar source and does not advance the calendar watermark (U2 invariant).
+    monkeypatch.setenv(
+        "STANDUP_CALENDARS",
+        json.dumps(
+            {
+                "ok": {"cmd": "gog", "calendar_id": "cal_ok", "account": "owner@example.test"},
+                "broken": {"cmd": "gog", "calendar_id": "cal_fail", "account": "owner@example.test"},
+            }
+        ),
+    )
+    good_event = _event("evt_ok", "Past accepted", "2026-06-23T09:00:00-07:00", response="accepted")
+
+    def fake_run(cmd, **kwargs):
+        if "cal_fail" in cmd:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="fixture failure")
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"events": [good_event]}), stderr="")
+
+    monkeypatch.setattr(calendar_adapter.subprocess, "run", fake_run)
+    monkeypatch.setattr(calendar_adapter.error_envelope, "breaker_open", lambda *_a, **_k: False)
+
+    records, failed = calendar_adapter.harvest(resolved=_resolved(), trigger="test")
+
+    assert failed is True
+    assert [r["provider_id"] for r in records] == ["evt_ok"]

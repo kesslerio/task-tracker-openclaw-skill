@@ -235,4 +235,7 @@ def harvest(
         except _SUBPROCESS_FAILURES as exc:
             failed += 1
             error_envelope.log_degraded(COMPONENT, exc, trigger=trigger, check="calendar")
-    return records, bool(configs and failed == len(configs))
+    # ANY per-calendar failure -> failed=True, so the orchestrator records a degraded
+    # calendar source AND does not advance the calendar watermark past events the failed
+    # calendar would have returned (the U2 watermark-safety invariant).
+    return records, failed > 0
