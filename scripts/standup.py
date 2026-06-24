@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from candidate_review import candidate_review_summary
 from task_audit import task_audit_summary
 from daily_notes import extract_completed_actions, extract_completed_tasks
+import harvest_window
 import standup_harvest
 from standup_common import (
     calendar_error,
@@ -181,9 +182,18 @@ def _identity_fields(task: dict) -> dict:
     }
 
 
-def _standup_harvest_result(date_str: str | None, *, trigger: str) -> dict:
+def _standup_harvest_result(
+    date_str: str | None,
+    *,
+    trigger: str,
+    resolved_window: harvest_window.HarvestWindow | None = None,
+) -> dict:
     try:
-        return standup_harvest.harvest(target_date=date_str, trigger=trigger)
+        return standup_harvest.harvest(
+            target_date=date_str,
+            trigger=trigger,
+            resolved_window=resolved_window,
+        )
     except Exception as exc:  # noqa: BLE001 -- standup must degrade, not blank
         error_envelope.log_degraded("standup:harvest", exc, trigger=trigger, check="evidence_harvest")
         return {"evidence_candidates": [], "health": {"status": "failed"}, "window": None}
@@ -471,13 +481,18 @@ def generate_standup(
     if tasks_data is None:
         _, tasks_data = load_tasks()
 
-    standup_date = resolve_standup_date(date_str)
+    requested_date = resolve_standup_date(date_str) if date_str else None
+    standup_window = harvest_window.resolve_standup_window(target_date=requested_date)
+    standup_date = standup_window.plan_date
     date_display = standup_date.strftime("%A, %B %d")
 
     # Build output using new task structure (q1, q2, q3, team, backlog)
     output = {
         'date': str(standup_date),
         'date_display': date_display,
+        'week_id': standup_window.week_id,
+        'window_id': standup_window.window_id,
+        'standup_window': standup_window.as_dict(),
         'calendar': get_calendar_events(trigger="user_command:/standup"),
         'priority': None,
         'due_today': [],
@@ -522,8 +537,9 @@ def generate_standup(
     output['team'] = tasks_data.get('team', [])
 
     harvest_result = _standup_harvest_result(
-        date_str,
+        str(requested_date) if requested_date else None,
         trigger="user_command:/standup",
+        resolved_window=standup_window,
     )
     evidence_candidates = harvest_result.get("evidence_candidates") or []
 
@@ -545,7 +561,7 @@ def generate_standup(
     )
     output['evidence_harvest'] = {
         "health": harvest_result.get("health") or {},
-        "window": harvest_result.get("window"),
+        "window": harvest_result.get("window") or standup_window.as_dict(),
         "run_id": harvest_result.get("run_id"),
         "summary": harvest_result.get("summary"),
     }

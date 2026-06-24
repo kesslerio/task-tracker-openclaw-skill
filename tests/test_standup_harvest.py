@@ -1,5 +1,6 @@
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
 
@@ -12,6 +13,7 @@ import cos_health
 import error_envelope
 import harvest_ledger
 import harvest_state
+import harvest_window
 import standup
 import standup_harvest
 import utils
@@ -258,3 +260,26 @@ def test_failed_source_watermark_is_not_advanced(env, monkeypatch):
     watermarks = state.get("watermarks") or {}
     assert "github" not in watermarks
     assert watermarks.get("gmail") == "2026-06-23T13:00:00-07:00"
+
+
+def test_concurrent_standup_harvest_creates_one_correct_window_state(env, monkeypatch):
+    _stub_adapters(monkeypatch, github=[_github_record("Fix payroll sync acme/app#42")])
+    resolved = harvest_window.resolve_standup_window(target_date=date(2026, 6, 23))
+
+    def run_once():
+        return standup_harvest.harvest(
+            target_date=date(2026, 6, 23),
+            trigger="test",
+            resolved_window=resolved,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: run_once(), range(2)))
+
+    candidates = [candidate for result in results for candidate in result["evidence_candidates"]]
+    assert len(candidates) == 1
+    state_file = env["state_dir"] / "harvest-state-standup.json"
+    saved = json.loads(state_file.read_text(encoding="utf-8"))
+    assert saved["harvest_window_id"] == "2026-W26:2026-06-23:standup"
+    assert saved["seen_hashes"] == [candidates[0]["evidence_hash"]]
+    assert len(list(env["state_dir"].glob("harvest-state-standup.json"))) == 1

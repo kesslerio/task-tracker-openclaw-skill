@@ -213,9 +213,14 @@ def _github_summary_metadata(candidates: list[dict[str, Any]]) -> list[dict[str,
     return minimal
 
 
-def harvest(*, target_date: str | date | None = None, trigger: str) -> dict[str, Any]:
+def harvest(
+    *,
+    target_date: str | date | None = None,
+    trigger: str,
+    resolved_window: harvest_window.HarvestWindow | None = None,
+) -> dict[str, Any]:
     """Return fresh standup evidence candidates for the stable U1 window."""
-    resolved = harvest_window.resolve_standup_window(target_date=target_date)
+    resolved = resolved_window or harvest_window.resolve_standup_window(target_date=target_date)
     state, expired = harvest_state.load_or_reset(
         resolved.window_id,
         harvest_state.WINDOW_STANDUP,
