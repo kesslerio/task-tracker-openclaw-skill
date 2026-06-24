@@ -1,5 +1,6 @@
 import json
 import sys
+from datetime import date, datetime
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import standup
+import cos_config
 import utils
 
 
@@ -95,7 +97,7 @@ def test_evidence_candidates_do_not_change_completed_bytes(env, monkeypatch):
     monkeypatch.setattr(
         standup,
         "_standup_harvest_result",
-        lambda date_str, *, trigger: {"evidence_candidates": [], "health": {}, "window": None},
+        lambda date_str, *, trigger, resolved_window=None: {"evidence_candidates": [], "health": {}, "window": None},
     )
     before = standup.generate_standup(
         date_str="2026-06-23",
@@ -108,7 +110,7 @@ def test_evidence_candidates_do_not_change_completed_bytes(env, monkeypatch):
     monkeypatch.setattr(
         standup,
         "_standup_harvest_result",
-        lambda date_str, *, trigger: {
+        lambda date_str, *, trigger, resolved_window=None: {
             "evidence_candidates": [_candidate()],
             "health": {"github": {"status": "ok"}},
             "window": {"window_id": "2026-W26:2026-06-23:standup"},
@@ -132,7 +134,7 @@ def test_matching_evidence_enriches_confirmed_done_and_is_not_rendered_twice(env
     monkeypatch.setattr(
         standup,
         "_standup_harvest_result",
-        lambda date_str, *, trigger: {
+        lambda date_str, *, trigger, resolved_window=None: {
             "evidence_candidates": [candidate],
             "health": {"github": {"status": "ok"}},
             "window": {"window_id": "2026-W26:2026-06-23:standup"},
@@ -158,7 +160,7 @@ def test_harvested_candidates_render_in_read_only_section(env, monkeypatch):
     monkeypatch.setattr(
         standup,
         "_standup_harvest_result",
-        lambda date_str, *, trigger: {
+        lambda date_str, *, trigger, resolved_window=None: {
             "evidence_candidates": [_candidate()],
             "health": {"github": {"status": "ok"}},
             "window": {"window_id": "2026-W26:2026-06-23:standup"},
@@ -198,7 +200,7 @@ def test_draft_summary_renders_read_only_and_does_not_change_completed(env, monk
     monkeypatch.setattr(
         standup,
         "_standup_harvest_result",
-        lambda date_str, *, trigger: {
+        lambda date_str, *, trigger, resolved_window=None: {
             "evidence_candidates": [_candidate()],
             "summary": summary,
             "health": {"github": {"status": "ok"}},
@@ -225,3 +227,138 @@ def test_draft_summary_renders_read_only_and_does_not_change_completed(env, monk
     assert "Draft summary (unconfirmed)" in text
     assert "Shipped payroll sync fix" in text
     assert "Read-only draft; not recorded as completed." in text
+
+
+def test_tuesday_standup_label_and_week_are_from_pacific_window(env, monkeypatch):
+    captured = {}
+
+    def harvest(date_str, *, trigger, resolved_window=None):
+        captured["date_str"] = date_str
+        captured["resolved_window"] = resolved_window
+        return {"evidence_candidates": [], "health": {}, "window": resolved_window.as_dict()}
+
+    monkeypatch.setattr(cos_config, "local_now", lambda: datetime.fromisoformat("2026-06-23T00:05:00-07:00"))
+    monkeypatch.setattr(standup, "_standup_harvest_result", harvest)
+
+    output = standup.generate_standup(
+        json_output=True,
+        tasks_data=_tasks_data(),
+        capacity_records=[],
+    )
+
+    assert output["date"] == "2026-06-23"
+    assert output["date_display"] == "Tuesday, June 23"
+    assert output["week_id"] == "2026-W26"
+    assert output["window_id"] == "2026-W26:2026-06-23:standup"
+    assert output["standup_window"]["evidence_date"] == "2026-06-22"
+    assert output["evidence_harvest"]["window"]["window_id"] == output["window_id"]
+    assert captured["date_str"] is None
+    assert captured["resolved_window"].plan_date == date(2026, 6, 23)
+
+
+def test_explicit_target_date_controls_label_week_and_harvest_window(env, monkeypatch):
+    captured = {}
+
+    def harvest(date_str, *, trigger, resolved_window=None):
+        captured["date_str"] = date_str
+        captured["resolved_window"] = resolved_window
+        return {"evidence_candidates": [], "health": {}, "window": resolved_window.as_dict()}
+
+    monkeypatch.setattr(cos_config, "local_now", lambda: datetime.fromisoformat("2030-01-01T08:00:00-08:00"))
+    monkeypatch.setattr(standup, "_standup_harvest_result", harvest)
+
+    output = standup.generate_standup(
+        date_str="2021-01-04",
+        json_output=True,
+        tasks_data=_tasks_data(),
+        capacity_records=[],
+    )
+
+    assert output["date_display"] == "Monday, January 04"
+    assert output["week_id"] == "2021-W01"
+    assert output["window_id"] == "2021-W01:2021-01-04:standup"
+    assert output["standup_window"]["evidence_date"] == "2021-01-04"
+    assert captured["date_str"] == "2021-01-04"
+    assert captured["resolved_window"].week_id == "2021-W01"
+
+
+@pytest.mark.parametrize(
+    ("target", "expected_label", "expected_week"),
+    [
+        ("2026-03-09", "Monday, March 09", "2026-W11"),
+        ("2026-11-02", "Monday, November 02", "2026-W45"),
+        ("2020-12-31", "Thursday, December 31", "2020-W53"),
+        ("2021-01-01", "Friday, January 01", "2020-W53"),
+    ],
+)
+def test_standup_labels_dst_and_iso_week_boundaries(env, monkeypatch, target, expected_label, expected_week):
+    monkeypatch.setattr(
+        standup,
+        "_standup_harvest_result",
+        lambda date_str, *, trigger, resolved_window=None: {
+            "evidence_candidates": [],
+            "health": {},
+            "window": resolved_window.as_dict(),
+        },
+    )
+
+    output = standup.generate_standup(
+        date_str=target,
+        json_output=True,
+        tasks_data=_tasks_data(),
+        capacity_records=[],
+    )
+
+    assert output["date_display"] == expected_label
+    assert output["week_id"] == expected_week
+    assert output["evidence_harvest"]["window"]["week_id"] == expected_week
+
+
+def test_harvest_degrade_still_exposes_deterministic_week_window(env, monkeypatch):
+    monkeypatch.setattr(
+        standup,
+        "_standup_harvest_result",
+        lambda date_str, *, trigger, resolved_window=None: {
+            "evidence_candidates": [],
+            "health": {"status": "failed"},
+            "window": None,
+        },
+    )
+
+    output = standup.generate_standup(
+        date_str="2026-06-23",
+        json_output=True,
+        tasks_data=_tasks_data(),
+        capacity_records=[],
+    )
+
+    assert output["date_display"] == "Tuesday, June 23"
+    assert output["week_id"] == "2026-W26"
+    assert output["evidence_harvest"]["window"]["window_id"] == "2026-W26:2026-06-23:standup"
+
+
+def test_invalid_date_string_uses_implicit_prior_workday_window(env, monkeypatch):
+    # A typo'd date (/standup 2026-99-99) must NOT silently retarget the evidence
+    # window to today; it falls through to the implicit prior-workday standup window.
+    captured = {}
+
+    def harvest(date_str, *, trigger, resolved_window=None):
+        captured["resolved_window"] = resolved_window
+        return {"evidence_candidates": [], "health": {}, "window": resolved_window.as_dict()}
+
+    # Tuesday 2026-06-23 Pacific -> implicit evidence window = Monday 2026-06-22.
+    monkeypatch.setattr(cos_config, "local_now", lambda: datetime.fromisoformat("2026-06-23T08:00:00-07:00"))
+    monkeypatch.setattr(standup, "_standup_harvest_result", harvest)
+
+    output = standup.generate_standup(
+        date_str="2026-99-99",
+        json_output=True,
+        tasks_data=_tasks_data(),
+        capacity_records=[],
+    )
+
+    assert output["date_display"] == "Tuesday, June 23"
+    assert output["standup_window"]["plan_date"] == "2026-06-23"
+    # The implicit window summarizes the PRIOR workday, not today (the bug would be today).
+    assert output["standup_window"]["evidence_date"] == "2026-06-22"
+    assert captured["resolved_window"].evidence_date.isoformat() == "2026-06-22"

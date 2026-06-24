@@ -1,12 +1,32 @@
 import json
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import harvest_state
+
+
+@pytest.mark.parametrize(
+    ("reference", "expected"),
+    [
+        (date(2020, 12, 31), "2020-W53"),
+        (date(2021, 1, 1), "2020-W53"),
+        (date(2021, 1, 4), "2021-W01"),
+        (date(2026, 6, 23), "2026-W26"),
+    ],
+)
+def test_iso_week_id_uses_iso_week_year_boundary(reference, expected):
+    assert harvest_state.iso_week_id(reference) == expected
+
+
+def test_standup_window_id_uses_canonical_iso_week_id():
+    assert harvest_state.window_id(harvest_state.WINDOW_STANDUP, date(2021, 1, 1)) == "2020-W53"
 
 
 def test_pre_u1_state_loads_defaults_and_round_trips_seen_hashes(tmp_path, monkeypatch):
