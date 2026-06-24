@@ -299,6 +299,18 @@ def ledger_digest_weekday() -> int:
     return day if 0 <= day <= 6 else 4
 
 
+# --- Dialpad SMS standup evidence knobs (v0.3.1 U3) -----------------------
+
+def dialpad_sms_pushback_message_threshold() -> int:
+    """Outbound SMS count that makes a thread substantive (default 3)."""
+    return max(1, _int_env("DIALPAD_SMS_PUSHBACK_MESSAGE_THRESHOLD", 3))
+
+
+def dialpad_sms_pushback_char_threshold() -> int:
+    """Outbound SMS character total that makes a thread substantive (default 200)."""
+    return max(1, _int_env("DIALPAD_SMS_PUSHBACK_CHAR_THRESHOLD", 200))
+
+
 # --- Undo windows (Decision #8) -------------------------------------------
 
 def undo_window_nag_hours() -> int:

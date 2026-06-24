@@ -9,3 +9,5 @@ def isolate_unwritable_ambient_state_dir(tmp_path, monkeypatch):
     raw = os.getenv("TASK_MGMT_STATE_DIR", "")
     if raw.startswith("/data/"):
         monkeypatch.setenv("TASK_MGMT_STATE_DIR", str(tmp_path / "state"))
+    # Standup harvest tests must never read a developer's live Dialpad SMS store.
+    monkeypatch.setenv("DIALPAD_SMS_DB", str(tmp_path / "missing-sms.db"))
