@@ -227,6 +227,119 @@ def test_health_empty_shows_registry_rituals_as_missing(capsys):
         assert f"MISSING {ritual}: last_success never" in out
 
 
+# --- U7: source-level standup health surfacing ------------------------------
+
+
+def test_health_surfaces_failed_standup_source_under_ok_ritual(capsys):
+    ts = cos_config.local_now().isoformat()
+    _write_health({
+        "standup": {
+            "last_success_ts": ts,
+            "sources": {
+                "github": {"status": "ok", "ts": ts, "trigger": "cron:standup", "last_success_ts": ts},
+                "gmail": {"status": "ok", "ts": ts, "trigger": "cron:standup", "last_success_ts": ts},
+                "calendar": {
+                    "status": "failed",
+                    "ts": ts,
+                    "trigger": "cron:standup",
+                    "last_failure": {
+                        "error_class": "calendar_harvest_failed",
+                        "ts": ts,
+                        "trigger": "cron:standup",
+                    },
+                    "last_failure_ts": ts,
+                },
+                "dialpad_sms": {"status": "ok", "ts": ts, "trigger": "cron:standup", "last_success_ts": ts},
+            },
+        },
+    })
+
+    cos_manifest.main(["health"])
+    out = capsys.readouterr().out
+    assert f"OK standup: last_success {ts}" in out
+    assert f"  calendar: failed @ {ts} | last_failure: calendar_harvest_failed @ {ts}" in out
+    assert f"  github: ok @ {ts}" in out
+    assert f"  gmail: ok @ {ts}" in out
+    assert f"  dialpad_sms: ok @ {ts}" in out
+
+
+def test_health_surfaces_missing_dialpad_db_as_failed_source(capsys):
+    ts = cos_config.local_now().isoformat()
+    _write_health({
+        "standup": {
+            "last_success_ts": ts,
+            "sources": {
+                "dialpad_sms": {
+                    "status": "failed",
+                    "ts": ts,
+                    "trigger": "cron:standup",
+                    "last_failure": {
+                        "error_class": "dialpad_sms_harvest_failed",
+                        "ts": ts,
+                        "trigger": "cron:standup",
+                    },
+                    "last_failure_ts": ts,
+                },
+            },
+        },
+    })
+
+    cos_manifest.main(["health"])
+    out = capsys.readouterr().out
+    assert f"  dialpad_sms: failed @ {ts} | last_failure: dialpad_sms_harvest_failed @ {ts}" in out
+
+
+def test_health_distinguishes_clean_empty_source_from_unharvested(capsys):
+    ts = cos_config.local_now().isoformat()
+    _write_health({
+        "standup": {
+            "last_success_ts": ts,
+            "sources": {
+                "github": {"status": "ok", "ts": ts, "trigger": "cron:standup", "last_success_ts": ts},
+            },
+        },
+    })
+
+    cos_manifest.main(["health"])
+    out = capsys.readouterr().out
+    assert f"  github: ok @ {ts}" in out
+    assert "  calendar: unharvested" in out
+    assert "  dialpad_sms: unharvested" in out
+    assert "  gmail: unharvested" in out
+
+
+def test_health_surfaces_all_failed_standup_sources(capsys):
+    ts = cos_config.local_now().isoformat()
+    sources = {
+        source: {
+            "status": "failed",
+            "ts": ts,
+            "trigger": "cron:standup",
+            "last_failure": {
+                "error_class": f"{source}_harvest_failed",
+                "ts": ts,
+                "trigger": "cron:standup",
+            },
+            "last_failure_ts": ts,
+        }
+        for source in ("github", "gmail", "calendar", "dialpad_sms")
+    }
+    _write_health({
+        "standup": {
+            "last_success_ts": ts,
+            "last_failure": {"error_class": "standup_harvest_failed", "ts": ts, "trigger": "cron:standup"},
+            "last_failure_ts": ts,
+            "sources": sources,
+        },
+    })
+
+    cos_manifest.main(["health"])
+    out = capsys.readouterr().out
+    assert "DEGRADED standup" in out
+    for source in sources:
+        assert f"  {source}: failed @ {ts} | last_failure: {source}_harvest_failed @ {ts}" in out
+
+
 # --- skill_version best-effort ----------------------------------------------
 
 

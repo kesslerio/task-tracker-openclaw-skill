@@ -71,6 +71,14 @@ _EXPECTED_RITUALS: dict[str, int] = {
     "ledger_harvest": 24 * 8,  # weekly brag digest (Friday) + a missed run of slack
 }
 
+# Source-level expected registry for rituals with adapter fan-out. The health receipt
+# writer already stamps clean runs as ``ok`` and source errors as ``failed``/``partial``;
+# the read-side view uses this registry to distinguish a clean-empty source from one
+# that never recorded a receipt for the ritual window.
+_EXPECTED_RITUAL_SOURCES: dict[str, tuple[str, ...]] = {
+    "standup": ("github", "gmail", "calendar", "dialpad_sms"),
+}
+
 # Stamp files checked (in order) for the deployed skill version. Best-effort: the
 # first that exists wins; absent -> "unknown" (a worktree has no deploy stamp).
 _STAMP_FILES = ("VERSION", "DEPLOY_STAMP")
@@ -201,6 +209,35 @@ def _ritual_flag(entry: dict[str, Any] | None, *, stale_hours: int, registered: 
     return "OK"
 
 
+def _source_lines(ritual: str, entry: dict[str, Any] | None) -> list[str]:
+    """Render source-level health receipts under a ritual line.
+
+    Expected standup sources with no receipt are rendered as ``unharvested``. A
+    recorded ``ok`` receipt means the source ran cleanly, even if it found zero
+    evidence; absence is the only missing/unharvested state.
+    """
+    raw_sources = (entry or {}).get("sources")
+    recorded = raw_sources if isinstance(raw_sources, dict) else {}
+    expected = _EXPECTED_RITUAL_SOURCES.get(ritual, ())
+    names = sorted(set(expected) | set(recorded))
+    lines: list[str] = []
+    for source in names:
+        raw_receipt = recorded.get(source)
+        if not isinstance(raw_receipt, dict):
+            lines.append(f"  {source}: unharvested")
+            continue
+
+        status = str(raw_receipt.get("status") or "unknown")
+        ts = raw_receipt.get("ts")
+        ts_part = f" @ {ts}" if ts else ""
+        failure_part = ""
+        failure = raw_receipt.get("last_failure")
+        if status in {"partial", "failed"} and isinstance(failure, dict):
+            failure_part = f" | last_failure: {failure.get('error_class')} @ {failure.get('ts')}"
+        lines.append(f"  {source}: {status}{ts_part}{failure_part}")
+    return lines
+
+
 def health_lines(*, stale_hours: int = _DEFAULT_STALE_HOURS) -> list[str]:
     """Render the per-ritual health summary, flagging stale/degraded/missing rituals.
 
@@ -240,6 +277,7 @@ def health_lines(*, stale_hours: int = _DEFAULT_STALE_HOURS) -> list[str]:
         else:
             fail_part = ""
         lines.append(f"{flag} {ritual}: last_success {success_part}{fail_part}")
+        lines.extend(_source_lines(ritual, entry))
     return lines
 
 
