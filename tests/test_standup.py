@@ -1,4 +1,8 @@
 import json
+import os
+import re
+import shlex
+import subprocess
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -12,6 +16,8 @@ import standup
 import cos_config
 import utils
 
+
+SCRIPTS = ROOT / "scripts"
 
 WORK_BOARD = """# Work
 
@@ -93,6 +99,77 @@ def _candidate_for_confirmed_done():
     return candidate
 
 
+def _write_fake_harvest_tools(bin_dir: Path) -> None:
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text("#!/usr/bin/env bash\nprintf '[]\\n'\n")
+    gh.chmod(0o755)
+    gog = bin_dir / "gog"
+    gog.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == \"gmail\" ]]; then\n"
+        "  printf '{\"threads\": []}\\n'\n"
+        "else\n"
+        "  printf '{\"events\": []}\\n'\n"
+        "fi\n"
+    )
+    gog.chmod(0o755)
+
+
+def _standup_subprocess_env(tmp_path: Path, *, state_name: str) -> dict[str, str]:
+    state_dir = tmp_path / state_name
+    work = tmp_path / f"{state_name}-Work Tasks.md"
+    daily = tmp_path / f"{state_name}-daily"
+    fake_bin = tmp_path / "fake-bin"
+    if not fake_bin.exists():
+        _write_fake_harvest_tools(fake_bin)
+    daily.mkdir(exist_ok=True)
+    work.write_text(WORK_BOARD)
+
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not (
+            key.startswith("TASK_TRACKER_")
+            or key.startswith("TELEGRAM_CHAT_ID_")
+            or key.startswith("OPENCLAW_TOPIC_")
+            or key in {"TASK_MGMT_STATE_DIR", "DIALPAD_SMS_DB", "STANDUP_CALENDARS"}
+        )
+    }
+    env.update(
+        {
+            "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+            "TASK_MGMT_STATE_DIR": str(state_dir),
+            "TASK_TRACKER_WORK_FILE": str(work),
+            "TASK_TRACKER_DAILY_NOTES_DIR": str(daily),
+            "TASK_TRACKER_DONE_LOG_DIR": str(daily),
+            "TASK_TRACKER_LEDGER_FILE": str(state_dir / "events.jsonl"),
+            "TASK_TRACKER_ERROR_LOG": str(state_dir / "errors.jsonl"),
+            "STANDUP_CALENDARS": "{}",
+            "STANDUP_SUMMARIZER_ENABLED": "0",
+            "COS_TIMEZONE": "America/Los_Angeles",
+        }
+    )
+    return env
+
+
+def _run_entrypoint(argv: list[str], env: dict[str, str]) -> bytes:
+    proc = subprocess.run(
+        argv,
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", errors="replace")
+    return proc.stdout
+
+
+def _health_sources(env: dict[str, str]) -> dict:
+    health_path = Path(env["TASK_MGMT_STATE_DIR"]) / "cos-health.json"
+    return json.loads(health_path.read_text())["standup"]["sources"]
+
+
 def test_evidence_candidates_do_not_change_completed_bytes(env, monkeypatch):
     monkeypatch.setattr(
         standup,
@@ -127,6 +204,48 @@ def test_evidence_candidates_do_not_change_completed_bytes(env, monkeypatch):
     assert json.dumps(after["completed"], sort_keys=True) == completed_before
     assert after["evidence_candidates"] == [_candidate()]
     assert after["evidence_harvest"]["health"]["github"]["status"] == "ok"
+
+
+def test_typed_standup_and_cron_descriptor_resolve_to_byte_identical_compact_json(tmp_path):
+    structured_args = ["--compact-json", "--skip-missed", "--date", "2026-06-23"]
+    typed_argv = ["bash", str(SCRIPTS / "telegram-commands.sh"), "daily", *structured_args]
+
+    desc = standup.standup_cron_descriptor(scripts_dir=str(SCRIPTS))
+    assert desc["payload"]["kind"] == "command"
+    cron_argv = list(desc["payload"]["argv"])
+    assert cron_argv[:2] == ["sh", "-c"]
+    assert "bash telegram-commands.sh daily" in cron_argv[2]
+    assert "--cron" not in cron_argv[2]
+    cron_argv[2] = f"{cron_argv[2]} {' '.join(shlex.quote(arg) for arg in structured_args)}"
+
+    serialised = json.dumps(desc, sort_keys=True)
+    assert desc["delivery"]["chat_id_env"] == "TELEGRAM_CHAT_ID_PRODUCTIVITY"
+    assert desc["delivery"]["topic_env"] == "OPENCLAW_TOPIC_PRODUCTIVITY_STANDUP"
+    assert "TELEGRAM_CHAT_ID_PRODUCTIVITY" in serialised
+    assert "OPENCLAW_TOPIC_PRODUCTIVITY_STANDUP" in serialised
+    assert not re.search(r"-100\d{8,}", serialised)
+    assert "-4242424242" not in serialised
+
+    typed_env = _standup_subprocess_env(tmp_path, state_name="typed-state")
+    cron_env = _standup_subprocess_env(tmp_path, state_name="cron-state")
+    typed_once = _run_entrypoint(typed_argv, typed_env)
+    cron_once = _run_entrypoint(cron_argv, cron_env)
+    assert typed_once == cron_once
+
+    payload = json.loads(typed_once)
+    assert payload["schema_version"] == "1"
+    assert payload["dos"][0]["title"] == "Investigate payroll sync"
+    assert payload["evidence_candidates"] == []
+
+    expected_sources = {"github", "gmail", "calendar", "dialpad_sms"}
+    for run_env in (typed_env, cron_env):
+        sources = _health_sources(run_env)
+        assert set(sources) == expected_sources
+        assert all(receipt["status"] == "ok" for receipt in sources.values())
+        assert {receipt["trigger"] for receipt in sources.values()} == {"user_command:/standup"}
+
+    typed_twice = _run_entrypoint(typed_argv, typed_env)
+    assert typed_twice == typed_once
 
 
 def test_matching_evidence_enriches_confirmed_done_and_is_not_rendered_twice(env, monkeypatch):

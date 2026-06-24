@@ -142,7 +142,7 @@ def standup_cron_descriptor(
         "payload": {
             "kind": "command",
             "argv": [
-                "sh", "-lc",
+                "sh", "-c",
                 f"cd {scripts_dir} && bash telegram-commands.sh daily",
             ],
         },
