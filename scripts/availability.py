@@ -26,12 +26,13 @@ from typing import Any
 
 import cos_config
 import error_envelope
+# Private helpers deliberately reused to SINGLE-SOURCE the busy-classification
+# (accepted/organized, all-day, declined/cancelled) -- see the module docstring. Do
+# not "promote to public" or re-implement; a drift here is a real nudge bug.
 from adapters.calendar_adapter import (
-    _DENIED_EVENT_TYPES,
     _calendar_configs,
     _event_allowed,
     _event_start,
-    _events_from_payload,
     _parse_dt,
 )
 
@@ -41,16 +42,19 @@ COMPONENT = "initiation:availability"
 # meeting is never longer than this; querying ``[now - lookback, now + lookahead]`` and
 # filtering by containment catches an event that started earlier and is still running.
 _BUSY_LOOKBACK = timedelta(hours=12)
+# A small margin on the QUERY upper bound for clock skew between our ``now`` and the
+# calendar server; containment still uses ``start <= now < end`` so a future-starting
+# event fetched by this margin is never counted as current.
 _BUSY_LOOKAHEAD = timedelta(minutes=1)
 _GOG_TIMEOUT_S = 10
 
-_SUBPROCESS_FAILURES = (
-    subprocess.TimeoutExpired,
-    subprocess.CalledProcessError,
-    json.JSONDecodeError,
-    FileNotFoundError,
-    OSError,
-)
+# Event types that NEVER make the user busy for nudging, even when timed: a birthday
+# or a working-location annotation is not an interruption. ``focusTime`` and
+# ``outOfOffice`` are deliberately NOT here -- a focus block or an out-of-office period
+# is EXACTLY when the user is unavailable, so they MUST classify as busy (via
+# ``_event_allowed``). The harvest's ``_DENIED_EVENT_TYPES`` is the WRONG set to reuse
+# here: it drops focusTime/OOO as "not standup evidence", the opposite of "not busy".
+_NON_BLOCKING_EVENT_TYPES = {"birthday", "workingLocation"}
 
 
 def _event_end(event: dict[str, Any]) -> datetime | None:
@@ -87,27 +91,52 @@ def _query_events(
     if result.returncode != 0:
         raise subprocess.CalledProcessError(
             result.returncode, cmd, output=result.stdout, stderr=result.stderr)
-    return _events_from_payload(json.loads(result.stdout))
+    return _strict_events(json.loads(result.stdout))
+
+
+def _strict_events(payload: Any) -> list[dict[str, Any]]:
+    """Extract the event list from a gog payload, RAISING on an unexpected shape.
+
+    Unlike the harvest's lenient ``_events_from_payload`` (which coerces any odd shape
+    to ``[]`` because empty harvest evidence is fine), the availability GATE must treat
+    an unparseable payload as UNCERTAINTY, not "no meetings": a ``{"events": "<error>"}``
+    / ``null`` / scalar / wrapper-without-events response would otherwise read as "free"
+    and fire a nudge we cannot justify. So a non-list events value raises ``ValueError``
+    (caught by the caller -> fail closed). A genuinely empty ``{"events": []}`` is fine.
+    """
+    if isinstance(payload, list):
+        events = payload
+    elif isinstance(payload, dict):
+        events = payload.get("events")
+        if events is None:
+            events = payload.get("items")
+    else:
+        raise ValueError(f"gog payload is not a list/object: {type(payload).__name__}")
+    if not isinstance(events, list):
+        raise ValueError("gog payload carried no events/items list")
+    return [event for event in events if isinstance(event, dict)]
 
 
 def _is_busy_at(event: dict[str, Any], now: datetime, *, account: str | None) -> bool:
     """True if ``event`` is a busy-making event whose ``[start, end)`` contains ``now``.
 
     Busy-making = the ``_event_allowed`` set (timed, accepted/organized, not
-    cancelled/declined/all-day). An allowed event we CANNOT time (missing/garbage
-    start or end) returns True -- fail closed, since we cannot prove it does not
-    contain ``now``. A non-busy event (all-day, declined, ...) or one whose interval
+    cancelled/declined/all-day) MINUS the non-blocking event types (birthday,
+    workingLocation). A focusTime or outOfOffice block IS busy. An allowed event we
+    CANNOT time (missing/garbage start or end, or a reversed ``end <= start`` interval)
+    returns True -- fail closed, since we cannot prove it does not contain ``now``. A
+    non-busy event (all-day, declined, non-blocking type, ...) or one whose interval
     does not contain ``now`` returns False.
     """
-    if event.get("eventType") in _DENIED_EVENT_TYPES:
+    if event.get("eventType") in _NON_BLOCKING_EVENT_TYPES:
         return False
     allowed, _reason = _event_allowed(event, account=account)
     if not allowed:
         return False  # all-day / declined / cancelled / no-response -> not busy
     start = _event_start(event)
     end = _event_end(event)
-    if start is None or end is None:
-        return True  # an accepted event we cannot time -> cannot rule out NOW -> busy
+    if start is None or end is None or end <= start:
+        return True  # an accepted event we cannot reliably time -> fail closed -> busy
     return start <= now < end
 
 
@@ -143,13 +172,13 @@ def not_known_busy(now: datetime, *, trigger: str = "initiation_availability") -
     for config in configs:
         account = str(config.get("account") or "") or None
         try:
-            events = _query_events(config, window_start, window_end)
-        except _SUBPROCESS_FAILURES as exc:
-            # A calendar we EXPECTED to read but could not -> we cannot rule out a
-            # meeting -> fail closed (suppress) and record the degrade via the envelope.
+            for event in _query_events(config, window_start, window_end):
+                if _is_busy_at(event, now, account=account):
+                    return False  # an accepted event contains now -> busy -> suppress
+        except Exception as exc:  # noqa: BLE001 -- fail CLOSED: ANY read/parse/classify
+            # error means we cannot rule out a meeting -> suppress. A broad catch is the
+            # correct posture for a security-relevant gate (an unexpected error must
+            # never fall through to "free"); the degrade is recorded, not silent.
             error_envelope.log_degraded(COMPONENT, exc, trigger=trigger, check="availability")
             return False
-        for event in events:
-            if _is_busy_at(event, now, account=account):
-                return False  # an accepted event contains now -> busy -> suppress
     return True  # fresh read of every calendar, nothing contains now -> safe to nudge
