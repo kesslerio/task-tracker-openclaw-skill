@@ -179,7 +179,7 @@ def test_standup_cron_descriptor_is_a_command_cron_to_the_standup_thread():
     # Deterministic command cron -- NOT an LLM agentTurn.
     assert desc["payload"]["kind"] == "command"
     argv = desc["payload"]["argv"]
-    assert argv[0] == "sh" and argv[1] == "-lc"
+    assert argv[0] == "sh" and argv[1] == "-c"
     assert "telegram-commands.sh daily" in argv[2]
     # The 8am hour, announce delivery to the Productivity STANDUP thread (env-var NAMES).
     assert desc["schedule"]["hour"] == 8

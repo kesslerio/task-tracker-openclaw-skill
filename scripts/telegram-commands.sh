@@ -71,7 +71,8 @@ case "$1" in
     # the live board), then the board/priorities/blockers. No LLM relay; same command a
     # user runs by hand. The cron swap + the legacy-cron deletion are DEFERRED OPERATOR
     # steps, gated on the U8 parity check.
-    run_with_envelope "standup" python3 "$SCRIPT_DIR/standup.py"
+    shift
+    run_with_envelope "standup" python3 "$SCRIPT_DIR/standup.py" "$@"
     ;;
   eod)
     # U7 EOD ritual (the 18:00 deterministic command cron points here). Assembles the
