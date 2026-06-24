@@ -23,9 +23,15 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 
 import cos_config
 from utils import _atomic_write
@@ -40,6 +46,38 @@ STATUS_SKIPPED = "skipped"
 
 def focus_state_path() -> Path:
     return cos_config.state_dir() / "focus-state.json"
+
+
+def focus_state_lock_path() -> Path:
+    return cos_config.state_dir() / "focus-state.lock"
+
+
+@contextmanager
+def _focus_state_flock() -> Iterator[None]:
+    """Hold the exclusive sidecar flock over ``focus-state.json`` for the block.
+
+    The ``rev`` bump is a read-on-disk-then-write-plus-one, and v0.4-C uses ``rev``
+    as a compare-and-swap token -- so the read-modify-write MUST be serialised across
+    processes or two near-simultaneous writers (the morning proposer cron and a user
+    ``/approve`` / ``/veto``, which all call ``save_focus_state`` from separate
+    processes) could both read ``rev=N`` and both write ``rev=N+1`` with DIFFERENT
+    content, making a stale proposal's CAS falsely pass on the coincident ``rev``.
+    Mirrors ``outbox._outbox_flock`` / ``nag_state._locked_state``.
+    """
+    cos_config.state_dir()  # ensure the 0o700 dir exists before opening the lockfile
+    lock_path = focus_state_lock_path()
+    with lock_path.open("a", encoding="utf-8") as lock_handle:
+        try:
+            os.fchmod(lock_handle.fileno(), 0o600)
+        except OSError:
+            pass
+        if fcntl is not None:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
 
 def _now_iso() -> str:
@@ -90,17 +128,75 @@ def load_focus_state() -> dict[str, Any] | None:
     return loaded
 
 
+def _as_int(value: Any, default: int = 0) -> int:
+    """``int(value)`` or ``default`` -- never raises on garbage/None."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _current_on_disk_rev() -> int:
+    """The ``rev`` currently persisted on disk, or 0 when absent/unreadable.
+
+    Read directly (not via ``load_focus_state``) so a corrupt file is NOT
+    quarantined here -- this runs inside ``save_focus_state``, which is about to
+    overwrite the file anyway. Any read/parse problem yields 0; the passed-in
+    state's own ``rev`` still floors the next value (see ``save_focus_state``), so
+    a transient read failure can never make ``rev`` go backwards.
+    """
+    path = focus_state_path()
+    if not path.exists():
+        return 0
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return 0
+    return _as_int(loaded.get("rev")) if isinstance(loaded, dict) else 0
+
+
 def save_focus_state(state: dict[str, Any]) -> dict[str, Any]:
-    """Atomically persist ``state`` after stamping ``updated_at``.
+    """Atomically persist ``state`` after stamping ``updated_at`` and bumping ``rev``.
 
     Returns the same dict so callers can chain. The directory + 0o700 perms are
     owned by ``state_dir()``; the file inherits 0o600 from ``_atomic_write`` on
     first write.
+
+    ``rev`` is a **monotonic integer** bumped on every write -- the v0.4 initiation
+    CAS token (a counter, not the coarse 1-second ``updated_at`` timestamp). The
+    next value floors the passed-in ``rev`` against the value currently ON DISK and
+    adds one, so it never regresses even when a caller builds a FRESH state document
+    (``new_proposal_state`` carries no ``rev``): the morning re-propose still reads
+    the prior day's on-disk ``rev`` and increments past it. The read-on-disk + bump +
+    write runs under ``_focus_state_flock`` so concurrent writers (the proposer cron
+    vs a user ``/approve``/``/veto``) cannot both mint the same ``rev`` with different
+    content. An additive field: a pre-``rev`` file reads as 0 and its first write
+    becomes ``rev: 1``.
     """
     state["schema_version"] = SCHEMA_VERSION
     state["updated_at"] = _now_iso()
-    _atomic_write(focus_state_path(), json.dumps(state, indent=2, sort_keys=True) + "\n")
+    with _focus_state_flock():
+        state["rev"] = max(_as_int(state.get("rev")), _current_on_disk_rev()) + 1
+        payload = json.dumps(state, indent=2, sort_keys=True) + "\n"
+        _atomic_write(focus_state_path(), payload)
     return state
+
+
+def current_rev() -> int | None:
+    """The persisted monotonic ``rev``, or ``None`` when no readable state exists.
+
+    The v0.4 initiation CAS snapshots this when the evaluator writes a proposal and
+    re-reads it at send time: an advanced ``rev`` means the committed-#1 / priorities
+    snapshot moved (a re-propose, an approve, a veto) -> the proposal is stale and is
+    suppressed. ``None`` (missing/corrupt state -- the snapshot the proposal was built
+    against is gone) is likewise treated as invalid by the CAS (fail-closed). A
+    present-but-pre-``rev`` legacy file reads as 0. Uses ``load_focus_state`` so a
+    corrupt file is quarantined and surfaced as ``None`` consistently with every reader.
+    """
+    state = load_focus_state()
+    if not isinstance(state, dict):
+        return None
+    return _as_int(state.get("rev"))
 
 
 def is_current(state: dict[str, Any] | None, *, reference_date: str | None = None) -> bool:
