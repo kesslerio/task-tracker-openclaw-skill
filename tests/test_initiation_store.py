@@ -1,6 +1,7 @@
 """v0.4-C initiation proposal store: write/read/clear/supersede/expire, with
 expired entries pruned on read and write and a corrupt file read as empty."""
 
+import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -88,4 +89,21 @@ def test_clear_missing_is_noop(state):
 def test_corrupt_store_reads_as_empty(state):
     store.store_path().parent.mkdir(parents=True, exist_ok=True)
     store.store_path().write_text("{ not json", encoding="utf-8")
+    assert store.read_proposal(SLOT, now=_at("18:30")) is None
+
+
+def test_store_file_and_lock_are_owner_only(state):
+    store.write_proposal(_proposal(), now=_at("18:00"))
+    assert (store.store_path().stat().st_mode & 0o777) == 0o600
+    assert (store.store_lock_path().stat().st_mode & 0o777) == 0o600
+
+
+def test_unreconstructable_entry_reads_as_none(state):
+    # A non-expired but structurally-broken entry (focus_episode_id no longer
+    # matches its parts -> Proposal.__post_init__ raises) must read as None (and is
+    # pruned), never reconstructed into an actionable proposal.
+    store.write_proposal(_proposal(), now=_at("18:00"))
+    raw = json.loads(store.store_path().read_text())
+    raw[SLOT]["focus_episode_id"] = "work:tsk_tampered:2026-06-24"  # mismatches parts
+    store.store_path().write_text(json.dumps(raw), encoding="utf-8")
     assert store.read_proposal(SLOT, now=_at("18:30")) is None

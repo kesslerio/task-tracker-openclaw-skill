@@ -41,6 +41,7 @@ Three pieces:
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -56,6 +57,10 @@ from outbox import make_idem_key
 STAGE_COLD_START = "cold_start"
 STAGE_COLD_START_RENUDGE = "cold_start_renudge"
 KNOWN_STAGES: frozenset[str] = frozenset({STAGE_COLD_START, STAGE_COLD_START_RENUDGE})
+# Stages are colon-joined into the outbox key, so a stage constant carrying a ":"
+# would ambiguate it. The closed KNOWN_STAGES set already rejects an arbitrary
+# colon stage at runtime; this guards a FUTURE maintainer adding a bad constant.
+assert all(":" not in stage for stage in KNOWN_STAGES), "stage constants must be colon-free"
 
 # Slot/key segments are colon-joined into the outbox idem key, so a literal ":" in
 # any segment would make the key ambiguous (and could collide two distinct slots).
@@ -118,6 +123,8 @@ class Proposal:
         """True if ``now`` is at/after ``expires_at`` (an unparseable expiry =>
         expired -- a proposal we cannot date must not be acted on)."""
         ref = now or datetime.now(timezone.utc)
+        if ref.tzinfo is None:  # a naive ``now`` is assumed UTC, never a raise
+            ref = ref.replace(tzinfo=timezone.utc)
         expires = _parse_iso(self.expires_at)
         if expires is None:
             return True
@@ -182,8 +189,12 @@ def cas_still_valid(
         if not isinstance(session, dict):
             continue
         for stamp in (session.get("started_at"), session.get("ended_at")):
+            if stamp in (None, ""):
+                continue  # absent stamp: this dimension does not constrain
             ts = _parse_iso(stamp)
-            if ts is not None and ts >= baseline:
+            # A present-but-unparseable stamp fails CLOSED: we cannot prove the
+            # session is OLDER than the baseline, so we must not nudge over it.
+            if ts is None or ts >= baseline:
                 return False
     return True
 
@@ -199,19 +210,48 @@ def task_sessions(state: dict[str, Any] | None, task_id: str) -> list[dict[str, 
     return sessions if isinstance(sessions, list) else []
 
 
+class _NagStateUnreadable(Exception):
+    """nag-state.json is present but unparseable -- the focus-episode CAS dimension
+    cannot be evaluated, so the caller must fail closed (suppress the send)."""
+
+
+def _live_task_sessions(task_id: str) -> list[dict[str, Any]]:
+    """Live focus sessions for ``task_id``, raising ``_NagStateUnreadable`` on a
+    corrupt-but-present nag-state.
+
+    ``nag_state.read_state`` QUARANTINES a corrupt file aside and returns an empty
+    dict -- indistinguishable from "no sessions". Trusting that would let the CAS
+    read "the user has not started" from a file we actually could not read (a fail
+    OPEN, asymmetric with the focus_state side, which fails closed via ``current_rev
+    -> None``). So probe the raw file FIRST: a present-but-unparseable / non-object
+    nag-state raises (caught by ``cas_still_valid_now`` -> fail closed); a genuinely
+    ABSENT file is a legitimate "no sessions yet".
+    """
+    path = nag_state.nag_state_path()
+    if path.exists():
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise _NagStateUnreadable(str(path)) from exc
+        if not isinstance(parsed, dict):
+            raise _NagStateUnreadable(f"{path}: not a JSON object")
+    return task_sessions(nag_state.read_state(), task_id)
+
+
 def cas_still_valid_now(proposal: Proposal) -> bool:
     """``cas_still_valid`` against LIVE state, failing CLOSED on any read error.
 
     Reads ``focus_state.current_rev()`` (the task-state version) and the task's
-    ``nag_state`` sessions (the focus-episode version). Any exception -- a missing
-    module dependency, an unreadable state file, a parse error -- returns ``False``
+    ``nag_state`` sessions (the focus-episode version, via ``_live_task_sessions``
+    which fails closed on a corrupt nag-state). Any exception -- a missing module
+    dependency, an unreadable/corrupt state file, a parse error -- returns ``False``
     (suppress the nudge): a send we cannot prove is safe is not sent.
     """
     try:
         return cas_still_valid(
             proposal,
             current_focus_rev=focus_state.current_rev(),
-            task_sessions=task_sessions(nag_state.read_state(), proposal.task_id),
+            task_sessions=_live_task_sessions(proposal.task_id),
         )
     except Exception:  # noqa: BLE001 -- fail closed: any read failure suppresses the send
         return False

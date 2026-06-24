@@ -79,6 +79,13 @@ def test_rev_floors_against_passed_value_when_disk_unreadable(state):
     assert s["rev"] == 3
 
 
+def test_save_takes_the_focus_state_flock(state):
+    # The rev bump is a read-then-write CAS token, so save must serialise under the
+    # sidecar flock (the lockfile is created on first save).
+    focus_state.save_focus_state(_proposal())
+    assert focus_state.focus_state_lock_path().exists()
+
+
 def test_current_rev_zero_for_legacy_state_without_rev(state):
     # A hand-written/legacy state file with no rev field reads as 0 (a valid
     # baseline), not None and not a crash.

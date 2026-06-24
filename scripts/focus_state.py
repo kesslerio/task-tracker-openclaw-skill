@@ -23,9 +23,15 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 
 import cos_config
 from utils import _atomic_write
@@ -40,6 +46,38 @@ STATUS_SKIPPED = "skipped"
 
 def focus_state_path() -> Path:
     return cos_config.state_dir() / "focus-state.json"
+
+
+def focus_state_lock_path() -> Path:
+    return cos_config.state_dir() / "focus-state.lock"
+
+
+@contextmanager
+def _focus_state_flock() -> Iterator[None]:
+    """Hold the exclusive sidecar flock over ``focus-state.json`` for the block.
+
+    The ``rev`` bump is a read-on-disk-then-write-plus-one, and v0.4-C uses ``rev``
+    as a compare-and-swap token -- so the read-modify-write MUST be serialised across
+    processes or two near-simultaneous writers (the morning proposer cron and a user
+    ``/approve`` / ``/veto``, which all call ``save_focus_state`` from separate
+    processes) could both read ``rev=N`` and both write ``rev=N+1`` with DIFFERENT
+    content, making a stale proposal's CAS falsely pass on the coincident ``rev``.
+    Mirrors ``outbox._outbox_flock`` / ``nag_state._locked_state``.
+    """
+    cos_config.state_dir()  # ensure the 0o700 dir exists before opening the lockfile
+    lock_path = focus_state_lock_path()
+    with lock_path.open("a", encoding="utf-8") as lock_handle:
+        try:
+            os.fchmod(lock_handle.fileno(), 0o600)
+        except OSError:
+            pass
+        if fcntl is not None:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
 
 def _now_iso() -> str:
@@ -129,15 +167,18 @@ def save_focus_state(state: dict[str, Any]) -> dict[str, Any]:
     next value floors the passed-in ``rev`` against the value currently ON DISK and
     adds one, so it never regresses even when a caller builds a FRESH state document
     (``new_proposal_state`` carries no ``rev``): the morning re-propose still reads
-    the prior day's on-disk ``rev`` and increments past it. (This module is the sole
-    writer -- writes are serialised by usage, not a lock -- so the read-then-bump is
-    race-free in practice.) An additive field: a pre-``rev`` file reads as 0 and its
-    first write becomes ``rev: 1``.
+    the prior day's on-disk ``rev`` and increments past it. The read-on-disk + bump +
+    write runs under ``_focus_state_flock`` so concurrent writers (the proposer cron
+    vs a user ``/approve``/``/veto``) cannot both mint the same ``rev`` with different
+    content. An additive field: a pre-``rev`` file reads as 0 and its first write
+    becomes ``rev: 1``.
     """
     state["schema_version"] = SCHEMA_VERSION
     state["updated_at"] = _now_iso()
-    state["rev"] = max(_as_int(state.get("rev")), _current_on_disk_rev()) + 1
-    _atomic_write(focus_state_path(), json.dumps(state, indent=2, sort_keys=True) + "\n")
+    with _focus_state_flock():
+        state["rev"] = max(_as_int(state.get("rev")), _current_on_disk_rev()) + 1
+        _atomic_write(
+            focus_state_path(), json.dumps(state, indent=2, sort_keys=True) + "\n")
     return state
 
 

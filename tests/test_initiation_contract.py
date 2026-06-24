@@ -134,6 +134,19 @@ def test_cas_tolerates_naive_session_timestamps():
     assert ic.cas_still_valid(_proposal(), current_focus_rev=1, task_sessions=naive) is False
 
 
+def test_cas_invalid_when_session_stamp_present_but_unparseable():
+    # A present-but-garbage stamp cannot be proven OLDER than the baseline -> fail
+    # closed (do NOT nudge over a session we cannot date), not silently skip it.
+    bad = [{"session_id": "st_bad", "started_at": "not-a-timestamp"}]
+    assert ic.cas_still_valid(_proposal(), current_focus_rev=1, task_sessions=bad) is False
+
+
+def test_is_expired_accepts_naive_now():
+    # A naive `now` is assumed UTC rather than raising on a naive/aware comparison.
+    assert _proposal().is_expired(now=datetime(2026, 6, 24, 18, 30)) is False
+    assert _proposal().is_expired(now=datetime(2026, 6, 24, 19, 30)) is True
+
+
 # --- cas_still_valid_now (live, fail-closed) --------------------------------
 
 @pytest.fixture
@@ -187,3 +200,18 @@ def test_cas_now_fail_closed_on_read_error(state, monkeypatch):
 
     monkeypatch.setattr(nag_state, "read_state", boom)
     assert ic.cas_still_valid_now(_proposal(cas_focus_state_rev=1)) is False
+
+
+def test_cas_now_fail_closed_on_corrupt_nag_state(state):
+    # nag_state.read_state quarantines a corrupt file to {} (looks like "no
+    # sessions"); the raw-file probe must catch the corruption and fail closed
+    # rather than read "user has not started" from an unreadable file.
+    rev = _seed_focus_rev(1)
+    nag_state.nag_state_path().write_text("{ corrupt", encoding="utf-8")
+    assert ic.cas_still_valid_now(_proposal(cas_focus_state_rev=rev)) is False
+
+
+def test_cas_now_fail_closed_on_non_dict_nag_state(state):
+    rev = _seed_focus_rev(1)
+    nag_state.nag_state_path().write_text("[1, 2, 3]", encoding="utf-8")
+    assert ic.cas_still_valid_now(_proposal(cas_focus_state_rev=rev)) is False
