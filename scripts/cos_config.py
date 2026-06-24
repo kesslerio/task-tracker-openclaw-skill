@@ -119,6 +119,15 @@ def active_task_hard_cap() -> int:
     return _int_env("ACTIVE_TASK_HARD_CAP", 20)
 
 
+def pushback_stale_days() -> int:
+    """Overdue threshold (days) for the deterministic capacity push-back (default 14).
+
+    A standup push-back candidate whose due date is more than this many days in the
+    past is flagged ``stale``. Mirrors ``_int_env`` robustness (unset/garbage -> 14).
+    """
+    return _int_env("STANDUP_PUSHBACK_STALE_DAYS", 14)
+
+
 # --- Nag engine knobs (U4, spec §6.5) -------------------------------------
 
 def nag_q1_threshold_days() -> int:

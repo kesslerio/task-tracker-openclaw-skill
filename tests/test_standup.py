@@ -481,3 +481,59 @@ def test_invalid_date_string_uses_implicit_prior_workday_window(env, monkeypatch
     # The implicit window summarizes the PRIOR workday, not today (the bug would be today).
     assert output["standup_window"]["evidence_date"] == "2026-06-22"
     assert captured["resolved_window"].evidence_date.isoformat() == "2026-06-22"
+
+
+_PUSHBACK_OVER_CAP_BOARD = """# Work
+
+## 🔴 Q1
+- [ ] **Ship payroll sync** 🗓️2026-05-01 estimate:: 13h task_id::tsk_aaaaaaaaaaaaaaaa
+- [ ] **Fix onboarding** 🗓️2026-06-20 estimate:: 13h task_id::tsk_bbbbbbbbbbbbbbbb
+
+## 🅿️ Parking Lot
+"""
+
+
+def test_over_cap_standup_renders_capacity_pushback_after_capacity_line(env, monkeypatch):
+    from task_records import task_records
+
+    over_cap = task_records(_PUSHBACK_OVER_CAP_BOARD)
+    monkeypatch.setattr(cos_config, "local_today", lambda: date(2026, 6, 24))
+    monkeypatch.setattr(cos_config, "local_now", lambda: datetime.fromisoformat("2026-06-24T08:00:00-07:00"))
+    monkeypatch.setattr(
+        standup, "_standup_harvest_result",
+        lambda *a, **k: {"evidence_candidates": [], "health": {}, "window": None},
+    )
+
+    out = standup.generate_standup(json_output=True, tasks_data=_tasks_data(), capacity_records=over_cap)
+    assert out["capacity_pushback"] is not None
+    assert "Cut / defer / edit" in out["capacity_pushback"]
+    assert "Ship payroll sync" in out["capacity_pushback"]
+
+    text = standup.generate_standup(tasks_data=_tasks_data(), capacity_records=over_cap)
+    assert out["capacity"] in text
+    # The push-back is rendered AFTER the capacity line.
+    assert text.index(out["capacity"]) < text.index("Cut / defer / edit")
+
+
+def test_under_cap_standup_has_no_pushback(env, monkeypatch):
+    monkeypatch.setattr(
+        standup, "_standup_harvest_result",
+        lambda *a, **k: {"evidence_candidates": [], "health": {}, "window": None},
+    )
+    out = standup.generate_standup(json_output=True, tasks_data=_tasks_data(), capacity_records=[])
+    assert out["capacity_pushback"] is None
+
+
+def test_pushback_renders_when_capacity_records_not_supplied(env, monkeypatch):
+    # The live /standup CLI calls generate_standup WITHOUT capacity_records (None);
+    # the push-back must load the work board itself, not silently no-op (regression guard).
+    env["work"].write_text(_PUSHBACK_OVER_CAP_BOARD)
+    monkeypatch.setattr(cos_config, "local_today", lambda: date(2026, 6, 24))
+    monkeypatch.setattr(cos_config, "local_now", lambda: datetime.fromisoformat("2026-06-24T08:00:00-07:00"))
+    monkeypatch.setattr(
+        standup, "_standup_harvest_result",
+        lambda *a, **k: {"evidence_candidates": [], "health": {}, "window": None},
+    )
+    out = standup.generate_standup(json_output=True, tasks_data=_tasks_data())  # no capacity_records
+    assert out["capacity_pushback"] is not None
+    assert "Ship payroll sync" in out["capacity_pushback"]

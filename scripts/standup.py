@@ -16,6 +16,7 @@ from candidate_review import candidate_review_summary
 from task_audit import task_audit_summary
 from daily_notes import extract_completed_actions, extract_completed_tasks
 import harvest_window
+import pushback
 import standup_harvest
 from standup_common import (
     calendar_error,
@@ -513,12 +514,17 @@ def generate_standup(
         'evidence_harvest': {},
         'objective_progress': {},
         'capacity': None,
+        'capacity_pushback': None,
     }
 
     # Layer-2 capacity ceiling line (U3): estimate-sum over active work vs ~1
     # week of capacity. Degrades to None on any failure rather than breaking the
     # standup. Skipped for personal standups (the cap governs the work board).
     output['capacity'] = capacity_line(records=capacity_records)
+    # U9: deterministic capacity push-back (rules only). When the active board is over
+    # the Layer-2 ceiling, surface the most-overdue candidates + a cut/defer/edit ask.
+    # Pure read + render: never chooses, mutates the board, or sends. None when within cap.
+    output['capacity_pushback'] = pushback.capacity_pushback(capacity_records)
 
     # Apply display-only priority escalation
     regrouped = regroup_by_effective_priority(tasks_data, reference_date=standup_date)
@@ -621,6 +627,8 @@ def generate_standup(
 
     if output.get('capacity'):
         lines.append(output['capacity'])
+        if output.get('capacity_pushback'):
+            lines.append(output['capacity_pushback'])
         lines.append("")
 
     if output['due_today']:
