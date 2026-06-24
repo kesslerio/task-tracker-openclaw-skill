@@ -130,3 +130,51 @@ def test_harvested_candidates_render_in_read_only_section(env, monkeypatch):
     assert "Fix payroll sync #42" in text
     assert "Recently Completed" in text
     assert "User stated DONE" in text
+
+
+def test_draft_summary_renders_read_only_and_does_not_change_completed(env, monkeypatch):
+    summary = {
+        "bullets": [
+            {
+                "evidence_id": "sha256:github:test",
+                "area": "eng",
+                "bullet": "Shipped payroll sync fix",
+            }
+        ],
+        "translated": True,
+        "model": "qwen3-coder-next:cloud",
+        "prompt_version": "test",
+        "disclosure": None,
+        "draft": True,
+        "confirmed": False,
+    }
+    monkeypatch.setattr(
+        standup,
+        "_standup_harvest_result",
+        lambda date_str, *, trigger: {
+            "evidence_candidates": [_candidate()],
+            "summary": summary,
+            "health": {"github": {"status": "ok"}},
+            "window": {"window_id": "2026-W26:2026-06-23:standup"},
+            "run_id": "run-1",
+        },
+    )
+
+    output = standup.generate_standup(
+        date_str="2026-06-23",
+        json_output=True,
+        tasks_data=_tasks_data(),
+        capacity_records=[],
+    )
+    text = standup.generate_standup(
+        date_str="2026-06-23",
+        json_output=False,
+        tasks_data=_tasks_data(),
+        capacity_records=[],
+    )
+
+    assert output["completed"] == _tasks_data()["done"]
+    assert output["evidence_harvest"]["summary"] == summary
+    assert "Draft summary (unconfirmed)" in text
+    assert "Shipped payroll sync fix" in text
+    assert "Read-only draft; not recorded as completed." in text
