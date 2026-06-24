@@ -71,6 +71,26 @@ def _candidate():
     }
 
 
+def _candidate_for_confirmed_done():
+    candidate = _candidate()
+    candidate.update(
+        {
+            "match_title": "User stated DONE",
+            "title": "Merged PR title that should not overwrite the user claim",
+            "evidence_hash": "sha256:github:done",
+            "matched_task_id": "tsk_done",
+            "suggested_task_id": "tsk_done",
+            "match": {
+                "decision": "evidence-link",
+                "match_type": "exact-id-or-link",
+                "matched_task_id": "tsk_done",
+                "suggested_task_id": "tsk_done",
+            },
+        }
+    )
+    return candidate
+
+
 def test_evidence_candidates_do_not_change_completed_bytes(env, monkeypatch):
     monkeypatch.setattr(
         standup,
@@ -105,6 +125,33 @@ def test_evidence_candidates_do_not_change_completed_bytes(env, monkeypatch):
     assert json.dumps(after["completed"], sort_keys=True) == completed_before
     assert after["evidence_candidates"] == [_candidate()]
     assert after["evidence_harvest"]["health"]["github"]["status"] == "ok"
+
+
+def test_matching_evidence_enriches_confirmed_done_and_is_not_rendered_twice(env, monkeypatch):
+    candidate = _candidate_for_confirmed_done()
+    monkeypatch.setattr(
+        standup,
+        "_standup_harvest_result",
+        lambda date_str, *, trigger: {
+            "evidence_candidates": [candidate],
+            "health": {"github": {"status": "ok"}},
+            "window": {"window_id": "2026-W26:2026-06-23:standup"},
+            "run_id": "run-1",
+        },
+    )
+
+    output = standup.generate_standup(
+        date_str="2026-06-23",
+        json_output=True,
+        tasks_data=_tasks_data(),
+        capacity_records=[],
+    )
+
+    assert output["evidence_candidates"] == []
+    assert len(output["completed"]) == 1
+    assert output["completed"][0]["title"] == "User stated DONE"
+    assert output["completed"][0]["provenance"][1]["source"] == "github"
+    assert output["completed"][0]["provenance"][1]["evidence_hash"] == "sha256:github:done"
 
 
 def test_harvested_candidates_render_in_read_only_section(env, monkeypatch):

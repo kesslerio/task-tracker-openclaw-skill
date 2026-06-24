@@ -25,6 +25,7 @@ from standup_common import (
     resolve_standup_date,
 )
 import error_envelope
+import reconcile
 from task_records import fallback_id_for
 from utils import (
     load_tasks,
@@ -191,6 +192,16 @@ def _standup_harvest_result(date_str: str | None, *, trigger: str) -> dict:
 def _candidate_task_suffix(candidate: dict) -> str:
     task_id = candidate.get("matched_task_id") or candidate.get("suggested_task_id")
     return f" -> {task_id}" if task_id else ""
+
+
+def _completed_board_items(items: list[dict]) -> list[dict]:
+    completed: list[dict] = []
+    for item in items:
+        copied = dict(item)
+        if "meeting::" in str(copied.get("raw_line") or ""):
+            copied["is_calendar_meeting"] = True
+        completed.append(copied)
+    return completed
 
 
 def _draft_summary_lines(summary: dict | None, *, indent: str = "  ") -> list[str]:
@@ -510,7 +521,13 @@ def generate_standup(
     # Team tasks
     output['team'] = tasks_data.get('team', [])
 
-    # Completed: daily notes primary, board [x] fallback
+    harvest_result = _standup_harvest_result(
+        date_str,
+        trigger="user_command:/standup",
+    )
+    evidence_candidates = harvest_result.get("evidence_candidates") or []
+
+    # Completed: confirmed user claims only; evidence can enrich but never promote.
     yesterday = standup_date - timedelta(days=1)
     if notes_dir:
         notes_completed = extract_completed_tasks(
@@ -518,29 +535,14 @@ def generate_standup(
             start_date=yesterday,
             end_date=standup_date,
         )
-        # Merge any stale [x] items from the board (deduplicate)
-        board_done = tasks_data.get('done', [])
-        by_title = {t['title'].casefold(): t for t in notes_completed}
-        for bt in board_done:
-            key = bt['title'].casefold()
-            is_calendar = "meeting::" in str(bt.get("raw_line") or "")
-            if key in by_title:
-                if is_calendar:
-                    by_title[key]["is_calendar_meeting"] = True
-                continue
-            if is_calendar:
-                bt["is_calendar_meeting"] = True
-            by_title[key] = bt
-            notes_completed.append(bt)
-        output['completed'] = notes_completed
+        user_stated = [*notes_completed, *_completed_board_items(tasks_data.get('done', []))]
     else:
-        output['completed'] = tasks_data.get('done', [])
+        user_stated = _completed_board_items(tasks_data.get('done', []))
 
-    harvest_result = _standup_harvest_result(
-        date_str,
-        trigger="user_command:/standup",
+    output['completed'], output['evidence_candidates'] = reconcile.merge(
+        user_stated,
+        evidence_candidates,
     )
-    output['evidence_candidates'] = harvest_result.get("evidence_candidates") or []
     output['evidence_harvest'] = {
         "health": harvest_result.get("health") or {},
         "window": harvest_result.get("window"),
