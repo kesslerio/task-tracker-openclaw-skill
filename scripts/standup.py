@@ -193,6 +193,25 @@ def _candidate_task_suffix(candidate: dict) -> str:
     return f" -> {task_id}" if task_id else ""
 
 
+def _draft_summary_lines(summary: dict | None, *, indent: str = "  ") -> list[str]:
+    if not summary or not summary.get("bullets"):
+        return []
+    lines = ["**Draft summary (unconfirmed):**"]
+    disclosure = summary.get("disclosure")
+    if disclosure:
+        lines.append(f"{indent}_{disclosure}_")
+    grouped: dict[str, list[dict]] = {}
+    for bullet in summary.get("bullets") or []:
+        area = str(bullet.get("area") or "unclassified")
+        grouped.setdefault(area, []).append(bullet)
+    for area in sorted(grouped):
+        lines.append(f"{indent}{area}:")
+        for bullet in grouped[area]:
+            lines.append(f"{indent}  • {bullet.get('bullet')}")
+    lines.append(f"{indent}Read-only draft; not recorded as completed.")
+    return lines
+
+
 def format_split_standup(output: dict, date_display: str) -> list:
     """Format standup as 3 separate messages.
     
@@ -222,6 +241,10 @@ def format_split_standup(output: dict, date_display: str) -> list:
             msg1_lines.append(
                 f"  • {candidate.get('title')}{_candidate_task_suffix(candidate)}"
             )
+    summary_lines = _draft_summary_lines((output.get("evidence_harvest") or {}).get("summary"))
+    if summary_lines:
+        msg1_lines.append("")
+        msg1_lines.extend(summary_lines)
     messages.append('\n'.join(msg1_lines).strip())
     
     # Message 2: Calendar events
@@ -522,6 +545,7 @@ def generate_standup(
         "health": harvest_result.get("health") or {},
         "window": harvest_result.get("window"),
         "run_id": harvest_result.get("run_id"),
+        "summary": harvest_result.get("summary"),
     }
 
     output['objective_progress'] = summarize_objective_progress(tasks_data)
@@ -656,6 +680,11 @@ def generate_standup(
             )
         if len(output['evidence_candidates']) > 5:
             lines.append(f"  • ... and {len(output['evidence_candidates']) - 5} more")
+
+    summary_lines = _draft_summary_lines((output.get("evidence_harvest") or {}).get("summary"))
+    if summary_lines:
+        lines.append("")
+        lines.extend(summary_lines)
 
     candidates = output.get('completion_candidates') or {}
     if candidates.get('review_required'):

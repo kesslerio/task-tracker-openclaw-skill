@@ -22,6 +22,7 @@ import evidence_record
 import harvest_ledger
 import harvest_state
 import harvest_window
+import standup_summarizer
 from adapters import calendar_adapter, dialpad_adapter
 
 STANDUP_RITUAL = "standup"
@@ -200,6 +201,18 @@ def _harvest_source(
     raise ValueError(f"unsupported standup harvest source: {source}")
 
 
+def _github_summary_metadata(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
+    minimal: list[dict[str, str]] = []
+    for candidate in candidates:
+        if candidate.get("source") != "github" or candidate.get("kind") != "activity":
+            continue
+        evidence_hash = str(candidate.get("evidence_hash") or "")
+        match_title = str(candidate.get("match_title") or "")
+        if evidence_hash and match_title:
+            minimal.append({"evidence_hash": evidence_hash, "match_title": match_title})
+    return minimal
+
+
 def harvest(*, target_date: str | date | None = None, trigger: str) -> dict[str, Any]:
     """Return fresh standup evidence candidates for the stable U1 window."""
     resolved = harvest_window.resolve_standup_window(target_date=target_date)
@@ -280,8 +293,11 @@ def harvest(*, target_date: str | date | None = None, trigger: str) -> dict[str,
         window=harvest_state.WINDOW_STANDUP,
     )
 
+    summary = standup_summarizer.summarize(_github_summary_metadata(persisted_fresh))
+
     return {
         "evidence_candidates": persisted_fresh,
+        "summary": summary,
         "health": health,
         "window": resolved.as_dict(),
         "run_id": run_id,

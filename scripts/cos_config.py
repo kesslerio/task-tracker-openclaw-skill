@@ -311,6 +311,43 @@ def dialpad_sms_pushback_char_threshold() -> int:
     return max(1, _int_env("DIALPAD_SMS_PUSHBACK_CHAR_THRESHOLD", 200))
 
 
+# --- Standup summarizer knobs (v0.3.1 U4) ---------------------------------
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().casefold() not in {"0", "false", "no", "off"}
+
+
+def standup_summarizer_enabled() -> bool:
+    """Whether the standup GitHub draft-summary LLM call is enabled."""
+    return _bool_env("STANDUP_SUMMARIZER_ENABLED", True)
+
+
+def standup_summarizer_model() -> str:
+    """Exact Ollama OpenAI-compatible model id for the one-shot summarizer."""
+    return os.getenv("STANDUP_SUMMARIZER_MODEL") or "qwen3-coder-next:cloud"
+
+
+def standup_summarizer_base_url() -> str:
+    """Local OpenAI-compatible chat-completions URL for the summarizer."""
+    return (
+        os.getenv("STANDUP_SUMMARIZER_BASE_URL")
+        or "http://127.0.0.1:11434/v1/chat/completions"
+    )
+
+
+def standup_summarizer_timeout_seconds() -> int:
+    """Hard timeout for the one-shot summarizer HTTP POST."""
+    return max(1, _int_env("STANDUP_SUMMARIZER_TIMEOUT_SECONDS", 15))
+
+
+def standup_summarizer_max_tokens() -> int:
+    """Hard max_tokens cap for the one-shot summarizer response."""
+    return max(1, _int_env("STANDUP_SUMMARIZER_MAX_TOKENS", 600))
+
+
 # --- Undo windows (Decision #8) -------------------------------------------
 
 def undo_window_nag_hours() -> int:
