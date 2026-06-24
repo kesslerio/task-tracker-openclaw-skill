@@ -86,6 +86,23 @@ def test_save_takes_the_focus_state_flock(state):
     assert focus_state.focus_state_lock_path().exists()
 
 
+def test_two_writers_from_the_same_rev_get_distinct_revs(state):
+    # The invariant the flock + read-on-disk-floor defends: two writers that both
+    # loaded the state at the SAME rev (the concurrent-writer race) must mint
+    # DISTINCT, strictly increasing revs -- never the same rev with different
+    # content (which would let a stale CAS snapshot falsely pass). The flock
+    # serialises the two saves; this asserts that, so serialised, each save reads
+    # the other's on-disk rev and increments past it rather than re-minting it.
+    focus_state.save_focus_state(_proposal())          # rev 1 on disk
+    a = focus_state.load_focus_state()                 # both writers load rev 1
+    b = focus_state.load_focus_state()
+    a["override_reason"], b["override_reason"] = "A", "B"  # divergent content
+    focus_state.save_focus_state(a)                    # rev 2
+    focus_state.save_focus_state(b)                    # rev 3, NOT a second rev 2
+    assert a["rev"] == 2 and b["rev"] == 3
+    assert focus_state.current_rev() == 3
+
+
 def test_current_rev_zero_for_legacy_state_without_rev(state):
     # A hand-written/legacy state file with no rev field reads as 0 (a valid
     # baseline), not None and not a crash.

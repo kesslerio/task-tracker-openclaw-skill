@@ -116,7 +116,13 @@ class Proposal:
                 f"focus_episode_id {self.focus_episode_id!r} != slot {expected!r}")
 
     def idem_key(self) -> str:
-        """The outbox at-most-once key: ``initiation:<focus_episode_id>:<stage>``."""
+        """The outbox at-most-once key: ``initiation:<focus_episode_id>:<stage>``.
+
+        Opaque + write-only: the key is only ever used as a dict key for dedupe; it is
+        NEVER split/parsed back, so the colon guards on the slot/stage exist solely to
+        keep two distinct episodes from colliding into one key -- do not "simplify"
+        them away on the assumption the key is parsed.
+        """
         return make_idem_key("initiation", self.focus_episode_id, self.stage)
 
     def is_expired(self, *, now: datetime | None = None) -> bool:

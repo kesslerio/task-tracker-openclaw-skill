@@ -177,8 +177,8 @@ def save_focus_state(state: dict[str, Any]) -> dict[str, Any]:
     state["updated_at"] = _now_iso()
     with _focus_state_flock():
         state["rev"] = max(_as_int(state.get("rev")), _current_on_disk_rev()) + 1
-        _atomic_write(
-            focus_state_path(), json.dumps(state, indent=2, sort_keys=True) + "\n")
+        payload = json.dumps(state, indent=2, sort_keys=True) + "\n"
+        _atomic_write(focus_state_path(), payload)
     return state
 
 
