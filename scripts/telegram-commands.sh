@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Telegram slash command wrapper for task-tracker skill
 # Usage: telegram-commands.sh {daily|eod|weekly|promote|swap|done|reschedule|snooze|body-double|start|cancel-session|
-#                              done24h|done7d|ledger|ledger-cron|win|approve|nag-check|checkin-dispatch|nag|quiet|unquiet|audit|undo}
+#                              done24h|done7d|ledger|ledger-cron|win|approve|nag-check|checkin-dispatch|initiation-tick|nag|quiet|unquiet|audit|undo}
 #
 # U1 NO-RAW-ERROR-LEAK boundary: every python3 invocation goes through
 # run_with_envelope, which captures stdout AND stderr. On a non-zero exit the
@@ -196,6 +196,14 @@ case "$1" in
     shift
     run_with_envelope "checkin_dispatch" python3 "$SCRIPT_DIR/checkin_dispatch.py" "$@"
     ;;
+  initiation-tick)
+    # v0.4-C recurring initiation nudge tick (cron-driven COMMAND, NOT an LLM turn).
+    # Evaluates whether today's committed #1 is unstarted past the threshold (and the
+    # user is free + not snoozed), parks an expiring proposal, and dispatches it via the
+    # receipt-backed outbox with a send-time CAS. No argv -- the tick derives the slot.
+    # The dispatcher OWNS the send; the cron does not re-announce its stdout.
+    run_with_envelope "initiation_dispatch" python3 "$SCRIPT_DIR/initiation_dispatch.py"
+    ;;
   nag)
     # U4 read-only escape hatch: `/nag` (or `/nag all`) prints the FULL overdue
     # list the capped cron push points at. Reactive + read-only (rung 0) -- no
@@ -228,7 +236,7 @@ case "$1" in
     run_with_envelope "manifest" python3 "$SCRIPT_DIR/cos_manifest.py" manifest
     ;;
   *)
-    echo "Usage: $0 {daily|eod|weekly|promote|swap|done|reschedule|snooze|body-double|start|cancel-session|done24h|done7d|ledger|ledger-cron|win|approve|nag-check|checkin-dispatch|nag|quiet|unquiet|health|manifest|audit|undo}"
+    echo "Usage: $0 {daily|eod|weekly|promote|swap|done|reschedule|snooze|body-double|start|cancel-session|done24h|done7d|ledger|ledger-cron|win|approve|nag-check|checkin-dispatch|initiation-tick|nag|quiet|unquiet|health|manifest|audit|undo}"
     exit 1
     ;;
 esac

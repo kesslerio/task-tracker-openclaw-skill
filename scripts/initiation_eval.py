@@ -193,3 +193,18 @@ def decide_and_store(now: datetime, *, user_scope: str = "work") -> Proposal | N
     except Exception:  # noqa: BLE001 -- fail OPEN: a store-write failure must not crash the cron
         return None
     return proposal
+
+
+def today_slot(now: datetime, *, user_scope: str = "work") -> str | None:
+    """The committed-#1 episode slot for ``now``, or None when no #1 is committed.
+
+    The public seam the C4 dispatcher uses to locate a lingering proposal's slot when
+    this tick itself emitted nothing -- single-sourcing the "today's committed #1"
+    derivation with the evaluator so the tick and the evaluation always agree.
+    """
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    first = _committed_first(now)
+    if first is None:
+        return None
+    return focus_episode_slot(user_scope, first[0], _local_date(now))
