@@ -38,13 +38,18 @@ did not ship. They generalize to any proactive, deterministic, measured action. 
 **1. Generalize the existing idempotent dispatcher; do the send-time recheck INSIDE its lock.**
 Do not build a new delivery path for a proactive action. Generalize the shipped idempotent dispatcher
 (reload state → bail if no longer eligible → **re-prove the delivery target NOW** → render **inert
-templated text** → `deliver_once` keyed for at-most-once). The "atomic claim" — re-validate that the
-parked decision is still safe to act on, with no double-send — is achieved by adding an **optional
-in-lock `precheck`** to the delivery primitive: it runs inside the existing flock, *after* the dedup
-short-circuit and *before* the sender, and a `False` aborts the send **without recording a receipt** (the
-slot stays open for a corrected re-fire). Reuse the existing flock; do **not** invent a new lock/receipt
-scheme. The decision and the delivery are decoupled across cron ticks via an **expiring proposal** in a
-small sidecar store, so a crash between deciding and sending loses nothing.
+templated text** → `deliver_once` keyed for at-most-once). Re-validate that the parked decision is still
+safe to act on by adding an **optional in-lock `precheck`** to the delivery primitive: it runs inside the
+existing flock, *after* the dedup short-circuit and *before* the sender, and a `False` aborts the send
+**without recording a receipt** (the slot stays open for a corrected re-fire). Reuse the existing flock;
+do **not** invent a new lock/receipt scheme. **Be precise about the guarantee**, though: the *dedup* (no
+double-send) IS atomic — it is the receipt write under the flock. The *staleness* recheck is
+**optimistic revalidation, not a true compare-and-swap**: the guarded task state lives under a
+*different* lock (pattern 3), so the precheck only makes the recheck as-late-as-possible and narrows the
+stale-send window — it does not close it. A genuinely atomic claim would compare-and-claim under the
+guarded state's *own* lock (or a shared transaction); don't over-claim the precheck as atomic across two
+independent locks. The decision and the delivery are decoupled across cron ticks via an **expiring
+proposal** in a small sidecar store, so a crash between deciding and sending loses nothing.
 
 **2. A proactive nudge fires before any work-session exists — key on a pre-session "slot" id.**
 An idempotency key (and an A/B assignment) normally keys on the work-session id. But a *cold-start*
@@ -75,15 +80,20 @@ is **busy** for an interruption gate yet **not evidence** for a harvest — reus
 event-type denylist verbatim would nudge straight through a "do not disturb" block. Parse strictly for a
 gate (raise on an odd payload) where the evidence read coerces to empty.
 
-**5. Pure rules-only evaluator, fail-OPEN toward silence.**
+**5. Rules-only evaluator that reads only, failing SAFE toward silence.**
 The "adaptivity" everyone reaches for an LLM/heartbeat to provide is a **deterministic state machine**
 over stored facts: committed-#1 · not-started · elapsed-threshold · not-busy-now · not-snoozed · budget.
 Order the gates **cheap-to-expensive** so the one network/subprocess read runs last (a normal "too soon"
-tick does zero I/O). For a *proactive* action, wrap the whole evaluation to **fail OPEN — toward doing
-nothing**: any read error returns "no nudge," because a missed nudge is harmless and an errant one is
-not. (This is the deliberate inverse of a fail-*closed* safety gate; name the direction at the boundary.)
-The decision's only side effect is parking the expiring proposal; the side-effecting write itself also
-fails open (a store error must not crash the cron).
+tick does zero I/O). For a *proactive* action, wrap the whole evaluation to **fail toward silence**: any
+read error returns "no nudge," because a missed nudge is harmless and an errant one is not. **Note this is
+the *same* direction as the calendar gate's fail-closed (pattern 4), not its opposite** — both resolve
+uncertainty to "don't send." They differ only in *why*: the gate maps an *Unknown* calendar to suppress
+(a deliberate "don't interrupt if unsure"), the evaluator catches *internal errors* and stays silent
+(fail-safe). The unifying rule for a proactive action is that **every uncertain path collapses to
+no-send**. (It is "rules-only" and side-effect-free in the sense that matters — no mutation, no send —
+but it does READ state and shell out to the calendar, so it is not a pure function; for testability,
+separate fact-acquisition, pure policy, and persistence.) The decision's only side effect is parking the
+expiring proposal; that write itself also fails toward silence (a store error must not crash the cron).
 
 **6. Ship a behaviour-change feature behind a deterministic holdout — and make the control arm symmetric.**
 Assign each entity a stable A/B arm by **hashing the slot id** (no RNG, no wall-clock), so the same
@@ -91,13 +101,19 @@ episode is always the same arm. The subtle, experiment-poisoning bug: the **cont
 identical path and record a counterfactual "held" receipt**. If control simply suppresses without
 recording, the evaluator re-decides the held entity *every tick* and the held-observation count inflates
 by roughly the number of ticks in the active window, tripping the escalation gate on a fraction of the
-intended data. Route control through the same
-delivery primitive with a **no-op sender** that records the receipt but sends nothing — cadence and dedup
-stay symmetric with treatment. **Aggregate efficacy per-EPISODE** (fold a re-decided slot or a
-cold+re-nudge pair to one observation; exclude windows still open as *pending*, never as misses). The
-metric reader is a **pure read** that only *collects*; the escalation decision (does the deterministic
-version earn an LLM upgrade?) stays a **human** read of the holdout count + the treatment-vs-control lift
-+ manually-labelled misses — the agent never promotes itself. Keep the **live trigger
+intended data. Route control through the same delivery primitive with a **no-op sender**: it records the
+at-most-once receipt — so the stage cadence and dedup stay symmetric with treatment — but delivers
+nothing. Be honest that this **reuses the delivery receipt as an exposure/stage-advance marker**; it is
+not a real delivery. A cleaner design would record an explicit "assignment/exposure" event rather than a
+sentinel receipt — reusing the receipt keeps both arms on one code path at the cost of that semantic
+fudge. **Aggregate efficacy per-EPISODE** (fold a re-decided slot or a cold+re-nudge pair to one
+observation; exclude windows still open as *pending*, never as misses), and fix the denominator at
+*assignment* (intention-to-treat), not at delivery. The metric reader only *collects* (no mutation, no
+send); the escalation decision stays a **human** read. **Mind the scope of what the holdout proves**,
+though: it measures **does nudging help** (nudge vs no-nudge), NOT **does the deterministic version need
+an LLM** (deterministic vs LLM) — those are *different* experiments. The holdout count + treatment-vs-
+control lift + manually-labelled *semantic* misses are necessary inputs to an LLM-upgrade decision but
+not sufficient on their own. The agent never promotes itself either way. Keep the **live trigger
 operator-deferred** until the holdout exists, so the feature can never run un-measured.
 
 ## Why this matters
@@ -108,9 +124,25 @@ Each pattern is the reason a specific bug did not ship, all surfaced by adversar
 - Without the pre-session slot (2), the cold-start nudge has no idempotency identity and re-sends.
 - Reusing the evidence read's event-type policy (4) would nudge during focus-time / out-of-office — the
   exact moments to stay silent.
-- Without fail-OPEN (5), a transient read error becomes an errant proactive send.
+- Without fail-toward-silence (5), a transient read error becomes an errant proactive send.
 - Without the symmetric held receipt (6), the holdout's whole purpose — an honest efficacy read — is
   defeated by a denominator inflated once per tick.
+
+## Shared system invariants (with the pull/harvest layer)
+
+This push layer and the pull/harvest layer ([deterministic-confirm-gated-harvest-pipeline](deterministic-confirm-gated-harvest-pipeline.md))
+are one system and rely on the same invariants — state them once, in both notes:
+- **One authority per fact.** Semantic task state (DONE / STARTED / priority) is recorded *only* through
+  user confirmation; the push layer records *proposals, exposures, receipts, metrics* and sends *inert*
+  prompts — it never records a DONE, and it consumes only **confirmed commitments**, never harvested
+  candidates or LLM drafts. A nudge's button action returns through the normal user-mutation path.
+- **One timezone + identity authority** (the Pacific local-day window; the slot/episode id), shared by
+  both layers so a date or an id means the same thing everywhere.
+- **Expiring, replay-safe proposals bound to a state revision** are the durable primitive on *both*
+  sides: the pull layer's confirm-gated draft and the push layer's deferred send both need stale-draft
+  protection + an idempotent token, so a late confirmation or a late send can't act on moved state.
+- **Lock ordering is explicit** wherever a recheck spans two locks (see pattern 1's honesty about the
+  precheck) — a true claim compares-and-claims under the guarded state's lock.
 
 ## When to apply
 
