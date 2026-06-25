@@ -63,6 +63,53 @@ def test_initiation_is_a_known_kind():
     assert "initiation" in outbox._KNOWN_KINDS
 
 
+# --- precheck (v0.4-C in-flock CAS) -----------------------------------------
+
+def test_precheck_true_allows_the_send(state):
+    calls = []
+
+    def sender(target, text, *a):
+        calls.append(text)
+        return {"message_id": FAKE_ID}
+
+    key = outbox.make_idem_key("initiation", "work:tsk_x:2026-06-24", "cold_start")
+    receipt = outbox.deliver_once(TARGET, "go", key, sender=sender, precheck=lambda: True)
+    assert calls == ["go"] and receipt["idempotent"] is False
+    assert outbox.get_receipt(key) is not None
+
+
+def test_precheck_false_aborts_without_send_or_receipt(state):
+    calls = []
+
+    def sender(target, text, *a):
+        calls.append(text)
+        return {"message_id": FAKE_ID}
+
+    key = outbox.make_idem_key("initiation", "work:tsk_x:2026-06-24", "cold_start")
+    receipt = outbox.deliver_once(TARGET, "go", key, sender=sender, precheck=lambda: False)
+    assert calls == []  # sender never called
+    assert receipt["aborted"] is True and receipt["idempotent"] is False
+    assert outbox.get_receipt(key) is None  # nothing recorded -> slot stays open
+
+
+def test_precheck_not_consulted_when_already_recorded(state):
+    sent = []
+
+    def sender(target, text, *a):
+        sent.append(text)
+        return {"message_id": FAKE_ID}
+
+    key = outbox.make_idem_key("initiation", "work:tsk_x:2026-06-24", "cold_start")
+    outbox.deliver_once(TARGET, "first", key, sender=sender)  # records the receipt
+
+    # A second call's precheck must NOT run (the dedup short-circuits first) and must
+    # not re-send -- it returns the recorded receipt as idempotent.
+    precheck_calls = []
+    receipt = outbox.deliver_once(TARGET, "second", key, sender=sender,
+                                  precheck=lambda: precheck_calls.append(1) or True)
+    assert sent == ["first"] and precheck_calls == [] and receipt["idempotent"] is True
+
+
 # --- deliver_once idempotency ----------------------------------------------
 
 def test_deliver_once_calls_sender_exactly_once_per_key(state):

@@ -286,6 +286,12 @@ def initiation_proposal_ttl_min() -> int:
     return max(1, _int_env("INITIATION_PROPOSAL_TTL_MIN", 60))
 
 
+def initiation_tick_minutes() -> int:
+    """Default cadence (minutes) of the recurring initiation dispatch tick (default 30).
+    Only the descriptor template's default; the operator sets the live cron schedule."""
+    return max(1, _int_env("INITIATION_TICK_MINUTES", 30))
+
+
 # --- Proactive layer knobs (U6) -------------------------------------------
 
 def focus_block_day_start_hour() -> int:

@@ -222,6 +222,7 @@ def deliver_once(
     *,
     sender: Callable[..., dict[str, Any]],
     buttons: list[dict[str, Any]] | None = None,
+    precheck: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Deliver ``text`` to ``delivery_target`` AT MOST ONCE per ``idem_key``.
 
@@ -250,6 +251,14 @@ def deliver_once(
     real receipt is ever recorded, so the outbox never contains a phantom send. This
     under-flock recorded-key check is the AUTHORITATIVE dedup; an upstream
     ``get_receipt`` / ``is_recorded`` peek is only an optimisation.
+
+    ``precheck`` (v0.4-C) is an OPTIONAL last-instant send-time guard evaluated INSIDE
+    the flock, AFTER the recorded-key dedup and immediately BEFORE the sender. It is the
+    "atomic claim" seam for the initiation CAS: the dispatcher passes a thunk that
+    re-reads the proposal's task-state/focus-episode versions, and a ``False`` ABORTS
+    the send (returns ``{idempotent: False, aborted: True}`` -- no sender call, no
+    receipt recorded), so a proposal that went stale between evaluation and the held
+    lock never delivers. ``None`` (every existing caller) keeps the historical behaviour.
     """
     with _outbox_flock():
         state = _read_outbox()
@@ -261,6 +270,11 @@ def deliver_once(
                 "ts": recorded.get("ts"),
                 "idempotent": True,
             }
+        # Last-instant CAS, inside the lock and after the dedup: a stale claim aborts
+        # WITHOUT sending or recording, so the slot stays open for a corrected re-fire.
+        if precheck is not None and not precheck():
+            return {"message_id": None, "target": None, "ts": None,
+                    "idempotent": False, "aborted": True}
         # A no-buttons send (``None`` or an empty list) stays the historical two-arg call
         # ``sender(target, text)`` so existing two-arg senders and test fakes are
         # unaffected; only a non-empty buttons list passes the third positional. The
