@@ -261,6 +261,31 @@ def outbox_retention_days() -> int:
     return max(1, _int_env("OUTBOX_RETENTION_DAYS", 7))
 
 
+def initiation_elapsed_min() -> int:
+    """Minutes after a #1 is committed (approved) before the first initiation nudge
+    may fire if it is still unstarted (v0.4-C "medium" cadence, default 90)."""
+    return max(1, _int_env("INITIATION_ELAPSED_MIN", 90))
+
+
+def initiation_daily_budget() -> int:
+    """Max initiation nudge SENDS per episode-slot per day (default 2: one cold-start
+    + one re-nudge). 0 disables initiation nudges entirely."""
+    return max(0, _int_env("INITIATION_DAILY_BUDGET", 2))
+
+
+def initiation_renudge_after_min() -> int:
+    """Minutes after the cold-start nudge before the single allowed re-nudge may fire
+    if the #1 is still unstarted (v0.4-C "medium" cadence, default 120)."""
+    return max(1, _int_env("INITIATION_RENUDGE_AFTER_MIN", 120))
+
+
+def initiation_proposal_ttl_min() -> int:
+    """How long an initiation proposal stays dispatchable before it expires (default
+    60). The dispatcher re-validates the CAS + calendar at send time regardless; this
+    just bounds how stale a parked proposal can be."""
+    return max(1, _int_env("INITIATION_PROPOSAL_TTL_MIN", 60))
+
+
 # --- Proactive layer knobs (U6) -------------------------------------------
 
 def focus_block_day_start_hour() -> int:
