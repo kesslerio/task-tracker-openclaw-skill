@@ -2,8 +2,10 @@
 """Confirm-gated GitHub evidence summarizer for the morning standup.
 
 This is the only LLM call in the v0.3.1 standup path. It is intentionally small:
-one OpenAI-compatible HTTP POST to the local Ollama endpoint, no tools, no
-session, no model fallback, hard output validation, and deterministic fallback.
+one OpenAI-compatible HTTP POST to a configured Ollama endpoint (local no-auth
+proxy by default, or the authenticated Ollama Cloud surface when an API key is
+set), no tools, no session, no model fallback, hard output validation, and
+deterministic fallback.
 """
 
 from __future__ import annotations
@@ -207,15 +209,23 @@ def _request_payload(
     }
 
 
-def _http_post_json(url: str, payload: dict[str, Any], timeout_seconds: int) -> tuple[int, bytes]:
+def _http_post_json(
+    url: str,
+    payload: dict[str, Any],
+    timeout_seconds: int,
+    api_key: str = "",
+) -> tuple[int, bytes]:
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme not in ("http", "https"):
         raise ValueError("unsupported summarizer url scheme")
     data = json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     request = urllib.request.Request(
         url,
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:
@@ -316,6 +326,7 @@ def summarize(
     enabled: bool | None = None,
     model: str | None = None,
     base_url: str | None = None,
+    api_key: str | None = None,
     timeout_seconds: int | None = None,
     max_tokens: int | None = None,
 ) -> dict[str, Any]:
@@ -336,7 +347,14 @@ def summarize(
     if cached is not None:
         return cached
 
-    poster = http_post or _http_post_json
+    if http_post is not None:
+        poster = http_post
+    else:
+        exact_key = api_key if api_key is not None else cos_config.standup_summarizer_api_key()
+
+        def poster(url: str, body: dict[str, Any], timeout: int) -> tuple[int, bytes]:
+            return _http_post_json(url, body, timeout, api_key=exact_key)
+
     try:
         payload = _request_payload(
             minimal,

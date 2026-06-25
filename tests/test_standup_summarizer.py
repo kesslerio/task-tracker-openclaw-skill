@@ -22,6 +22,7 @@ def state_dir(tmp_path, monkeypatch):
         "STANDUP_SUMMARIZER_ENABLED",
         "STANDUP_SUMMARIZER_MODEL",
         "STANDUP_SUMMARIZER_BASE_URL",
+        "STANDUP_SUMMARIZER_API_KEY",
         "STANDUP_SUMMARIZER_TIMEOUT_SECONDS",
         "STANDUP_SUMMARIZER_MAX_TOKENS",
     ):
@@ -167,6 +168,142 @@ def test_non_http_base_url_falls_back_without_urlopen(state_dir, monkeypatch):
 
     assert result["translated"] is False
     assert result["bullets"][0]["bullet"] == "Ship summarizer cache"
+
+
+class _CapturingResponse:
+    status = 200
+
+    def __init__(self, body):
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def read(self, size=-1):
+        return self._body
+
+
+def _capturing_urlopen(captured):
+    body = json.dumps(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            [
+                                {
+                                    "evidence_id": "sha256:github:one",
+                                    "area": "eng",
+                                    "bullet": "Shipped it",
+                                }
+                            ]
+                        )
+                    }
+                }
+            ]
+        }
+    ).encode("utf-8")
+
+    def urlopen(request, *, timeout):
+        captured.append(request)
+        return _CapturingResponse(body)
+
+    return urlopen
+
+
+def test_api_key_adds_bearer_authorization_header(state_dir, monkeypatch):
+    captured = []
+    monkeypatch.setattr(
+        standup_summarizer.urllib.request, "urlopen", _capturing_urlopen(captured)
+    )
+
+    result = standup_summarizer.summarize(
+        [_candidate()],
+        base_url="https://ollama.com/v1/chat/completions",
+        api_key="secret-token",
+        model="model-a",
+    )
+
+    assert result["translated"] is True
+    assert len(captured) == 1
+    assert captured[0].get_header("Authorization") == "Bearer secret-token"
+
+
+def test_no_api_key_sends_no_authorization_header(state_dir, monkeypatch):
+    captured = []
+    monkeypatch.setattr(
+        standup_summarizer.urllib.request, "urlopen", _capturing_urlopen(captured)
+    )
+
+    result = standup_summarizer.summarize(
+        [_candidate()],
+        base_url="http://127.0.0.1:11434/v1/chat/completions",
+        model="model-a",
+    )
+
+    assert result["translated"] is True
+    assert len(captured) == 1
+    assert captured[0].get_header("Authorization") is None
+
+
+def test_api_key_env_default_is_used_when_not_overridden(state_dir, monkeypatch):
+    monkeypatch.setenv("STANDUP_SUMMARIZER_API_KEY", "env-token")
+    captured = []
+    monkeypatch.setattr(
+        standup_summarizer.urllib.request, "urlopen", _capturing_urlopen(captured)
+    )
+
+    result = standup_summarizer.summarize(
+        [_candidate()],
+        base_url="https://ollama.com/v1/chat/completions",
+        model="model-a",
+    )
+
+    assert result["translated"] is True
+    assert len(captured) == 1
+    assert captured[0].get_header("Authorization") == "Bearer env-token"
+
+
+def test_api_key_env_trailing_newline_is_stripped_not_an_invalid_header(state_dir, monkeypatch):
+    # The common KEY="$(cat secret)" idiom appends a trailing newline; an
+    # unstripped value would raise ValueError building the header and degrade
+    # to a silent permanent fallback.
+    monkeypatch.setenv("STANDUP_SUMMARIZER_API_KEY", "env-token\n")
+    captured = []
+    monkeypatch.setattr(
+        standup_summarizer.urllib.request, "urlopen", _capturing_urlopen(captured)
+    )
+
+    result = standup_summarizer.summarize(
+        [_candidate()],
+        base_url="https://ollama.com/v1/chat/completions",
+        model="model-a",
+    )
+
+    assert result["translated"] is True
+    assert len(captured) == 1
+    assert captured[0].get_header("Authorization") == "Bearer env-token"
+
+
+def test_whitespace_only_api_key_env_disables_the_header(state_dir, monkeypatch):
+    monkeypatch.setenv("STANDUP_SUMMARIZER_API_KEY", "   ")
+    captured = []
+    monkeypatch.setattr(
+        standup_summarizer.urllib.request, "urlopen", _capturing_urlopen(captured)
+    )
+
+    result = standup_summarizer.summarize(
+        [_candidate()],
+        base_url="http://127.0.0.1:11434/v1/chat/completions",
+        model="model-a",
+    )
+
+    assert result["translated"] is True
+    assert len(captured) == 1
+    assert captured[0].get_header("Authorization") is None
 
 
 def test_adversarial_commit_text_cannot_change_target_or_inject_done(state_dir):
@@ -447,7 +584,7 @@ def test_request_payload_contains_only_github_minimal_metadata(state_dir, monkey
             }
         ], False
 
-    def post(url, payload, timeout):
+    def post(url, payload, timeout, api_key=""):
         captured["payload"] = payload
         github_evidence = json.loads(payload["messages"][1]["content"])["github_evidence"]
         return _envelope(

@@ -390,6 +390,21 @@ def standup_summarizer_base_url() -> str:
     )
 
 
+def standup_summarizer_api_key() -> str:
+    """Bearer token for the summarizer endpoint (empty disables the header).
+
+    Empty by default so the local no-auth Ollama proxy keeps working unchanged.
+    Set ``STANDUP_SUMMARIZER_API_KEY`` (e.g. to ``${OLLAMA_API_KEY}``) when the
+    endpoint is the authenticated Ollama Cloud OpenAI-compatible surface.
+
+    Stripped so a trailing newline from the common ``KEY="$(cat secret)"`` idiom
+    cannot produce an invalid header value (which would otherwise escape the
+    summarizer's HTTPError-only catch and degrade to a silent permanent
+    fallback); whitespace-only values collapse to empty and disable the header.
+    """
+    return (os.getenv("STANDUP_SUMMARIZER_API_KEY") or "").strip()
+
+
 def standup_summarizer_timeout_seconds() -> int:
     """Hard timeout for the one-shot summarizer HTTP POST."""
     return max(1, _int_env("STANDUP_SUMMARIZER_TIMEOUT_SECONDS", 15))
