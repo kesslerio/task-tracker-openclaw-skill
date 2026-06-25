@@ -90,7 +90,8 @@ Assign each entity a stable A/B arm by **hashing the slot id** (no RNG, no wall-
 episode is always the same arm. The subtle, experiment-poisoning bug: the **control arm must traverse the
 identical path and record a counterfactual "held" receipt**. If control simply suppresses without
 recording, the evaluator re-decides the held entity *every tick* and the held-observation count inflates
-5–15×, tripping the escalation gate on a fraction of the intended data. Route control through the same
+by roughly the number of ticks in the active window, tripping the escalation gate on a fraction of the
+intended data. Route control through the same
 delivery primitive with a **no-op sender** that records the receipt but sends nothing — cadence and dedup
 stay symmetric with treatment. **Aggregate efficacy per-EPISODE** (fold a re-decided slot or a
 cold+re-nudge pair to one observation; exclude windows still open as *pending*, never as misses). The
@@ -109,7 +110,7 @@ Each pattern is the reason a specific bug did not ship, all surfaced by adversar
   exact moments to stay silent.
 - Without fail-OPEN (5), a transient read error becomes an errant proactive send.
 - Without the symmetric held receipt (6), the holdout's whole purpose — an honest efficacy read — is
-  defeated by a 5–15× inflated denominator.
+  defeated by a denominator inflated once per tick.
 
 ## When to apply
 
