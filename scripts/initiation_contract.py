@@ -62,6 +62,14 @@ KNOWN_STAGES: frozenset[str] = frozenset({STAGE_COLD_START, STAGE_COLD_START_REN
 # colon stage at runtime; this guards a FUTURE maintainer adding a bad constant.
 assert all(":" not in stage for stage in KNOWN_STAGES), "stage constants must be colon-free"
 
+# The holdout arms (C5). Canonical here (the lowest module); ``initiation_holdout``
+# re-exports them. ``None`` is the pre-C5 / direct-construction default. A corrupt or
+# unknown arm on a stored proposal is REJECTED at construction (fail-closed: an
+# unrecognised arm must never round-trip and be mistaken for the send-eligible value).
+ARM_TREATMENT = "treatment"
+ARM_CONTROL = "control"
+KNOWN_ARMS: frozenset[str] = frozenset({ARM_TREATMENT, ARM_CONTROL})
+
 # Slot/key segments are colon-joined into the outbox idem key, so a literal ":" in
 # any segment would make the key ambiguous (and could collide two distinct slots).
 # Real values never contain one (scope ``work``; ``tsk_...`` ids; ISO ``YYYY-MM-DD``
@@ -108,6 +116,8 @@ class Proposal:
     def __post_init__(self) -> None:
         if self.stage not in KNOWN_STAGES:
             raise ValueError(f"unknown initiation stage {self.stage!r}")
+        if self.arm is not None and self.arm not in KNOWN_ARMS:
+            raise ValueError(f"unknown initiation arm {self.arm!r}")
         # The slot must round-trip its parts (no stray ":"), or the outbox key is
         # ambiguous. Re-derive and compare rather than trust a hand-built id.
         expected = focus_episode_slot(self.user_scope, self.task_id, self.local_date)

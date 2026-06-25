@@ -292,6 +292,18 @@ def initiation_tick_minutes() -> int:
     return max(1, _int_env("INITIATION_TICK_MINUTES", 30))
 
 
+def initiation_holdout_pct() -> int:
+    """Percent of episode SLOTS held back as the no-nudge control arm (default 25,
+    decisions-C7). 0 disables the holdout (everything is treatment); clamped to 0..100."""
+    return min(100, max(0, _int_env("INITIATION_HOLDOUT_PCT", 25)))
+
+
+def initiation_success_window_min() -> int:
+    """The initiation-success window (minutes): did the user START the #1 within this
+    long of the nudge/held decision (default 45, decisions-C7)."""
+    return max(1, _int_env("INITIATION_SUCCESS_WINDOW_MIN", 45))
+
+
 # --- Proactive layer knobs (U6) -------------------------------------------
 
 def focus_block_day_start_hour() -> int:
