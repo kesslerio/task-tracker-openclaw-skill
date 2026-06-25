@@ -36,13 +36,14 @@ def _commit(*, minutes_ago=100):
     })
 
 
-def _park(*, stage=ic.STAGE_COLD_START):
+def _park(*, stage=ic.STAGE_COLD_START, arm="treatment"):
     p = ic.Proposal(
         focus_episode_id=SLOT, task_id=TASK, user_scope="work", local_date=TODAY,
         stage=stage, reason_code="committed_unstarted",
         created_at=(NOW - timedelta(minutes=1)).isoformat(),
         expires_at=(NOW + timedelta(minutes=59)).isoformat(),
-        cas_focus_state_rev=focus_state.current_rev(), cas_no_session_since=NOW.isoformat())
+        cas_focus_state_rev=focus_state.current_rev(), cas_no_session_since=NOW.isoformat(),
+        arm=arm)
     store.write_proposal(p, now=NOW)
     return p
 
@@ -50,6 +51,9 @@ def _park(*, stage=ic.STAGE_COLD_START):
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     monkeypatch.setenv("TASK_MGMT_STATE_DIR", str(tmp_path / "state"))
+    # Pin run_tick's real evaluator to the treatment arm; the control path is tested
+    # directly via _park(arm="control") so a date-dependent slot hash can't flake here.
+    monkeypatch.setenv("INITIATION_HOLDOUT_PCT", "0")
     monkeypatch.setattr(disp.nag_delivery, "resolve_target",
                         lambda: {"ok": True, "delivery_target": TARGET})
     monkeypatch.setattr(disp.availability, "not_known_busy", lambda now, **k: True)
@@ -87,6 +91,17 @@ def test_renudge_stage_uses_distinct_text(env):
     _park(stage=ic.STAGE_COLD_START_RENUDGE)
     disp.run_dispatch(SLOT, now=NOW, sender=env.sender)
     assert "Still your #1" in env.sent[0]["text"]
+
+
+def test_control_arm_suppresses_the_send(env):
+    # The holdout control arm passes every eligibility gate but the send is suppressed
+    # (the counterfactual is recorded), and the proposal is cleared.
+    _commit()
+    _park(arm="control")
+    result = disp.run_dispatch(SLOT, now=NOW, sender=env.sender)
+    assert result["reason"] == "holdout-control" and result["arm"] == "control"
+    assert env.sent == []
+    assert store.read_proposal(SLOT, now=NOW) is None
 
 
 # --- nothing to send -------------------------------------------------------

@@ -120,6 +120,7 @@ KNOWN_EVENT_TYPES: frozenset[str] = frozenset({
     # v0.4-C -- deterministic initiation nudge dispatcher (no LLM turn).
     "initiation_sent",
     "initiation_delivery_blocked",
+    "initiation_suppressed_holdout",
     # H7 -- /start initiation loop (reuses the body-double session machinery).
     "start_session_started",
     # U5 -- accomplishment ledger.

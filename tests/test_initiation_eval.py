@@ -73,6 +73,10 @@ def test_emits_cold_start_when_all_gates_pass(env):
     assert p.reason_code == ev.REASON_COLD_START
     assert p.cas_focus_state_rev == focus_state.current_rev()
     assert p.cas_no_session_since == p.created_at == NOW.isoformat()
+    # C5: the holdout arm is stamped deterministically from the slot.
+    import initiation_holdout
+    assert p.arm == initiation_holdout.arm_for(SLOT)
+    assert p.arm in ("treatment", "control")
 
 
 # --- gate 1: committed #1 --------------------------------------------------

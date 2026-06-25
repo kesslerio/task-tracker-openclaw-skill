@@ -41,6 +41,7 @@ import error_envelope
 import focus_state
 import initiation_contract
 import initiation_eval
+import initiation_holdout
 import initiation_store
 import nag_delivery
 import nag_state
@@ -153,6 +154,18 @@ def run_dispatch(
         return {"sent": False, "reason": "target-unproven",
                 "focus_episode_id": focus_episode_id, "proof_reason": proof.get("reason")}
 
+    # Holdout control arm: eligible AND target-proven -- this is exactly where treatment
+    # SENDS. Suppress the send and record the counterfactual so treatment vs control is
+    # measured at the same decision point (the symmetric "no-nudge" arm).
+    if proposal.arm == initiation_holdout.ARM_CONTROL:
+        _log("initiation_suppressed_holdout", task_id=proposal.task_id,
+             focus_episode_id=focus_episode_id, stage=proposal.stage,
+             reason_code=proposal.reason_code, arm=proposal.arm)
+        _clear(focus_episode_id)
+        _record_health(ok=True)
+        return {"sent": False, "reason": "holdout-control", "arm": proposal.arm,
+                "focus_episode_id": focus_episode_id}
+
     text = _render_initiation_text(proposal)
     buttons = telegram_buttons.priority_nag_row(proposal.task_id)
 
@@ -175,7 +188,7 @@ def run_dispatch(
         return {"sent": False, "reason": "cas-stale-at-send", "focus_episode_id": focus_episode_id}
     if not receipt.get("idempotent"):
         _log("initiation_sent", task_id=proposal.task_id, focus_episode_id=focus_episode_id,
-             stage=proposal.stage, reason_code=proposal.reason_code,
+             stage=proposal.stage, reason_code=proposal.reason_code, arm=proposal.arm,
              message_id=receipt.get("message_id"), idem_key=proposal.idem_key())
     return {"sent": not receipt.get("idempotent"), "reason": "delivered",
             "idempotent": bool(receipt.get("idempotent")), "stage": proposal.stage,

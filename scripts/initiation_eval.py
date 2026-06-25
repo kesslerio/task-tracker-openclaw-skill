@@ -27,6 +27,7 @@ from datetime import datetime, timedelta, timezone
 import availability
 import cos_config
 import focus_state
+import initiation_holdout
 import initiation_store
 import nag_state
 import outbox
@@ -172,7 +173,7 @@ def evaluate(now: datetime, *, user_scope: str = "work") -> Proposal | None:
             expires_at=(now + ttl).isoformat(),
             cas_focus_state_rev=focus_state.current_rev(),
             cas_no_session_since=created,
-            arm=None,
+            arm=initiation_holdout.arm_for(slot),
         )
     except Exception:  # noqa: BLE001 -- fail OPEN toward silence: any read error -> no nudge
         return None
