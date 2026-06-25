@@ -157,6 +157,17 @@ def test_precheck_abort_at_send_does_not_deliver(env):
     assert store.read_proposal(SLOT, now=NOW) is None  # cleared
 
 
+def test_snooze_tapped_at_send_aborts(env):
+    _commit()
+    _park()
+    # Not snoozed at the pre-flock gate, but a Snooze lands before the held lock: the
+    # in-flock precheck's fresh snooze read must abort (no send mid-snooze).
+    states = iter([{}, {TASK: {"snoozed_until": (NOW + timedelta(hours=1)).isoformat()}}])
+    env.mp.setattr(disp.nag_state, "read_state", lambda: next(states))
+    result = disp.run_dispatch(SLOT, now=NOW, sender=env.sender)
+    assert result["reason"] == "cas-stale-at-send" and env.sent == []
+
+
 # --- run_tick (evaluate + store + dispatch) --------------------------------
 
 def test_run_tick_end_to_end_delivers(env):
@@ -169,6 +180,25 @@ def test_run_tick_end_to_end_delivers(env):
 def test_run_tick_no_committed_first(env):
     assert disp.run_tick(now=NOW, sender=env.sender)["reason"] == "no-committed-first"
     assert env.sent == []
+
+
+def test_run_tick_uses_the_returned_proposal_slot(env):
+    # On the hot path (decide_and_store emitted a proposal) the tick must NOT re-derive
+    # the slot -- it uses the returned proposal's focus_episode_id.
+    _commit()
+    env.mp.setattr(disp.initiation_eval, "today_slot",
+                   lambda *a, **k: (_ for _ in ()).throw(AssertionError("re-derived slot")))
+    assert disp.run_tick(now=NOW, sender=env.sender)["sent"] is True
+
+
+def test_run_tick_dispatches_a_lingering_proposal(env):
+    # This tick emits nothing new, but a prior tick's proposal is still parked -> the
+    # tick falls back to today's slot and dispatches it.
+    _commit()
+    _park()
+    env.mp.setattr(disp.initiation_eval, "decide_and_store", lambda now, **k: None)
+    result = disp.run_tick(now=NOW, sender=env.sender)
+    assert result["sent"] is True and len(env.sent) == 1
 
 
 # --- cron descriptor (code-only) -------------------------------------------

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -72,6 +73,15 @@ def _record_health(*, ok: bool, error_class: str | None = None) -> None:
             cos_health.record_failure(COMPONENT, error_class=error_class or "initiation_failed",
                                       trigger=f"cron:{COMPONENT}")
     except Exception:  # noqa: BLE001 -- health recording is best-effort, never fatal
+        pass
+
+
+def _clear(focus_episode_id: str) -> None:
+    """Best-effort proposal clear -- a failure (after a successful send especially) is
+    recovered on the next tick by the outbox dedup, so it must never crash the dispatch."""
+    try:
+        initiation_store.clear_proposal(focus_episode_id)
+    except Exception:  # noqa: BLE001 -- best-effort cleanup; the outbox receipt is the durable guard
         pass
 
 
@@ -120,7 +130,7 @@ def run_dispatch(
     # Send-time CAS: a stale proposal (the #1 changed, or the user already started) is
     # dead -- clear it and stop. (Re-checked again, atomically, in the outbox flock below.)
     if not initiation_contract.cas_still_valid_now(proposal):
-        initiation_store.clear_proposal(focus_episode_id)
+        _clear(focus_episode_id)
         _record_health(ok=True)
         return {"sent": False, "reason": "cas-stale", "focus_episode_id": focus_episode_id}
 
@@ -145,14 +155,21 @@ def run_dispatch(
 
     text = _render_initiation_text(proposal)
     buttons = telegram_buttons.priority_nag_row(proposal.task_id)
+
+    def _still_sendable() -> bool:
+        # In-flock last-instant guard: the CAS (task/episode version) AND a FRESH snooze
+        # read -- a Snooze tapped between the pre-flock gate and the held lock must abort.
+        if not initiation_contract.cas_still_valid_now(proposal):
+            return False
+        return not nag_state.is_snoozed(nag_state.read_state().get(proposal.task_id), now=now)
+
     receipt = outbox.deliver_once(
         proof["delivery_target"], text, proposal.idem_key(),
-        sender=sender or outbox.openclaw_sender, buttons=buttons,
-        precheck=lambda: initiation_contract.cas_still_valid_now(proposal),
+        sender=sender or outbox.openclaw_sender, buttons=buttons, precheck=_still_sendable,
     )
 
     # Delivered / already-delivered / aborted-stale are all TERMINAL for this proposal.
-    initiation_store.clear_proposal(focus_episode_id)
+    _clear(focus_episode_id)
     _record_health(ok=True)
     if receipt.get("aborted"):
         return {"sent": False, "reason": "cas-stale-at-send", "focus_episode_id": focus_episode_id}
@@ -165,26 +182,15 @@ def run_dispatch(
             "focus_episode_id": focus_episode_id, "message_id": receipt.get("message_id")}
 
 
-def _today_slot(now: datetime, *, user_scope: str = "work") -> str | None:
-    """The committed-#1 episode slot for ``now``, or None when no #1 is committed.
-
-    Single-sources the "today's committed #1" derivation with the evaluator so the
-    dispatch tick and the evaluation agree on the slot.
-    """
-    first = initiation_eval._committed_first(now)
-    if first is None:
-        return None
-    return initiation_contract.focus_episode_slot(
-        user_scope, first[0], initiation_eval._local_date(now))
-
-
 def run_tick(
     *, now: datetime | None = None, sender: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """The recurring cron entry: evaluate + store, then dispatch the pending proposal."""
     now = now or _now()
-    initiation_eval.decide_and_store(now)
-    slot = _today_slot(now)
+    proposal = initiation_eval.decide_and_store(now)
+    # Dispatch the proposal just parked; if this tick emitted nothing, fall back to a
+    # prior tick's lingering proposal at today's slot (the evaluator's public seam).
+    slot = proposal.focus_episode_id if proposal is not None else initiation_eval.today_slot(now)
     if slot is None:
         _record_health(ok=True)
         return {"sent": False, "reason": "no-committed-first"}
@@ -211,7 +217,8 @@ def initiation_cron_descriptor(*, scripts_dir: str = DEFAULT_SCRIPTS_DIR) -> dic
         "schedule": {"kind": "interval", "minutes": cos_config.initiation_tick_minutes()},
         "payload": {
             "kind": "command",
-            "argv": ["sh", "-c", f"cd {scripts_dir} && bash telegram-commands.sh initiation-tick"],
+            "argv": ["sh", "-c",
+                     f"cd {shlex.quote(scripts_dir)} && bash telegram-commands.sh initiation-tick"],
         },
     }
 

@@ -259,6 +259,10 @@ def deliver_once(
     the send (returns ``{idempotent: False, aborted: True}`` -- no sender call, no
     receipt recorded), so a proposal that went stale between evaluation and the held
     lock never delivers. ``None`` (every existing caller) keeps the historical behaviour.
+    A caller that passes ``precheck`` MUST check ``receipt.get("aborted")`` BEFORE
+    treating ``idempotent: False`` as a fresh send -- an abort is NEITHER sent nor a
+    recorded duplicate, so a caller that only branches on ``idempotent`` would log a
+    phantom send. (Callers that pass no ``precheck`` can never see the abort shape.)
     """
     with _outbox_flock():
         state = _read_outbox()
