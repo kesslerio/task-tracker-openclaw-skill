@@ -77,6 +77,13 @@ def _record_health(*, ok: bool, error_class: str | None = None) -> None:
         pass
 
 
+def _held_sender(delivery_target: dict[str, Any], text: str, buttons: Any = None) -> dict[str, Any]:
+    """The CONTROL-arm "sender": records a receipt (so the holdout's stage cadence +
+    dedup stay symmetric with treatment) but delivers NOTHING. The sentinel message_id
+    marks the outbox entry as a held counterfactual, not a real send."""
+    return {"message_id": "holdout-control"}
+
+
 def _clear(focus_episode_id: str) -> None:
     """Best-effort proposal clear -- a failure (after a successful send especially) is
     recovered on the next tick by the outbox dedup, so it must never crash the dispatch."""
@@ -154,18 +161,6 @@ def run_dispatch(
         return {"sent": False, "reason": "target-unproven",
                 "focus_episode_id": focus_episode_id, "proof_reason": proof.get("reason")}
 
-    # Holdout control arm: eligible AND target-proven -- this is exactly where treatment
-    # SENDS. Suppress the send and record the counterfactual so treatment vs control is
-    # measured at the same decision point (the symmetric "no-nudge" arm).
-    if proposal.arm == initiation_holdout.ARM_CONTROL:
-        _log("initiation_suppressed_holdout", task_id=proposal.task_id,
-             focus_episode_id=focus_episode_id, stage=proposal.stage,
-             reason_code=proposal.reason_code, arm=proposal.arm)
-        _clear(focus_episode_id)
-        _record_health(ok=True)
-        return {"sent": False, "reason": "holdout-control", "arm": proposal.arm,
-                "focus_episode_id": focus_episode_id}
-
     text = _render_initiation_text(proposal)
     buttons = telegram_buttons.priority_nag_row(proposal.task_id)
 
@@ -176,23 +171,37 @@ def run_dispatch(
             return False
         return not nag_state.is_snoozed(nag_state.read_state().get(proposal.task_id), now=now)
 
+    # The holdout CONTROL arm runs the IDENTICAL path -- same gates, same in-flock
+    # precheck, and (critically) the same receipt-recording deliver_once -- but a no-op
+    # "held" sender delivers NOTHING. Recording the receipt is what makes the stage
+    # cadence + dedup SYMMETRIC with treatment: ``_select_stage`` reads the receipt and
+    # advances cold_start -> renudge -> done once, instead of re-emitting cold_start
+    # every tick (which would inflate the holdout count). Only the final send differs.
+    # Fail-CLOSED on the arm: deliver ONLY for an explicit treatment (or a legacy None);
+    # any other value holds, so a corrupt/unknown arm can never leak a send.
+    should_deliver = proposal.arm in (initiation_holdout.ARM_TREATMENT, None)
     receipt = outbox.deliver_once(
         proof["delivery_target"], text, proposal.idem_key(),
-        sender=sender or outbox.openclaw_sender, buttons=buttons, precheck=_still_sendable,
+        sender=(sender or outbox.openclaw_sender) if should_deliver else _held_sender,
+        buttons=buttons, precheck=_still_sendable,
     )
 
-    # Delivered / already-delivered / aborted-stale are all TERMINAL for this proposal.
+    # Delivered / held / already-recorded / aborted-stale are all TERMINAL for this proposal.
     _clear(focus_episode_id)
     _record_health(ok=True)
     if receipt.get("aborted"):
-        return {"sent": False, "reason": "cas-stale-at-send", "focus_episode_id": focus_episode_id}
+        return {"sent": False, "reason": "cas-stale-at-send", "arm": proposal.arm,
+                "focus_episode_id": focus_episode_id}
     if not receipt.get("idempotent"):
-        _log("initiation_sent", task_id=proposal.task_id, focus_episode_id=focus_episode_id,
+        _log("initiation_sent" if should_deliver else "initiation_suppressed_holdout",
+             task_id=proposal.task_id, focus_episode_id=focus_episode_id,
              stage=proposal.stage, reason_code=proposal.reason_code, arm=proposal.arm,
              message_id=receipt.get("message_id"), idem_key=proposal.idem_key())
-    return {"sent": not receipt.get("idempotent"), "reason": "delivered",
-            "idempotent": bool(receipt.get("idempotent")), "stage": proposal.stage,
-            "focus_episode_id": focus_episode_id, "message_id": receipt.get("message_id")}
+    return {"sent": should_deliver and not receipt.get("idempotent"),
+            "reason": "delivered" if should_deliver else "holdout-control",
+            "arm": proposal.arm, "idempotent": bool(receipt.get("idempotent")),
+            "stage": proposal.stage, "focus_episode_id": focus_episode_id,
+            "message_id": receipt.get("message_id")}
 
 
 def run_tick(

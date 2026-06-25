@@ -97,11 +97,28 @@ def test_control_arm_suppresses_the_send(env):
     # The holdout control arm passes every eligibility gate but the send is suppressed
     # (the counterfactual is recorded), and the proposal is cleared.
     _commit()
-    _park(arm="control")
+    p = _park(arm="control")
     result = disp.run_dispatch(SLOT, now=NOW, sender=env.sender)
     assert result["reason"] == "holdout-control" and result["arm"] == "control"
     assert env.sent == []
     assert store.read_proposal(SLOT, now=NOW) is None
+    # CRITICAL: control records a receipt (so _select_stage advances the stage and does
+    # NOT re-emit this slot every tick -- the holdout-inflation fix). It is NOT a send.
+    assert disp.outbox.get_receipt(p.idem_key()) is not None
+
+
+def test_corrupt_arm_in_store_reads_as_none_no_send(env):
+    # A corrupt arm must NEVER leak a send. Proposal.__post_init__ rejects an unknown arm,
+    # so a tampered stored proposal fails from_dict on read -> store returns None -> the
+    # dispatcher does nothing (fail-closed: no send to a holdout slot via corruption).
+    import json
+    _commit()
+    _park(arm="control")
+    raw = json.loads(disp.initiation_store.store_path().read_text())
+    raw[SLOT]["arm"] = "contrl"
+    disp.initiation_store.store_path().write_text(json.dumps(raw))
+    result = disp.run_dispatch(SLOT, now=NOW, sender=env.sender)
+    assert result["reason"] == "no-proposal" and env.sent == []
 
 
 # --- nothing to send -------------------------------------------------------

@@ -19,9 +19,9 @@ from __future__ import annotations
 import hashlib
 
 import cos_config
+from initiation_contract import ARM_CONTROL, ARM_TREATMENT  # canonical arm vocabulary
 
-ARM_TREATMENT = "treatment"
-ARM_CONTROL = "control"
+__all__ = ["ARM_CONTROL", "ARM_TREATMENT", "arm_for"]
 
 
 def arm_for(focus_episode_id: str) -> str:
@@ -31,6 +31,13 @@ def arm_for(focus_episode_id: str) -> str:
     A SHA-256 of the slot id -> an integer in ``[0, 100)`` -> below the holdout cut is
     control. Deterministic (no ``Math.random``/wall-clock), so the arm is identical
     across every evaluator tick for the same episode, and symmetric across runs.
+
+    **Operational invariant: do NOT change ``INITIATION_HOLDOUT_PCT`` during an active
+    experiment.** The split is stable for a FIXED pct; changing it mid-experiment can
+    flip an as-yet-unrecorded slot's arm (changing the % of any running A/B test
+    invalidates it). Once a slot's first decision is recorded (an outbox receipt), the
+    C3 evaluator no longer re-emits it, so the recorded arm is frozen -- but set the pct
+    once at the start of a holdout window and leave it.
     """
     digest = hashlib.sha256(focus_episode_id.encode("utf-8")).hexdigest()
     bucket = int(digest, 16) % 100

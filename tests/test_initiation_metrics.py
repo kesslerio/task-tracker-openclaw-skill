@@ -1,4 +1,4 @@
-"""v0.4-C initiation metrics: pure per-arm initiation-success read over the ledger."""
+"""v0.4-C initiation metrics: pure per-EPISODE initiation-success read over the ledger."""
 
 import sys
 from datetime import datetime, timedelta, timezone
@@ -19,12 +19,18 @@ def _ago(minutes):
     return NOW - timedelta(minutes=minutes)
 
 
+def _slot(task_id):
+    return f"work:{task_id}:slot"
+
+
 @pytest.fixture
 def ledger(tmp_path, monkeypatch):
     monkeypatch.setenv("TASK_TRACKER_LEDGER_FILE", str(tmp_path / "ledger.jsonl"))
     monkeypatch.setenv("TASK_MGMT_STATE_DIR", str(tmp_path / "state"))
 
     def _append(event_type, task_id, ts, **meta):
+        if event_type in metrics._DECISION_TYPES:
+            meta.setdefault("focus_episode_id", _slot(task_id))
         event = task_ledger.new_event(event_type, task_id=task_id, metadata=meta)
         event["timestamp"] = ts.isoformat()
         task_ledger.append_event(event)
@@ -42,12 +48,31 @@ def test_per_arm_success_rates_and_pending(ledger):
     ledger("initiation_sent", "tsk_e", _ago(10), arm="treatment", stage="cold_start")  # window open -> pending
 
     s = metrics.summarize(now=NOW)
-    assert s["treatment"] == {"decisions": 2, "started_within": 1, "pending": 1, "start_rate": 0.5}
-    assert s["control"] == {"decisions": 2, "started_within": 1, "pending": 0, "start_rate": 0.5}
+    assert s["treatment"] == {"episodes": 2, "started_within": 1, "pending": 1, "start_rate": 0.5}
+    assert s["control"] == {"episodes": 2, "started_within": 1, "pending": 0, "start_rate": 0.5}
     assert s["valid_holdouts"] == 2
     assert [m["task_id"] for m in s["miss_candidates"]] == ["tsk_b"]
     assert s["already_started_fp"] == []
     assert s["window_min"] == 45
+
+
+def test_re_emitted_decisions_for_a_slot_count_once(ledger):
+    # The same slot re-decided across several ticks (the holdout-inflation hazard) folds
+    # to ONE episode, anchored at the FIRST decision; a later start still scores it once.
+    for mins in (60, 30, 5):
+        ledger("initiation_suppressed_holdout", "tsk_x", _ago(mins), arm="control", stage="cold_start")
+    ledger("body_double_started", "tsk_x", _ago(20))  # within 45m of the FIRST (-60) decision
+    s = metrics.summarize(now=NOW)
+    assert s["valid_holdouts"] == 1
+    assert s["control"] == {"episodes": 1, "started_within": 1, "pending": 0, "start_rate": 1.0}
+
+
+def test_cold_and_renudge_for_a_slot_are_one_episode(ledger):
+    ledger("initiation_sent", "tsk_y", _ago(180), arm="treatment", stage="cold_start")
+    ledger("initiation_sent", "tsk_y", _ago(60), arm="treatment", stage="cold_start_renudge")
+    s = metrics.summarize(now=NOW)
+    assert s["treatment"]["episodes"] == 1 and s["treatment"]["started_within"] == 0
+    assert [m["task_id"] for m in s["miss_candidates"]] == ["tsk_y"]
 
 
 def test_start_after_window_is_not_a_success(ledger):
