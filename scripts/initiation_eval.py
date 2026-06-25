@@ -75,15 +75,21 @@ def _committed_first(now: datetime) -> tuple[str, datetime] | None:
         return None
     task_id = rows[0].get("task_id")
     committed_at = _parse_iso((state or {}).get("approved_at"))
-    if not task_id or committed_at is None:
+    # task_id must be a real string id -- do NOT str()-coerce a numeric/garbage value
+    # (that would launder it past focus_episode_slot's own non-empty-string guard).
+    if not isinstance(task_id, str) or not task_id or committed_at is None:
         return None
-    return str(task_id), committed_at
+    return task_id, committed_at
 
 
 def _has_started(entry: object, now: datetime, today: str) -> bool:
-    """Has a focus session for the task been started today (ACTIVE or already ended)?
+    """Has a focus session for the task engaged it today? If so, nothing to *initiate*.
 
-    Either signal means the user has engaged the #1, so there is nothing to *initiate*.
+    Engaged = an ACTIVE session, OR any session whose start / scheduled-end (``ends_at``,
+    so an overnight block running into today counts) / explicit-end falls on today, OR an
+    ended session we cannot date. The undateable-ended case fails CLOSED (assume engaged)
+    -- mirroring ``cas_still_valid``, and so a garbage stamp on a real same-day session
+    can never read as "not started" and fire a false nudge.
     """
     if not isinstance(entry, dict):
         return False
@@ -92,9 +98,12 @@ def _has_started(entry: object, now: datetime, today: str) -> bool:
     for session in entry.get("body_double_sessions") or []:
         if not isinstance(session, dict):
             continue
-        started = _parse_iso(session.get("started_at"))
-        if started is not None and _local_date(started) == today:
-            return True
+        for field in ("started_at", "ends_at", "ended_at"):
+            stamp = _parse_iso(session.get(field))
+            if stamp is not None and _local_date(stamp) == today:
+                return True
+        if session.get("ended_at") and _parse_iso(session.get("ended_at")) is None:
+            return True  # an ended session we cannot date -> fail closed (engaged)
     return False
 
 
@@ -110,6 +119,8 @@ def _select_stage(slot: str, committed_at: datetime, now: datetime) -> tuple[str
     renudge = outbox.get_receipt(outbox.make_idem_key("initiation", slot, STAGE_COLD_START_RENUDGE))
     if (1 if cold else 0) + (1 if renudge else 0) >= cos_config.initiation_daily_budget():
         return None
+    if cold is None and renudge is not None:
+        return None  # a re-nudge with no cold-start is corrupted state -> suppress
     if cold is None:
         if _minutes(now - committed_at) < cos_config.initiation_elapsed_min():
             return None
@@ -174,10 +185,11 @@ def decide_and_store(now: datetime, *, user_scope: str = "work") -> Proposal | N
     dispatcher's send-time re-check (C4) can run in a separate cron tick.
     """
     proposal = evaluate(now, user_scope=user_scope)
-    if proposal is not None:
-        initiation_store.write_proposal(proposal, now=proposal_now(now))
+    if proposal is None:
+        return None
+    try:
+        # ``now`` may be naive; the store's expiry check normalizes it (naive -> UTC).
+        initiation_store.write_proposal(proposal, now=now)
+    except Exception:  # noqa: BLE001 -- fail OPEN: a store-write failure must not crash the cron
+        return None
     return proposal
-
-
-def proposal_now(now: datetime) -> datetime:
-    return now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)

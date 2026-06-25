@@ -103,6 +103,39 @@ def test_started_and_ended_today_no_nudge(env):
     assert ev.evaluate(NOW) is None
 
 
+def test_overnight_session_ended_today_no_nudge(env):
+    # Started yesterday-local, ended today-local (straddles local midnight) -> engaged.
+    _commit()
+    env.nag({"body_double_sessions": [{"session_id": "st_x",
+             "started_at": (NOW - timedelta(days=1)).isoformat(),
+             "ended_at": (NOW - timedelta(minutes=20)).isoformat()}]})
+    assert ev.evaluate(NOW) is None
+
+
+def test_overnight_session_scheduled_into_today_no_nudge(env):
+    # Started yesterday, scheduled end (ends_at) is today, never explicitly closed.
+    _commit()
+    env.nag({"body_double_sessions": [{"session_id": "st_x",
+             "started_at": (NOW - timedelta(days=1)).isoformat(),
+             "ends_at": (NOW - timedelta(minutes=20)).isoformat()}]})
+    assert ev.evaluate(NOW) is None
+
+
+def test_ended_session_with_undateable_stamp_fails_closed_no_nudge(env):
+    # An ended session we cannot date might be today's -> fail closed (engaged), never
+    # a false nudge (mirrors the CAS posture on unparseable stamps).
+    _commit()
+    env.nag({"body_double_sessions": [{"session_id": "st_x",
+             "started_at": "not-a-timestamp", "ended_at": "also-garbage"}]})
+    assert ev.evaluate(NOW) is None
+
+
+def test_non_string_task_id_no_nudge(env):
+    # A malformed focus_state with a numeric task_id must not be laundered into a slot.
+    _commit(task_id=12345)
+    assert ev.evaluate(NOW) is None
+
+
 # --- gate 3: snooze --------------------------------------------------------
 
 def test_snoozed_no_nudge(env):
@@ -139,6 +172,38 @@ def test_budget_exhausted_no_nudge(env):
         _key(ic.STAGE_COLD_START_RENUDGE): {"ts": (NOW - timedelta(minutes=130)).isoformat()},
     })
     assert ev.evaluate(NOW) is None
+
+
+def test_renudge_receipt_without_cold_start_suppresses(env):
+    # Corrupted send history (a re-nudge with no cold-start) must not emit a cold-start.
+    _commit(minutes_ago=400)
+    env.receipts({_key(ic.STAGE_COLD_START_RENUDGE): {"ts": (NOW - timedelta(minutes=130)).isoformat()}})
+    assert ev.evaluate(NOW) is None
+
+
+def test_budget_zero_disables_nudges(env):
+    _commit()
+    env.mp.setenv("INITIATION_DAILY_BUDGET", "0")
+    assert ev.evaluate(NOW) is None
+
+
+def test_elapsed_boundary_is_inclusive(env):
+    _commit(minutes_ago=89)
+    assert ev.evaluate(NOW) is None        # 89 < 90 -> too soon
+    _commit(minutes_ago=90)
+    assert ev.evaluate(NOW) is not None     # exactly 90 -> fires
+
+
+# --- decide_and_store fail-open --------------------------------------------
+
+def test_decide_and_store_fails_open_on_write_error(env):
+    _commit()
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+
+    env.mp.setattr(ev.initiation_store, "write_proposal", boom)
+    assert ev.decide_and_store(NOW) is None  # must not propagate / crash the cron
 
 
 # --- gate 5: calendar (evaluated LAST) -------------------------------------
