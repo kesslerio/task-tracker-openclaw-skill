@@ -74,7 +74,11 @@ def _query_events(
     calendar_id = config.get("calendar_id") or config.get("calendar") or config.get("id")
     account = config.get("account")
     if not calendar_id or not account:
-        return []
+        # A configured-but-unqueryable calendar is UNCERTAINTY, not "no meetings": we
+        # cannot rule out a meeting on it, so raise (the caller's broad except fails
+        # closed). The harvest's _run_calendar returns [] here because empty evidence is
+        # fine; the availability GATE must not read a missing-config as "free".
+        raise ValueError("calendar config missing calendar_id/account")
     args = [
         cmd, "calendar", "list", str(calendar_id),
         "--account", str(account),

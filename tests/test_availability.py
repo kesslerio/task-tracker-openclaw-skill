@@ -169,6 +169,22 @@ def test_malformed_calendar_config_fails_closed(tmp_path, monkeypatch):
     assert availability.not_known_busy(NOW) is False
 
 
+@pytest.mark.parametrize("config", [
+    {"cmd": "gog", "account": "owner@example.test"},        # no calendar_id
+    {"cmd": "gog", "calendar_id": "cal_fixture"},            # no account
+])
+def test_incomplete_calendar_config_fails_closed(tmp_path, monkeypatch, config):
+    # A structurally-valid config missing calendar_id/account is unqueryable ->
+    # uncertainty -> suppress, never silently read as 'no meetings' (free).
+    monkeypatch.setenv("TASK_MGMT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("STANDUP_CALENDARS", json.dumps({"work": config}))
+    monkeypatch.setattr(availability.error_envelope, "breaker_open", lambda component: False)
+    # subprocess must never be reached; if it is, this would raise loudly.
+    monkeypatch.setattr(availability.subprocess, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("gog called")))
+    assert availability.not_known_busy(NOW) is False
+
+
 def test_gog_nonzero_exit_fails_closed(configured):
     configured([], returncode=1)
     assert availability.not_known_busy(NOW) is False
