@@ -3,9 +3,8 @@
 EOD Review Generator - Aggregates daily note + work tasks into a structured EOD review.
 
 Reads from:
-1. 06-Daily/{date}.md — primary source for today's done/not-done items
-2. Work Tasks.md — open Q1/Q2 items for "tomorrow's top 3"
-3. Google Calendar via gog CLI (optional, reuses standup.py pattern)
+1. TASK_TRACKER_DAILY_NOTES_DIR/{date}.md — canonical daily-note completion evidence
+2. Work Tasks.md — fallback completed items and open Q1/Q2 items for "tomorrow's top 3"
 
 Outputs:
 - Default: writes 01-Reports/{date}-eod.md AND prints to stdout
@@ -16,121 +15,42 @@ Outputs:
 import argparse
 import json
 import os
-import re
 import sys
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import error_envelope
 from candidate_review import candidate_review_summary
+from daily_notes import extract_completed_tasks
 from task_audit import task_audit_summary
 from utils import load_tasks
 
 OBSIDIAN_VAULT = Path(os.getenv('OBSIDIAN_VAULT', Path.home() / "Obsidian"))
-DAILY_DIR = Path(os.getenv('EOD_DAILY_DIR', OBSIDIAN_VAULT / "06-Daily"))
+_DAILY_NOTES_DEFAULT = OBSIDIAN_VAULT / "01-TODOs" / "Daily"
 OUTPUT_DIR = Path(os.getenv('EOD_OUTPUT_DIR', OBSIDIAN_VAULT / "01-Reports"))
 
-WEEKDAY_MAP = {
-    'mon': 0, 'monday': 0,
-    'tue': 1, 'tuesday': 1,
-    'wed': 2, 'wednesday': 2,
-    'thu': 3, 'thursday': 3,
-    'fri': 4, 'friday': 4,
-    'sat': 5, 'saturday': 5,
-    'sun': 6, 'sunday': 6,
-}
+
+def daily_notes_dir() -> Path:
+    raw = os.getenv("TASK_TRACKER_DAILY_NOTES_DIR")
+    return (Path(raw) if raw else _DAILY_NOTES_DEFAULT).expanduser()
 
 
-def parse_daily_note(content: str, target_date: datetime) -> dict:
-    """Parse a 06-Daily note into done/not-done items.
-
-    Handles two observed formats:
-    - Checkboxes directly under "### Today (...)"
-    - A "#### Done" subsection under "### Today"
-    - Weekly priorities with "(done Weekday)" annotations
-    """
-    done = []
-    not_done = []
-    target_weekday = target_date.weekday()
-
-    lines = content.split('\n')
-    in_today = False
-    in_today_done = False
-    in_weekly = False
-    current_weekly_section = None
-
-    for line in lines:
-        stripped = line.strip()
-
-        # Detect section headers
-        if stripped.startswith('### Today'):
-            in_today = True
-            in_today_done = False
-            in_weekly = False
-            continue
-        if stripped.startswith('### Yesterday') or stripped.startswith('### '):
-            if stripped.startswith('### This Week'):
-                in_weekly = True
-                in_today = False
-                in_today_done = False
-                current_weekly_section = None
-                continue
-            if not stripped.startswith('### This Week'):
-                in_today = False
-                in_today_done = False
-                if not in_weekly:
-                    continue
-
-        # "#### Done" subsection under Today
-        if in_today and stripped.startswith('#### Done'):
-            in_today_done = True
-            continue
-        if in_today and stripped.startswith('#### '):
-            in_today_done = False
-            continue
-
-        # Track weekly subsection headers (### SALES, ### MARKETING, etc.)
-        if in_weekly and stripped.startswith('### '):
-            current_weekly_section = stripped.lstrip('#').strip()
-            continue
-
-        # Parse checkboxes in Today section
-        if in_today:
-            checkbox = re.match(r'^- \[([ xX])\] (.+)$', stripped)
-            if checkbox:
-                is_done = checkbox.group(1).lower() == 'x'
-                item_text = checkbox.group(2).strip()
-                if is_done or in_today_done:
-                    done.append(item_text)
-                else:
-                    not_done.append(item_text)
-
-        # Parse weekly priorities with "(done Weekday)" matching target date
-        if in_weekly:
-            checkbox = re.match(r'^- \[([ xX])\] (.+)$', stripped)
-            if checkbox:
-                is_done = checkbox.group(1).lower() == 'x'
-                item_text = checkbox.group(2).strip()
-
-                # Check for "(done Weekday)" annotation
-                done_match = re.search(r'\(done\s+(\w+)\)', item_text, re.IGNORECASE)
-                if done_match:
-                    weekday_str = done_match.group(1).lower()
-                    weekday_num = WEEKDAY_MAP.get(weekday_str)
-                    if weekday_num == target_weekday:
-                        # Strip the annotation for cleaner output
-                        clean = re.sub(r'\s*\(done\s+\w+\)', '', item_text).strip()
-                        prefix = f"[{current_weekly_section}] " if current_weekly_section else ""
-                        done.append(f"{prefix}{clean}")
-                elif is_done and not done_match:
-                    # Checked but no weekday annotation — skip (could be any day)
-                    pass
-                elif not is_done:
-                    prefix = f"[{current_weekly_section}] " if current_weekly_section else ""
-                    not_done.append(f"{prefix}{item_text}")
-
-    return {'done': done, 'not_done': not_done}
+def read_canonical_daily_note(target_day: date) -> dict:
+    """Read completion evidence from the canonical daily-note directory."""
+    notes_dir = daily_notes_dir()
+    note_path = notes_dir / f"{target_day.isoformat()}.md"
+    completed = extract_completed_tasks(
+        notes_dir=notes_dir,
+        start_date=target_day,
+        end_date=target_day,
+    )
+    return {
+        "done": [task["title"] for task in completed],
+        "not_done": [],
+        "path": note_path,
+        "exists": note_path.exists(),
+    }
 
 
 def get_tomorrows_top3(tasks_data: dict) -> list[str]:
@@ -157,23 +77,20 @@ def generate_eod(target_date: datetime = None) -> dict:
     date_display = target_date.strftime('%A, %B %d').replace(' 0', ' ')
     weekday = target_date.strftime('%A')
 
-    daily_note_path = DAILY_DIR / f"{date_str}.md"
-    source = '06-Daily'
+    parsed = read_canonical_daily_note(target_date.date())
+    source = 'TASK_TRACKER_DAILY_NOTES_DIR'
+    _, tasks_data = load_tasks()
 
-    if daily_note_path.exists():
-        content = daily_note_path.read_text()
-        parsed = parse_daily_note(content, target_date)
+    if parsed["exists"]:
         done = parsed['done']
         not_done = parsed['not_done']
     else:
         # Fallback: Work Tasks.md done section (with staleness caveat)
-        source = 'Work Tasks.md (fallback — no daily note found)'
-        _, tasks_data = load_tasks()
+        source = 'Work Tasks.md (fallback — no canonical daily note found)'
         done = [t['title'] for t in tasks_data.get('done', [])[:8]]
         not_done = []
 
     # Tomorrow's top 3 from Work Tasks.md
-    _, tasks_data = load_tasks()
     tomorrows_top3 = get_tomorrows_top3(tasks_data)
 
     return {

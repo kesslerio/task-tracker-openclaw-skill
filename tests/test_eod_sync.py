@@ -6,12 +6,13 @@ import sys
 import os
 import subprocess
 from pathlib import Path
-from datetime import date
+from datetime import date, datetime
 
 # Make scripts importable
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 import eod_sync as sync
+import eod_review
 
 
 # ---------------------------------------------------------------------------
@@ -221,8 +222,11 @@ class TestBuildSyncPlan:
         plan = sync.build_sync_plan(done_items, OPEN_TASKS_SAMPLE, "2026-02-19")
         synced = [r for r in plan if r["status"] == "evidence"]
         # The KPMG task should only match once
-        kpmg_matched_indices = {r["match"]["line_idx"] for r in synced if r["match"] is not None}
-        assert len(kpmg_matched_indices) <= len(synced), "Duplicate match detected"
+        kpmg_matches = [
+            r for r in synced
+            if r["match"] is not None and "KPMG audit package" in r["match"]["body"]
+        ]
+        assert len(kpmg_matches) == 1, "KPMG task matched more than once"
 
     def test_score_in_range(self):
         plan = sync.build_sync_plan(DONE_ITEMS_SAMPLE, OPEN_TASKS_SAMPLE, "2026-02-19")
@@ -319,6 +323,46 @@ def test_cli_default_is_report_only(tmp_path):
     assert proc.returncode == 0
     assert "Report-only mode" in proc.stdout
     assert weekly.read_text() == original
+
+
+def test_eod_review_reads_canonical_daily_notes_completion_format(tmp_path, monkeypatch):
+    daily_dir = tmp_path / "daily"
+    legacy_dir = tmp_path / "06-Daily"
+    daily_dir.mkdir()
+    legacy_dir.mkdir()
+    (daily_dir / "2026-02-19.md").write_text(
+        "# 2026-02-19\n\n"
+        "- 09:15 ✅ Canonical shipped item\n"
+    )
+    (legacy_dir / "2026-02-19.md").write_text(
+        "### Today\n"
+        "- [x] Legacy checkbox item\n"
+    )
+    monkeypatch.setenv("TASK_TRACKER_DAILY_NOTES_DIR", str(daily_dir))
+    monkeypatch.setenv("EOD_DAILY_DIR", str(legacy_dir))
+    monkeypatch.setattr(
+        eod_review,
+        "load_tasks",
+        lambda: (
+            "",
+            {
+                "q1": [{"title": "Tomorrow candidate", "done": False}],
+                "q2": [],
+                "done": [],
+            },
+        ),
+    )
+    monkeypatch.setattr(eod_review, "candidate_review_summary", lambda: {})
+    monkeypatch.setattr(eod_review, "task_audit_summary", lambda limit=3: {})
+
+    data = eod_review.generate_eod(datetime(2026, 2, 19))
+    rendered = eod_review.format_markdown(data)
+
+    assert data["source"] == "TASK_TRACKER_DAILY_NOTES_DIR"
+    assert data["done"] == ["Canonical shipped item"]
+    assert "Canonical shipped item" in rendered
+    assert "Legacy checkbox item" not in rendered
+    assert "Nothing recorded" not in rendered
 
 
 def test_cli_dry_run_wins_over_apply(tmp_path):

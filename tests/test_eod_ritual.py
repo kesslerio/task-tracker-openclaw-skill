@@ -833,9 +833,37 @@ def test_summary_upsert_is_idempotent_replaces_not_appends(env):
     assert third["changed"] is True
     text = note.read_text()
     assert text.count("## EOD Summary") == 1
-    assert "- X" in text
+    assert "- ✅ X" in text
     assert "_No #1 set_" in text  # empty tomorrow renders the explicit placeholder
     assert "_Board is clear_" in text  # empty still-open renders its placeholder
+
+
+def test_summary_done_today_uses_daily_notes_completed_format(env):
+    """Done items in ## EOD Summary are machine-readable completion evidence."""
+    import eod_summary
+    from daily_notes import _is_completed_action_line, extract_completed_tasks
+    from cos_config import local_today
+
+    rendered = eod_summary.render_summary(
+        done_today=["Ship the parser fix"],
+        still_open=[],
+        tomorrow_top=None,
+    )
+    done_line = next(line for line in rendered.splitlines() if "Ship the parser fix" in line)
+    assert done_line == "- ✅ Ship the parser fix"
+    assert _is_completed_action_line(done_line)
+
+    eod_summary.write_summary(
+        done_today=["Ship the parser fix"],
+        still_open=[],
+        tomorrow_top=None,
+    )
+    tasks = extract_completed_tasks(
+        notes_dir=env["daily"],
+        start_date=local_today(),
+        end_date=local_today(),
+    )
+    assert [task["title"] for task in tasks] == ["Ship the parser fix"]
 
 
 def test_summary_upsert_preserves_surrounding_sections(env):
@@ -852,7 +880,7 @@ def test_summary_upsert_preserves_surrounding_sections(env):
     text = note.read_text()
     assert "## Notes" in text and "- keep me" in text  # neighbour section preserved
     assert text.count("## EOD Summary") == 1
-    assert "- new" in text and "old" not in text  # the summary body was replaced
+    assert "- ✅ new" in text and "old" not in text  # the summary body was replaced
 
 
 # --- U7 cron descriptor: CODE-ONLY shape (no live registration) ------------------

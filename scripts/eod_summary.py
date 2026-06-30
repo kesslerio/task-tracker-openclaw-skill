@@ -61,10 +61,12 @@ _SUMMARY_SECTION_RE = re.compile(
 )
 
 
-def _bullet_lines(items: list[str], *, empty: str) -> list[str]:
+def _bullet_lines(items: list[str], *, empty: str, completed: bool = False) -> list[str]:
     """Render a bullet list, or a single italic ``empty`` placeholder when there are none."""
     if not items:
         return [f"_{empty}_"]
+    if completed:
+        return [f"- ✅ {item}" for item in items]
     return [f"- {item}" for item in items]
 
 
@@ -83,7 +85,7 @@ def render_summary(
     """
     lines: list[str] = [SUMMARY_HEADER, ""]
     lines.append("**Done today**")
-    lines.extend(_bullet_lines(done_today, empty="Nothing recorded done today"))
+    lines.extend(_bullet_lines(done_today, empty="Nothing recorded done today", completed=True))
     lines.append("")
     lines.append("**Still open**")
     lines.extend(_bullet_lines(still_open, empty="Board is clear"))
@@ -132,5 +134,7 @@ def write_summary(
     after = upsert_section(before, section)
     changed = after != before
     if changed:
-        path.write_text(after, encoding="utf-8")
+        tmp_path = path.with_name(f".{path.name}.tmp")
+        tmp_path.write_text(after, encoding="utf-8")
+        tmp_path.replace(path)
     return {"ok": True, "path": str(path), "changed": changed}
