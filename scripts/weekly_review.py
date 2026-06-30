@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Weekly Review Generator - Summarizes last week and plans this week.
+Weekly Review Generator - Summarizes the most recent completed ISO week.
 """
 
 import argparse
@@ -104,18 +104,28 @@ def _count_completed_in_range(
     tasks: list[dict], start: date, end: date
 ) -> int:
     """Count tasks whose completed_date falls within [start, end]."""
-    count = 0
+    return len(_completed_in_range(tasks, start, end))
+
+
+def _completed_in_range(tasks: list[dict], start: date, end: date) -> list[dict]:
+    """Return tasks whose completed_date falls within [start, end]."""
+    completed_tasks = []
     for task in tasks:
-        cd = task.get('completed_date')
-        if not cd:
-            continue
-        try:
-            completed = datetime.strptime(cd, '%Y-%m-%d').date()
-        except ValueError:
-            continue
-        if start <= completed <= end:
-            count += 1
-    return count
+        if _completion_date_in_range(task, start, end):
+            completed_tasks.append(task)
+    return completed_tasks
+
+
+def _completion_date_in_range(task: dict, start: date, end: date) -> bool:
+    """Return True when task.completed_date is a valid date inside [start, end]."""
+    cd = task.get('completed_date')
+    if not cd:
+        return False
+    try:
+        completed = datetime.strptime(cd, '%Y-%m-%d').date()
+    except ValueError:
+        return False
+    return start <= completed <= end
 
 
 def generate_velocity_section(
@@ -124,18 +134,20 @@ def generate_velocity_section(
     week_end: date,
     archive_dir: Path,
     notes_dir: Path | None = None,
+    completed_tasks: list[dict] | None = None,
 ) -> list[str]:
     """Generate the 📊 Velocity section lines.
 
-    When notes_dir is available, counts completions from daily notes
-    (authoritative). Falls back to archive + board data otherwise.
+    The current week count comes from the same windowed completion set used by
+    the Completed This Week section. Trend data still uses daily notes when
+    available and archive data otherwise.
     """
     lines: list[str] = []
+    completed_this_week = len(completed_tasks) if completed_tasks is not None else None
 
     if notes_dir:
-        # Count from daily notes (authoritative)
-        notes_tasks = extract_completed_tasks(notes_dir, week_start, week_end)
-        completed_this_week = len(notes_tasks)
+        if completed_this_week is None:
+            completed_this_week = len(extract_completed_tasks(notes_dir, week_start, week_end))
 
         # Build 4-week rolling trend from daily notes
         trend_counts: list[int] = []
@@ -148,14 +160,15 @@ def generate_velocity_section(
         # Fallback: archive data for trend
         archive_weeks = _parse_archive_weeks(archive_dir)
 
-        all_tasks = tasks_data.get('all', [])
-        live_completed = _count_completed_in_range(all_tasks, week_start, week_end)
+        if completed_this_week is None:
+            all_tasks = tasks_data.get('all', [])
+            live_completed = _count_completed_in_range(all_tasks, week_start, week_end)
 
-        iso_year_cur, iso_week_cur, _ = week_start.isocalendar()
-        current_label = f"{iso_year_cur}-W{iso_week_cur:02d}"
-        current_archive_count = len(archive_weeks.get(current_label, []))
+            iso_year_cur, iso_week_cur, _ = week_start.isocalendar()
+            current_label = f"{iso_year_cur}-W{iso_week_cur:02d}"
+            current_archive_count = len(archive_weeks.get(current_label, []))
 
-        completed_this_week = live_completed + current_archive_count
+            completed_this_week = live_completed + current_archive_count
 
         trend_counts = []
         for i in range(3, 0, -1):
@@ -169,8 +182,6 @@ def generate_velocity_section(
     lines.append("")
     lines.append("📊 **Velocity**")
     lines.append(f"  Completed: {completed_this_week} task{'s' if completed_this_week != 1 else ''}")
-    lines.append("  Added: — (tracking not available)")
-    lines.append("  Net: — (need task snapshots)")
 
     # 4-week trend (3 previous weeks + current)
     full_trend = trend_counts + [current_week_count]
@@ -263,11 +274,17 @@ def group_by_area(tasks: list[dict]) -> dict[str, list[dict]]:
     return areas
 
 
-def parse_iso_week(week: str | None) -> tuple[date, date]:
+def parse_iso_week(
+    week: str | None,
+    *,
+    this_week: bool = False,
+    today: date | None = None,
+) -> tuple[date, date]:
     """Parse ISO week string (YYYY-WNN) into start/end dates."""
-    today = datetime.now().date()
+    today = today or datetime.now().date()
     if not week:
-        week_start = today - timedelta(days=today.weekday())
+        anchor = today if this_week else today - timedelta(days=7)
+        week_start = anchor - timedelta(days=anchor.weekday())
         return week_start, week_start + timedelta(days=6)
 
     match = re.fullmatch(r'(\d{4})-W(\d{2})', week)
@@ -416,15 +433,105 @@ def extract_lessons(notes_dir: Path, start_date: date, end_date: date) -> list[s
     return lessons
 
 
-def generate_weekly_review(week: str | None = None, archive: bool = False) -> str:
+def _merge_windowed_completed_tasks(
+    notes_tasks: list[dict],
+    board_done: list[dict],
+    week_start: date,
+    week_end: date,
+) -> list[dict]:
+    """Merge daily-note completions with board completions dated in the window."""
+    done_tasks = list(notes_tasks)
+    seen = {t['title'].casefold() for t in done_tasks}
+    for board_task in _completed_in_range(board_done, week_start, week_end):
+        title_key = board_task['title'].casefold()
+        if title_key in seen:
+            continue
+        seen.add(title_key)
+        done_tasks.append(board_task)
+    return done_tasks
+
+
+def _count_rolling_7_day_completions(
+    tasks_data: dict,
+    notes_dir: Path | None,
+    today: date,
+) -> int:
+    """Mirror tasks.py --completed-since 7d count for coverage comparison."""
+    cutoff_date = today - timedelta(days=7)
+    recent_done = _completed_in_range(tasks_data.get('done', []), cutoff_date, today)
+
+    if notes_dir:
+        notes_tasks = extract_completed_tasks(notes_dir, cutoff_date, today)
+        board_titles = {task['title'].casefold() for task in recent_done}
+        for notes_task in notes_tasks:
+            if notes_task['title'].casefold() not in board_titles:
+                recent_done.append(notes_task)
+
+    return len(recent_done)
+
+
+def _coverage_warning_lines(
+    tasks_data: dict,
+    notes_dir: Path | None,
+    week_start: date,
+    week_end: date,
+    today: date,
+    window_completed_count: int,
+) -> list[str]:
+    """Build coverage-divergence warnings without changing completion counts."""
+    warnings: list[str] = []
+
+    if notes_dir and window_completed_count == 0:
+        prior_start = week_start - timedelta(days=7)
+        prior_end = week_start - timedelta(days=1)
+        prior_count = len(extract_completed_tasks(notes_dir, prior_start, prior_end))
+        if prior_count > 0:
+            warnings.append(
+                f"Window completions: {window_completed_count}; "
+                f"prior-week daily-note completions: {prior_count}."
+            )
+
+    rolling_count = _count_rolling_7_day_completions(tasks_data, notes_dir, today)
+    if rolling_count >= window_completed_count + 2:
+        warnings.append(
+            f"Window completions: {window_completed_count}; "
+            f"rolling-7-day completions: {rolling_count}."
+        )
+
+    undated_board_count = sum(
+        1 for task in tasks_data.get('done', [])
+        if not task.get('completed_date')
+    )
+    if undated_board_count:
+        warnings.append(
+            f"Board done items without completion dates: {undated_board_count}; "
+            "not attributed to this window."
+        )
+
+    if not warnings:
+        return []
+
+    lines = ["", "⚠️ **Coverage Warning**"]
+    lines.extend(f"  • {warning}" for warning in warnings)
+    lines.append("")
+    return lines
+
+
+def generate_weekly_review(
+    week: str | None = None,
+    archive: bool = False,
+    *,
+    this_week: bool = False,
+    today: date | None = None,
+) -> str:
     """Generate weekly review summary."""
     _, tasks_data = load_tasks()
 
-    week_start, week_end = parse_iso_week(week)
+    today = today or datetime.now().date()
+    week_start, week_end = parse_iso_week(week, this_week=this_week, today=today)
     notes_dir_raw = os.getenv("TASK_TRACKER_DAILY_NOTES_DIR", None)
     notes_dir = Path(notes_dir_raw) if notes_dir_raw else None
-    today = datetime.now().date()
-    reference_date = week_start if week else today
+    reference_date = today if this_week else week_start
     iso_year, iso_week, _ = week_start.isocalendar()
     week_label = f"{iso_year}-W{iso_week:02d}"
 
@@ -438,21 +545,14 @@ def generate_weekly_review(week: str | None = None, archive: bool = False) -> st
             start_date=week_start,
             end_date=week_end,
         )
-        # Merge stale board [x] items
-        board_done = tasks_data.get('done', [])
-        seen = {t['title'].casefold() for t in done_tasks}
-        for bt in board_done:
-            if bt['title'].casefold() not in seen:
-                seen.add(bt['title'].casefold())
-                done_tasks.append(bt)
+        done_tasks = _merge_windowed_completed_tasks(
+            done_tasks,
+            tasks_data.get('done', []),
+            week_start,
+            week_end,
+        )
     else:
-        done_tasks = tasks_data.get('done', [])
-        if week:
-            lines.append(
-                "_Note: `--week` changes the reporting window, but completions cannot be time-filtered "
-                "without TASK_TRACKER_DAILY_NOTES_DIR._"
-            )
-            lines.append("")
+        done_tasks = _completed_in_range(tasks_data.get('done', []), week_start, week_end)
 
     format_area_grouped(
         lines,
@@ -461,6 +561,15 @@ def generate_weekly_review(week: str | None = None, archive: bool = False) -> st
         lambda t: t['title'],
         "No completed tasks",
     )
+
+    lines.extend(_coverage_warning_lines(
+        tasks_data,
+        notes_dir,
+        week_start,
+        week_end,
+        today,
+        len(done_tasks),
+    ))
 
     # Carried Over (Misses): overdue tasks bucketed from utils and then grouped by area
     missed_buckets = get_missed_tasks_bucketed(tasks_data, reference_date=reference_date.isoformat())
@@ -541,7 +650,12 @@ def generate_weekly_review(week: str | None = None, archive: bool = False) -> st
 
     # Velocity / Burndown metrics (compute BEFORE archiving to avoid double-count)
     velocity_lines = generate_velocity_section(
-        tasks_data, week_start, week_end, ARCHIVE_DIR, notes_dir=notes_dir,
+        tasks_data,
+        week_start,
+        week_end,
+        ARCHIVE_DIR,
+        notes_dir=notes_dir,
+        completed_tasks=done_tasks,
     )
     lines.extend(velocity_lines)
 
@@ -576,15 +690,25 @@ def generate_weekly_review(week: str | None = None, archive: bool = False) -> st
 
 def main():
     parser = argparse.ArgumentParser(description='Generate weekly review summary')
-    parser.add_argument(
+    window_group = parser.add_mutually_exclusive_group()
+    window_group.add_argument(
         '--week',
         help='ISO week to review (YYYY-WNN).',
+    )
+    window_group.add_argument(
+        '--this-week',
+        action='store_true',
+        help='Review the current ISO week instead of the most recent completed week.',
     )
     parser.add_argument('--archive', action='store_true', help='Archive completed tasks')
 
     args = parser.parse_args()
     try:
-        print(generate_weekly_review(week=args.week, archive=args.archive))
+        print(generate_weekly_review(
+            week=args.week,
+            archive=args.archive,
+            this_week=args.this_week,
+        ))
     except ValueError as exc:
         parser.error(str(exc))
 
