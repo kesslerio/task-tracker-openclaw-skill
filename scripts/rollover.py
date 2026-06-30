@@ -32,7 +32,7 @@ from utils import (
 )
 
 
-CLOSED_STATES = frozenset({"done", "closed", "complete", "completed"})
+CLOSED_STATES = frozenset({"done", "closed", "complete", "completed", "cancelled"})
 OPEN_STATES = frozenset({"active", "open"})
 
 

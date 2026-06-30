@@ -265,6 +265,83 @@ def complete_by_id(
     }
 
 
+def cancel_by_id(
+    task_id: str,
+    personal: bool = False,
+    source: str = "user_command",
+) -> dict:
+    tasks_file, content, record, error = _resolve_by_id(task_id, personal)
+    if error:
+        return error
+    ledger_error = _preflight_ledger(tasks_file)
+    if ledger_error:
+        return ledger_error
+    if record.line_number is None:
+        return {
+            "ok": False,
+            "error": {
+                "code": "task-line-resolution-failed",
+                "message": "Resolved task has no stable line number; active board was not changed.",
+            },
+        }
+
+    new_content = remove_task_line(content, record.raw_line, record.line_number)
+    if new_content is None:
+        return {
+            "ok": False,
+            "error": {
+                "code": "task-line-resolution-failed",
+                "message": "Resolved task line no longer matches the active board; active board was not changed.",
+            },
+        }
+
+    event = new_event(
+        "state_transition",
+        task_id=task_id,
+        source=source,
+        previous_state="active",
+        next_state="cancelled",
+        reason="cancelled-by-id",
+        metadata={
+            "title": record.title,
+            "line_number": record.line_number,
+            "raw_line": record.raw_line,
+            "section": record.section,
+            "area": record.area,
+        },
+    )
+    snapshots = {tasks_file: (True, content)}
+    ledger_file = ledger_path(tasks_file)
+    ledger_snapshot = _snapshot_regular(ledger_file)
+    if ledger_snapshot is not None:
+        snapshots[ledger_file] = ledger_snapshot
+
+    write_stage = "board-write"
+    try:
+        _atomic_write(tasks_file, new_content)
+        write_stage = "ledger-append"
+        append_event(event, path=ledger_file)
+    except OSError as exc:
+        restore_error = _restore_after_failure(snapshots)
+        code = "ledger-append-failed" if write_stage == "ledger-append" else "task-state-write-failed"
+        error = {
+            "code": code,
+            "message": f"Task cancellation write failed; snapshots were restored: {exc}",
+        }
+        if restore_error:
+            error["restore_error"] = restore_error
+        return {
+            "ok": False,
+            "error": error,
+        }
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "title": record.title,
+        "event": event,
+    }
+
+
 def reschedule_by_id(
     task_id: str,
     new_due: str,
