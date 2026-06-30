@@ -1,3 +1,4 @@
+import importlib
 import json
 import os
 import subprocess
@@ -42,6 +43,47 @@ def _titles(tasks: dict, bucket: str) -> set[str]:
 def _active_title_keys(content: str) -> list[str]:
     parsed = utils.parse_tasks(content)
     return [task["title"].casefold() for task in parsed["all"] if not task["done"]]
+
+
+def _cli_env(tmp_path: Path, *, work: Path, ledger: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "scripts"),
+            "TASK_TRACKER_WORK_FILE": str(work),
+            "TASK_TRACKER_LEGACY_FILE": str(tmp_path / "legacy-missing.md"),
+            "TASK_TRACKER_LEDGER_FILE": str(ledger),
+            "TASK_TRACKER_ERROR_LOG": str(tmp_path / "errors.jsonl"),
+            "TASK_MGMT_STATE_DIR": str(tmp_path / "state"),
+        }
+    )
+    return env
+
+
+def test_reconcile_module_imports_and_basic_reconcile_runs():
+    module = importlib.import_module("reconcile_board")
+
+    result = module.reconcile_board(
+        """# Weekly TODOs — 2026-W25
+
+## 🔴 Q1
+- [ ] **Open task** task_id::tsk_open area:: Ops
+""",
+        [],
+        target_date="2026-06-29",
+    )
+
+    assert result.content.startswith("# Weekly TODOs — 2026-W27")
+    assert "task_id::tsk_open" in result.content
+    assert result.report["merged_duplicates"] == []
+
+
+def test_open_count_pattern_ignores_done_lines():
+    module = importlib.import_module("reconcile_board")
+
+    assert module.TASK_LINE_RE.match("- [ ] open")
+    assert not module.TASK_LINE_RE.match("- [x] done")
+    assert not module.TASK_LINE_RE.match("- [X] done")
 
 
 def test_reconcile_collapses_dual_board_strikes_closed_and_reports_actions(tmp_path, monkeypatch):
@@ -118,14 +160,7 @@ def test_reconcile_dry_run_cli_writes_nothing(tmp_path):
 """
     work.write_text(original, encoding="utf-8")
     ledger.write_text(json.dumps(_done_event("tsk_closed", "Closed task")) + "\n", encoding="utf-8")
-    env = os.environ.copy()
-    env.update(
-        {
-            "TASK_TRACKER_WORK_FILE": str(work),
-            "TASK_TRACKER_LEDGER_FILE": str(ledger),
-            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "scripts"),
-        }
-    )
+    env = _cli_env(tmp_path, work=work, ledger=ledger)
 
     proc = subprocess.run(
         ["python3", "scripts/reconcile_board.py", "--date", "2026-06-29"],
@@ -156,14 +191,7 @@ def test_reconcile_apply_cli_writes_cleaned_board(tmp_path):
         encoding="utf-8",
     )
     ledger.write_text(json.dumps(_done_event("tsk_closed", "Closed task")) + "\n", encoding="utf-8")
-    env = os.environ.copy()
-    env.update(
-        {
-            "TASK_TRACKER_WORK_FILE": str(work),
-            "TASK_TRACKER_LEDGER_FILE": str(ledger),
-            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "scripts"),
-        }
-    )
+    env = _cli_env(tmp_path, work=work, ledger=ledger)
 
     proc = subprocess.run(
         ["python3", "scripts/reconcile_board.py", "--apply", "--date", "2026-06-29"],
@@ -198,3 +226,103 @@ def test_reconcile_keeps_non_duplicate_similar_titles():
     assert "Review vendor contract" in result.content
     assert "Review vendor contract draft" in result.content
     assert result.report["merged_duplicates"] == []
+
+
+def test_reconcile_keeps_same_title_distinct_task_ids_and_merges_bare_duplicate():
+    board = """# Weekly TODOs — 2026-W25
+
+## 🔴 Q1
+- [ ] **Follow up with vendor** task_id::tsk_vendor_a area:: Ops 🔺
+
+## 🟡 Q2
+- [ ] **Follow up with vendor** task_id::tsk_vendor_b area:: Ops
+
+## 📋 All Tasks
+- [ ] **Follow up with vendor**
+"""
+
+    result = reconcile_board(board, [], target_date="2026-06-29")
+
+    assert result.content.count("Follow up with vendor") == 2
+    assert "task_id::tsk_vendor_a" in result.content
+    assert "task_id::tsk_vendor_b" in result.content
+    dropped_task_ids = [
+        merge["dropped"]["task_id"]
+        for merge in result.report["merged_duplicates"]
+    ]
+    assert "tsk_vendor_a" not in dropped_task_ids
+    assert "tsk_vendor_b" not in dropped_task_ids
+    assert dropped_task_ids == [None]
+
+
+def test_reconcile_all_tasks_only_inline_priority_lands_in_q1(tmp_path, monkeypatch):
+    board = """# Weekly TODOs — 2026-W25
+
+## 📋 All Tasks
+- [ ] **Escalated only in dump** task_id::tsk_dump_priority area:: Ops 🔺
+"""
+
+    result = reconcile_board(board, [], target_date="2026-06-29")
+
+    q1_start = result.content.index("## 🔴 Q1: Urgent & Important")
+    q2_start = result.content.index("## 🟡 Q2: Important, Not Urgent")
+    backlog_start = result.content.index("## ⚪ Backlog")
+    task_index = result.content.index("Escalated only in dump")
+    assert q1_start < task_index < q2_start
+    assert task_index < backlog_start
+
+    rolled = tmp_path / "Work Tasks.md"
+    rolled.write_text(result.content, encoding="utf-8")
+    monkeypatch.setattr(utils, "get_tasks_file", lambda personal=False, force_legacy=False: (rolled, "obsidian"))
+    _content, tasks = utils.load_tasks()
+    assert "Escalated only in dump" in _titles(tasks, "q1")
+    assert "Escalated only in dump" not in _titles(tasks, "backlog")
+
+
+def test_reconcile_missing_board_cli_uses_error_envelope(tmp_path):
+    missing = tmp_path / "missing.md"
+    ledger = tmp_path / "missing.md.events.jsonl"
+    env = _cli_env(tmp_path, work=missing, ledger=ledger)
+
+    proc = subprocess.run(
+        ["python3", "scripts/reconcile_board.py", "--date", "2026-06-29"],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 0
+    assert "reconcile board is unavailable right now. Logged for review." in proc.stdout
+    assert "Traceback" not in combined
+    assert "FileNotFoundError" not in combined
+    logged = [
+        json.loads(line)
+        for line in (tmp_path / "errors.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert logged[-1]["component"] == "reconcile_board"
+    assert logged[-1]["error_class"] == "environment"
+
+
+def test_reconcile_is_idempotent_after_first_cleanup():
+    board = """# Weekly TODOs — 2026-W25
+
+## 🔴 Q1
+- [ ] **Open task** task_id::tsk_open area:: Ops 🔺
+- [ ] **Closed task** task_id::tsk_closed area:: Ops
+
+## 📋 All Tasks
+- [ ] **Open task**
+- [ ] **Missing identity** area:: Ops
+"""
+    events = [_done_event("tsk_closed", "Closed task")]
+
+    first = reconcile_board(board, events, target_date="2026-06-29")
+    second = reconcile_board(first.content, events, target_date="2026-06-29")
+
+    assert second.content == first.content
+    assert second.report["merged_duplicates"] == []
+    assert second.report["struck_closed"] == []
