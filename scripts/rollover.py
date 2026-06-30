@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import cos_config
+import error_envelope
 from task_ledger import ledger_path, read_events
 from task_records import TaskRecord, task_records
 from task_transitions import _extract_due_date, _set_due_date
@@ -50,6 +51,7 @@ class RolloverResult:
     missing_task_ids: tuple[dict[str, Any], ...]
     duplicate_count: int
     advanced_recurring: tuple[dict[str, Any], ...]
+    skipped_recur_errors: tuple[dict[str, Any], ...] = ()
 
     def payload(self, *, tasks_file: Path | None = None) -> dict[str, Any]:
         payload = {
@@ -60,6 +62,7 @@ class RolloverResult:
             "missing_task_ids": list(self.missing_task_ids),
             "duplicate_count": self.duplicate_count,
             "advanced_recurring": list(self.advanced_recurring),
+            "skipped_recur_errors": list(self.skipped_recur_errors),
         }
         if tasks_file is not None:
             payload["tasks_file"] = str(tasks_file)
@@ -67,7 +70,7 @@ class RolloverResult:
 
 
 @dataclass(frozen=True)
-class _Candidate:
+class Candidate:
     record: TaskRecord
     raw_line: str
     task_id: str | None
@@ -75,6 +78,7 @@ class _Candidate:
     missing_task_id: bool
     advanced_recurring: bool = False
     next_due: str | None = None
+    skipped_recur_error: dict[str, Any] | None = None
 
 
 def week_id_for(target_date: date | datetime | str | None = None) -> str:
@@ -92,7 +96,7 @@ def week_id_for(target_date: date | datetime | str | None = None) -> str:
     return f"{iso_year}-W{iso_week:02d}"
 
 
-def _normalise_title(title: str) -> str:
+def normalise_title(title: str) -> str:
     return re.sub(r"\s+", " ", title).strip().casefold()
 
 
@@ -104,7 +108,7 @@ def ledger_closed_index(events: Iterable[dict[str, Any]]) -> LedgerClosedIndex:
     for event in events:
         event_type = str(event.get("event_type") or "")
         task_id = _event_task_id(event)
-        title_key = _normalise_title(str((event.get("metadata") or {}).get("title") or ""))
+        title_key = normalise_title(str((event.get("metadata") or {}).get("title") or ""))
         if event_type == "state_transition_reverted":
             if task_id:
                 state_by_id[task_id] = "open"
@@ -157,18 +161,22 @@ def rollover_board(
     closed = ledger_closed_index(events)
     records = task_records(content, personal=personal, fmt=fmt)
 
-    candidates: list[_Candidate] = []
+    candidates: list[Candidate] = []
     excluded_closed: list[str] = []
     advanced_recurring: list[dict[str, Any]] = []
+    skipped_recur_errors: list[dict[str, Any]] = []
+    parking_lot_lines = _parking_lot_section_lines(content)
 
     for record in records:
         candidate = _candidate_for_record(record, ref_date)
         if candidate is None:
             continue
-        if _is_closed_by_ledger(candidate, closed):
+        if is_closed_by_ledger(candidate, closed):
             excluded_closed.append(candidate.task_id or f"title:{record.title}")
             continue
         candidates.append(candidate)
+        if candidate.skipped_recur_error:
+            skipped_recur_errors.append(candidate.skipped_recur_error)
         if candidate.advanced_recurring:
             advanced_recurring.append(
                 {
@@ -179,7 +187,12 @@ def rollover_board(
                 }
             )
 
-    rendered, missing_task_ids, duplicate_count = _render_candidates(candidates, week_id, personal=personal)
+    rendered, missing_task_ids, duplicate_count = render_candidates(
+        candidates,
+        week_id,
+        personal=personal,
+        parking_lot_lines=parking_lot_lines,
+    )
     return RolloverResult(
         content=rendered,
         week_id=week_id,
@@ -188,6 +201,7 @@ def rollover_board(
         missing_task_ids=tuple(missing_task_ids),
         duplicate_count=duplicate_count,
         advanced_recurring=tuple(advanced_recurring),
+        skipped_recur_errors=tuple(skipped_recur_errors),
     )
 
 
@@ -203,14 +217,32 @@ def _target_date_value(target_date: date | datetime | str | None) -> date:
     raise ValueError("target_date must be a date/datetime object or YYYY-MM-DD string")
 
 
-def _candidate_for_record(record: TaskRecord, ref_date: date) -> _Candidate | None:
+def _candidate_for_record(record: TaskRecord, ref_date: date) -> Candidate | None:
+    if record.section == "parking_lot" or record.is_objective:
+        return None
+
     task_id = record.canonical_id
-    title_key = _normalise_title(record.title)
+    title_key = normalise_title(record.title)
     if record.done:
         if not record.recur:
             return None
-        next_line, next_due = _advance_recurring_line(record, ref_date)
-        return _Candidate(
+        try:
+            next_line, next_due = _advance_recurring_line(record, ref_date)
+        except ValueError as exc:
+            return Candidate(
+                record=record,
+                raw_line=_open_checked_line(record.raw_line),
+                task_id=task_id,
+                title_key=title_key,
+                missing_task_id=record.task_id is None,
+                skipped_recur_error={
+                    "task_id": task_id,
+                    "title": record.title,
+                    "recur": record.recur,
+                    "error": str(exc),
+                },
+            )
+        return Candidate(
             record=record,
             raw_line=next_line,
             task_id=task_id,
@@ -219,7 +251,7 @@ def _candidate_for_record(record: TaskRecord, ref_date: date) -> _Candidate | No
             advanced_recurring=True,
             next_due=next_due,
         )
-    return _Candidate(
+    return Candidate(
         record=record,
         raw_line=record.raw_line,
         task_id=task_id,
@@ -228,15 +260,19 @@ def _candidate_for_record(record: TaskRecord, ref_date: date) -> _Candidate | No
     )
 
 
+def _open_checked_line(raw_line: str) -> str:
+    return re.sub(r"^(\s*)- \[[xX]\] ", r"\1- [ ] ", raw_line, count=1)
+
+
 def _advance_recurring_line(record: TaskRecord, ref_date: date) -> tuple[str, str]:
     due_value = _extract_due_date(record.raw_line)
     from_date = due_value or ref_date.isoformat()
     next_due = next_recurrence_date(record.recur or "", from_date)
-    open_line = re.sub(r"^(\s*)- \[[xX]\] ", r"\1- [ ] ", record.raw_line, count=1)
+    open_line = _open_checked_line(record.raw_line)
     return _set_due_date(open_line, next_due), next_due
 
 
-def _is_closed_by_ledger(candidate: _Candidate, closed: LedgerClosedIndex) -> bool:
+def is_closed_by_ledger(candidate: Candidate, closed: LedgerClosedIndex) -> bool:
     if candidate.advanced_recurring or candidate.record.recur:
         return False
     if candidate.task_id and candidate.task_id in closed.task_ids:
@@ -250,35 +286,43 @@ SECTION_ORDER = ("q1", "q2", "q3", "team", "backlog")
 PERSONAL_SECTION_ORDER = ("q1", "q2", "q3", "backlog")
 
 
-def _render_candidates(
-    candidates: list[_Candidate],
+def render_candidates(
+    candidates: list[Candidate],
     week_id: str,
     *,
     personal: bool = False,
+    parking_lot_lines: list[str] | None = None,
 ) -> tuple[str, list[dict[str, Any]], int]:
-    id_titles = {candidate.title_key for candidate in candidates if candidate.task_id}
+    id_titles: set[str] = set()
+    seen_ids_for_titles: set[str] = set()
+    for candidate in candidates:
+        if candidate.task_id and candidate.task_id not in seen_ids_for_titles:
+            seen_ids_for_titles.add(candidate.task_id)
+            if candidate.title_key:
+                id_titles.add(candidate.title_key)
+
     seen_ids: set[str] = set()
-    seen_titles: set[str] = set()
-    kept: list[_Candidate] = []
+    seen_bare_titles: set[str] = set()
+    kept: list[Candidate] = []
     duplicate_count = 0
 
     for candidate in candidates:
         if candidate.task_id:
-            if candidate.task_id in seen_ids or candidate.title_key in seen_titles:
+            if candidate.task_id in seen_ids:
                 duplicate_count += 1
                 continue
             seen_ids.add(candidate.task_id)
-            seen_titles.add(candidate.title_key)
             kept.append(candidate)
             continue
 
-        if candidate.title_key in id_titles or candidate.title_key in seen_titles:
+        if candidate.title_key in id_titles or candidate.title_key in seen_bare_titles:
             duplicate_count += 1
             continue
-        seen_titles.add(candidate.title_key)
+        if candidate.title_key:
+            seen_bare_titles.add(candidate.title_key)
         kept.append(candidate)
 
-    grouped: dict[str, list[_Candidate]] = {
+    grouped: dict[str, list[Candidate]] = {
         bucket: [] for bucket in (PERSONAL_SECTION_ORDER if personal else SECTION_ORDER)
     }
     for candidate in kept:
@@ -300,10 +344,12 @@ def _render_candidates(
                     }
                 )
                 lines.append(f"<!-- repair: missing task_id:: for \"{candidate.record.title}\" -->")
+    if parking_lot_lines is not None:
+        lines.extend(["", *parking_lot_lines])
     return "\n".join(lines).rstrip() + "\n", missing, duplicate_count
 
 
-def _bucket_for_candidate(candidate: _Candidate) -> str:
+def _bucket_for_candidate(candidate: Candidate) -> str:
     section = candidate.record.section
     if section in SECTION_ORDER:
         return section
@@ -312,6 +358,16 @@ def _bucket_for_candidate(candidate: _Candidate) -> str:
         if mapped_section in SECTION_ORDER:
             return mapped_section
     return "backlog"
+
+
+def _parking_lot_section_lines(content: str) -> list[str] | None:
+    from parking_lot import _find_parking_lot_bounds
+
+    lines = content.splitlines()
+    start, end = _find_parking_lot_bounds(lines)
+    if start == -1:
+        return None
+    return lines[start:end] or [f"## {get_section_display_name('parking_lot')}"]
 
 
 def run_rollover(
@@ -352,4 +408,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(error_envelope.run_main("rollover", main))

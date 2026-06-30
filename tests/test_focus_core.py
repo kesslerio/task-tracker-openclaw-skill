@@ -191,6 +191,21 @@ def test_capacity_dedupes_same_task_id_and_same_bare_title():
     assert summary.estimated_minutes == 60
 
 
+def test_capacity_counts_same_title_tasks_with_distinct_task_ids():
+    content = """# Work
+
+## 🔴 Q1
+- [ ] **Standup** estimate:: 3h task_id::tsk_standup_a
+- [ ] **Standup** estimate:: 3h task_id::tsk_standup_b
+
+## 🅿️ Parking Lot
+"""
+    summary = summarize_capacity(_records(content))
+
+    assert summary.active_count == 2
+    assert summary.estimated_minutes == 360
+
+
 def test_add_gate_uses_distinct_capacity_before_parking():
     import os
 

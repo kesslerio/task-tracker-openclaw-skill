@@ -101,8 +101,9 @@ def _distinct_active_records(records: list[TaskRecord]) -> list[TaskRecord]:
     """Collapse duplicate active records before they hit count/hour caps.
 
     Identity wins first: repeated physical lines with the same canonical id are
-    one task. The remaining rows are then collapsed by normalized title so bare
-    duplicate/phantom lines without ``task_id::`` do not consume extra capacity.
+    one task. Title is only a fallback for bare rows: a row without a canonical
+    id is skipped when it duplicates an id-bearing task title or a previous bare
+    title. Distinct canonical ids are always distinct tasks even when titles match.
     """
     by_id: list[TaskRecord] = []
     seen_ids: set[str] = set()
@@ -114,13 +115,18 @@ def _distinct_active_records(records: list[TaskRecord]) -> list[TaskRecord]:
         by_id.append(record)
 
     distinct: list[TaskRecord] = []
-    seen_titles: set[str] = set()
+    id_titles = {_normalised_title(record) for record in by_id if record.canonical_id}
+    seen_bare_titles: set[str] = set()
     for record in by_id:
+        if record.canonical_id:
+            distinct.append(record)
+            continue
+
         title_key = _normalised_title(record)
-        if title_key and title_key in seen_titles:
+        if title_key and (title_key in id_titles or title_key in seen_bare_titles):
             continue
         if title_key:
-            seen_titles.add(title_key)
+            seen_bare_titles.add(title_key)
         distinct.append(record)
     return distinct
 
