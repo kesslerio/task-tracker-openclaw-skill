@@ -15,6 +15,30 @@ weekly notes are logs/evidence, not canonical task state. The JSONL sidecar
 ledger is audit/candidate history for identity repairs, ID-based completions,
 and completion evidence decisions.
 
+## Board mutation rule (CRITICAL — never hand-edit the board)
+
+The work board (`Weekly TODOs.md` / `TASK_TRACKER_WORK_FILE`) is mutated **only**
+through the task-tracker scripts. Never hand-create, overwrite, or hand-edit it
+with a file `write`/`edit`/`apply_patch` tool or shell `sed` — doing so strips
+`task_id::` metadata, creates duplicate task representations (a metadata-bearing
+section plus a bare "All Tasks" copy), and resurrects ledger-closed tasks as open,
+corrupting every standup, nag, and weekly review downstream.
+
+- **Add / complete / reschedule:** `python3 scripts/tasks.py add|done|reschedule`
+  (assigns and preserves the canonical `task_id::`).
+- **Weekly rollover (creating the new week's board):** `python3 scripts/rollover.py`
+  — the deterministic, ledger-aware rollover. It carries forward open tasks with
+  their `task_id::` intact, never re-lists a ledger-closed task as open, and emits
+  one canonical priority-sectioned board (no duplicate "All Tasks" section). **Do
+  NOT** "compile the open tasks from last week" into a new board by hand — that is
+  exactly what corrupts it.
+- **One-time cleanup of an already-corrupted board** (dual representation, missing
+  IDs, resurrected-done): `python3 scripts/reconcile_board.py` (dry-run by default;
+  `--apply --repair` to write).
+
+If a board operation isn't covered by these scripts, surface it as a gap — do not
+improvise with a raw file write.
+
 ## When to Use
 
 Use this skill when the user asks to:
