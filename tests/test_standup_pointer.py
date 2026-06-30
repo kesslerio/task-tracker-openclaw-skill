@@ -156,6 +156,27 @@ def test_generate_standup_first_content_line_is_the_pointer(env):
     assert "Re-evaluate ActiveCampaign" in lines[1]
 
 
+def test_generate_standup_renders_only_one_number_one_when_pointer_is_set(env):
+    """A live tomorrow-pointer is the single coherent #1; Q1 escalation must not add
+    a second '#1 Priority' row or a contradictory pick-one prompt."""
+    tomorrow_pointer.set_top("tsk_top0001", "Re-evaluate ActiveCampaign")
+
+    md = standup.generate_standup(json_output=False)
+
+    assert md.count("Today's #1") == 1
+    assert "Re-evaluate ActiveCampaign" in md
+    assert "No #1 set" not in md
+    assert "#1 Priority" not in md
+
+
+def test_generate_standup_without_pointer_prompts_once_and_does_not_invent_number_one(env):
+    md = standup.generate_standup(json_output=False)
+
+    assert md.count("No #1 set") == 1
+    assert "#1 Priority" not in md
+    assert "Today's #1" not in md
+
+
 def test_generate_standup_json_carries_the_pointer_line(env):
     """The JSON payload carries ``tomorrow_pointer_line`` so automation clients see the
     same #1 the markdown opens with."""
@@ -164,6 +185,37 @@ def test_generate_standup_json_carries_the_pointer_line(env):
     payload = standup.generate_standup(json_output=True)
     assert "Today's #1" in payload["tomorrow_pointer_line"]
     assert "Re-evaluate ActiveCampaign" in payload["tomorrow_pointer_line"]
+
+
+def test_standup_proposes_at_most_three_daily_top_priorities_not_full_q1(env, monkeypatch):
+    env["work"].write_text("""# Work
+
+## 🔴 Q1
+- [ ] **First Q1** task_id::tsk_first area:: Ops
+- [ ] **Second Q1** task_id::tsk_second area:: Ops
+- [ ] **Third Q1** task_id::tsk_third area:: Ops
+- [ ] **Fourth Q1** task_id::tsk_fourth area:: Ops
+- [ ] **Fifth Q1** task_id::tsk_fifth area:: Ops
+""")
+    monkeypatch.setattr(
+        standup,
+        "_standup_harvest_result",
+        lambda date_str, *, trigger, resolved_window=None: {
+            "evidence_candidates": [],
+            "health": {},
+            "window": resolved_window.as_dict() if resolved_window else None,
+        },
+    )
+
+    md = standup.generate_standup(json_output=False)
+
+    assert "Daily Top Priorities" in md
+    priority_rows = [line for line in md.splitlines() if line.strip().startswith(("1. ", "2. ", "3. "))]
+    assert len(priority_rows) <= 3
+    assert "First Q1" in md and "Second Q1" in md and "Third Q1" in md
+    assert "Fourth Q1" not in md
+    assert "Fifth Q1" not in md
+    assert "Urgent & Important (Q1)" not in md
 
 
 # --- the deterministic command cron descriptor (CODE-ONLY shape) ---------------

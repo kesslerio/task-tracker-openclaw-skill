@@ -57,6 +57,38 @@ def _tasks_data():
     }
 
 
+def test_rendered_priority_rows_are_deduplicated(env, monkeypatch):
+    monkeypatch.setattr(
+        standup,
+        "_standup_harvest_result",
+        lambda date_str, *, trigger, resolved_window=None: {
+            "evidence_candidates": [],
+            "health": {},
+            "window": resolved_window.as_dict() if resolved_window else None,
+        },
+    )
+    duplicated = {
+        "done": [],
+        "due_today": [],
+        "q1": [],
+        "q2": [
+            {"title": "Deduplicate me", "area": "Ops", "task_id": "tsk_dupe"},
+            {"title": "Deduplicate me", "area": "Ops", "task_id": "tsk_dupe"},
+        ],
+        "q3": [],
+        "team": [],
+        "all": [],
+    }
+
+    text = standup.generate_standup(
+        date_str="2026-06-23",
+        tasks_data=duplicated,
+        capacity_records=[],
+    )
+
+    assert text.count("Deduplicate me") == 1
+
+
 def _candidate():
     return {
         "schema_version": 1,
