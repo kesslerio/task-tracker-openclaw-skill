@@ -279,6 +279,53 @@ def test_reconcile_all_tasks_only_inline_priority_lands_in_q1(tmp_path, monkeypa
     assert "Escalated only in dump" not in _titles(tasks, "backlog")
 
 
+def test_reconcile_preserves_parking_lot_and_remains_idempotent():
+    board = """# Weekly TODOs — 2026-W25
+
+## 🔴 Q1
+- [ ] **Active task** task_id::tsk_active area:: Ops
+
+## 🅿️ Parking Lot
+- [ ] **Parked task** created::2026-06-01 task_id::tsk_parked
+
+## ⚪ Backlog
+- [ ] **Backlog task** task_id::tsk_backlog
+"""
+
+    first = reconcile_board(board, [], target_date="2026-06-29")
+    second = reconcile_board(first.content, [], target_date="2026-06-29")
+
+    _assert_single_canonical_board(first.content)
+    assert "## 🅿️ Parking Lot" in first.content
+    parking_start = first.content.index("## 🅿️ Parking Lot")
+    parked_start = first.content.index("Parked task")
+    assert parking_start < parked_start
+    backlog_start = first.content.index("## ⚪ Backlog")
+    assert "Parked task" not in first.content[backlog_start:parking_start]
+    assert "- [ ] **Parked task** created::2026-06-01 task_id::tsk_parked" in first.content
+    assert "- [ ] **Backlog task** task_id::tsk_backlog" in first.content
+    assert second.content == first.content
+
+
+def test_reconcile_skips_objective_header_records_without_repair_comment():
+    board = """# Weekly Objectives
+
+## Objectives
+
+- [ ] Hiring #hiring
+  - [ ] **Write JD** estimate:: 1h task_id::tsk_write_jd
+  - [ ] **Post listing** estimate:: 30m task_id::tsk_post_listing
+
+## 🅿️ Parking Lot
+"""
+
+    result = reconcile_board(board, [], target_date="2026-06-29")
+
+    assert "- [ ] Hiring #hiring" not in result.content
+    assert "repair: missing task_id" not in result.content
+    assert all(item["title"] != "Hiring" for item in result.report["still_missing_task_id"])
+
+
 def test_reconcile_missing_board_cli_uses_error_envelope(tmp_path):
     missing = tmp_path / "missing.md"
     ledger = tmp_path / "missing.md.events.jsonl"

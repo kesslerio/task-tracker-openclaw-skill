@@ -28,7 +28,7 @@ from rollover import (
 )
 from task_ledger import ledger_path, read_events
 from task_records import TaskRecord, task_records
-from utils import PRIORITY_TO_SECTION, _atomic_write, get_tasks_file, load_tasks
+from utils import PRIORITY_TO_SECTION, _atomic_write, get_section_display_name, get_tasks_file, load_tasks
 
 try:
     from utils import SECTION_ORDER
@@ -96,6 +96,7 @@ def reconcile_board(
     """Return a cleaned canonical board and a report of reconciliation actions."""
     week_id = week_id_for(target_date)
     closed = ledger_closed_index(events)
+    parking_lot_lines = _parking_lot_section_lines(content)
     items = [item for item in _board_items(content, personal=personal, fmt=fmt) if not item.record.done]
 
     open_items: list[_BoardItem] = []
@@ -118,6 +119,7 @@ def reconcile_board(
         candidates,
         week_id,
         personal=personal,
+        parking_lot_lines=parking_lot_lines,
     )
     report: dict[str, Any] = {
         "struck_closed": struck_closed,
@@ -169,6 +171,8 @@ def _board_items(content: str, *, personal: bool, fmt: str) -> list[_BoardItem]:
     source_by_line, section_by_line = _scan_task_sections(content, personal=personal)
     items: list[_BoardItem] = []
     for index, record in enumerate(task_records(content, personal=personal, fmt=fmt)):
+        if record.section == "parking_lot" or record.is_objective:
+            continue
         source_section = source_by_line.get(record.line_number)
         section = section_by_line.get(record.line_number)
         if section is None and record.line_number not in section_by_line and record.section in SECTION_ORDER:
@@ -218,6 +222,16 @@ def _section_for_header(line: str, *, personal: bool) -> str | None:
     if heading.startswith("✅") or heading.startswith("done"):
         return "done"
     return None
+
+
+def _parking_lot_section_lines(content: str) -> list[str] | None:
+    from parking_lot import _find_parking_lot_bounds
+
+    lines = content.splitlines()
+    start, end = _find_parking_lot_bounds(lines)
+    if start == -1:
+        return None
+    return lines[start:end] or [f"## {get_section_display_name('parking_lot')}"]
 
 
 def _candidate_for_item(item: _BoardItem) -> Candidate:
