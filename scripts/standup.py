@@ -126,11 +126,29 @@ def tomorrow_pointer_line(records=None) -> str:
     return tomorrow_pointer_state(records=records)["line"]
 
 
+def _line_number_int(value) -> int | None:
+    try:
+        return int(value) if value else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _fallback_identity(task: dict) -> str | None:
+    if task.get("fallback_id"):
+        return str(task["fallback_id"])
+    raw_line = str(task.get("raw_line") or "")
+    if not raw_line:
+        return None
+    return fallback_id_for(raw_line, _line_number_int(task.get("line_number")))
+
+
 def _task_key(task: dict) -> tuple[str, str]:
-    for field in ("task_id", "legacy_id", "fallback_id", "raw_line"):
-        value = task.get(field)
-        if value:
-            return (field, str(value))
+    task_id = task.get("task_id") or task.get("legacy_id")
+    if task_id:
+        return ("id", str(task_id))
+    fallback_id = _fallback_identity(task)
+    if fallback_id:
+        return ("id", fallback_id)
     return ("title", str(task.get("title") or "").casefold())
 
 
@@ -155,15 +173,15 @@ def _load_focus_records(capacity_records):
         _, _, records = load_records(personal=False)
         return records
     except Exception:
-        return []
+        return None
 
 
-def _daily_top_priorities(records, *, reference_date: date) -> list[dict]:
+def _daily_top_priorities(records, *, reference_date: date) -> tuple[list[dict], bool]:
     try:
         proposal = propose_defended_three(records or [], reference_date=reference_date.isoformat())
     except Exception:
-        return []
-    return proposal.defended[:3]
+        return [], True
+    return proposal.defended[:3], False
 
 
 def _find_task_by_id(tasks_data: dict, task_id: str | None) -> dict | None:
@@ -179,15 +197,56 @@ def _find_task_by_id(tasks_data: dict, task_id: str | None) -> dict | None:
     return None
 
 
-def _render_daily_top_priorities(lines: list[str], rows: list[dict], *, indent: str = "  ") -> None:
+def _pointer_priority_row(output: dict) -> dict | None:
+    pointer_state = output.get("tomorrow_pointer_state") or {}
+    task_id = pointer_state.get("task_id")
+    if pointer_state.get("status") != "active" or not task_id:
+        return None
+    task = dict(output.get("priority") or {})
+    task["task_id"] = task_id
+    task["title"] = pointer_state.get("title") or task.get("title") or ""
+    return task
+
+
+def _daily_priority_rows_for_render(output: dict) -> list[dict]:
+    rows = list(output.get("daily_top_priorities") or [])
+    pointer_row = _pointer_priority_row(output)
+    if pointer_row is None:
+        return rows[:3]
+
+    selected = [pointer_row]
+    seen = {_task_key(pointer_row)}
+    for row in rows:
+        key = _task_key(row)
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(row)
+        if len(selected) == 3:
+            break
+
+    return [{**row, "position": index} for index, row in enumerate(selected, start=1)]
+
+
+def _render_daily_top_priorities(
+    lines: list[str],
+    rows: list[dict],
+    *,
+    indent: str = "  ",
+    unavailable: bool = False,
+) -> None:
+    if unavailable:
+        lines.append("⚠️ daily priorities unavailable — check Q1 manually")
+        lines.append("")
     if not rows:
         return
     lines.append("🎯 **Daily Top Priorities:**")
-    for row in rows[:3]:
+    for index, row in enumerate(rows[:3], start=1):
         est_minutes = int(row.get("estimate_minutes") or 0)
         est = f" ({format_duration(est_minutes)})" if est_minutes > 0 else ""
         escalated = " 🔺" if row.get("escalated") else ""
-        lines.append(f"{indent}{row.get('position', len(lines))}. {row.get('title')}{escalated}{est}")
+        position = row.get("position") or index
+        lines.append(f"{indent}{position}. {row.get('title')}{escalated}{est}")
     lines.append("")
 
 
@@ -256,14 +315,8 @@ def group_by_area(tasks):
 
 
 def _identity_fields(task: dict) -> dict:
-    raw_line = str(task.get("raw_line") or "")
-    line_number = task.get("line_number")
-    try:
-        line_number_int = int(line_number) if line_number else None
-    except (TypeError, ValueError):
-        line_number_int = None
     task_id = task.get("task_id") or task.get("legacy_id")
-    fallback_id = fallback_id_for(raw_line, line_number_int) if raw_line else None
+    fallback_id = _fallback_identity(task)
     return {
         "task_id": task_id,
         "fallback_id": fallback_id,
@@ -379,12 +432,12 @@ def format_split_standup(output: dict, date_display: str) -> list:
     msg3_lines.append("")
 
     rendered_seen: set[tuple[str, str]] = set()
-    pointer_state = output.get("tomorrow_pointer_state") or {}
-    if pointer_state.get("task_id"):
-        rendered_seen.add(("task_id", str(pointer_state["task_id"])))
-
-    top_priorities = _dedupe_tasks(output.get("daily_top_priorities") or [], seen=rendered_seen)
-    _render_daily_top_priorities(msg3_lines, top_priorities)
+    top_priorities = _dedupe_tasks(_daily_priority_rows_for_render(output), seen=rendered_seen)
+    _render_daily_top_priorities(
+        msg3_lines,
+        top_priorities,
+        unavailable=bool(output.get("daily_top_priorities_unavailable")),
+    )
     
     # Due today
     due_today = _dedupe_tasks(output['due_today'], seen=rendered_seen)
@@ -489,6 +542,8 @@ def _build_daily_note_links(anchor_date: str | None = None) -> dict:
 def build_compact_standup_sections(output: dict) -> dict:
     """Compact standup payload schema v1 for automation clients."""
     done = [t.get('title', '') for t in (output.get('completed') or [])[:12]]
+    rendered_seen: set[tuple[str, str]] = set()
+    due_today = _dedupe_tasks(output.get('due_today') or [], seen=rendered_seen)
     calendar_dos = [
         {
             "quick_id": f"c{idx}",
@@ -496,7 +551,7 @@ def build_compact_standup_sections(output: dict) -> dict:
             "status": "scheduled",
             **_identity_fields(t),
         }
-        for idx, t in enumerate(output.get('due_today') or [], start=1)
+        for idx, t in enumerate(due_today, start=1)
     ]
 
     completed = output.get('completed') or []
@@ -522,15 +577,21 @@ def build_compact_standup_sections(output: dict) -> dict:
         + [("q2", t) for t in (output.get('q2') or [])]
         + [("q3", t) for t in (output.get('q3') or [])]
     )
-    for idx, (section, t) in enumerate(stack[:20], start=1):
+    for section, t in stack:
+        key = _task_key(t)
+        if key in rendered_seen:
+            continue
+        rendered_seen.add(key)
         dos.append(
             {
-                "quick_id": f"d{idx}",
+                "quick_id": f"d{len(dos) + 1}",
                 "title": t.get('title', ''),
                 "section": section,
                 **_identity_fields(t),
             }
         )
+        if len(dos) == 20:
+            break
 
     return {
         "schema_version": "1",
@@ -590,6 +651,7 @@ def generate_standup(
         'tomorrow_pointer_state': {},
         'tomorrow_pointer_line': "",
         'daily_top_priorities': [],
+        'daily_top_priorities_unavailable': False,
         'due_today': [],
         'q1': [],  # Urgent & Important
         'q2': [],  # Important, Not Urgent
@@ -624,10 +686,12 @@ def generate_standup(
     output['tomorrow_pointer_state'] = pointer_state
     output['tomorrow_pointer_line'] = pointer_state["line"]
     output['priority'] = _find_task_by_id(tasks_data, pointer_state.get("task_id"))
-    output['daily_top_priorities'] = _daily_top_priorities(
+    daily_top_priorities, daily_top_priorities_unavailable = _daily_top_priorities(
         focus_records,
         reference_date=standup_date,
     )
+    output['daily_top_priorities'] = daily_top_priorities
+    output['daily_top_priorities_unavailable'] = daily_top_priorities_unavailable
 
     # Due today
     output['due_today'] = _dedupe_tasks(tasks_data.get('due_today', []))
@@ -693,9 +757,6 @@ def generate_standup(
     lines.append("")
 
     rendered_seen: set[tuple[str, str]] = set()
-    pointer_state = output.get("tomorrow_pointer_state") or {}
-    if pointer_state.get("task_id"):
-        rendered_seen.add(("task_id", str(pointer_state["task_id"])))
 
     # Calendar events
     cal_err = calendar_error(output['calendar'])
@@ -710,8 +771,12 @@ def generate_standup(
             lines.append(f"  • {time_str} — {event['summary']}")
         lines.append("")
 
-    top_priorities = _dedupe_tasks(output.get("daily_top_priorities") or [], seen=rendered_seen)
-    _render_daily_top_priorities(lines, top_priorities)
+    top_priorities = _dedupe_tasks(_daily_priority_rows_for_render(output), seen=rendered_seen)
+    _render_daily_top_priorities(
+        lines,
+        top_priorities,
+        unavailable=bool(output.get("daily_top_priorities_unavailable")),
+    )
 
     if output.get('capacity'):
         lines.append(output['capacity'])

@@ -4,8 +4,7 @@ EOD Review Generator - Aggregates daily note + work tasks into a structured EOD 
 
 Reads from:
 1. TASK_TRACKER_DAILY_NOTES_DIR/{date}.md — canonical daily-note completion evidence
-2. Work Tasks.md — open Q1/Q2 items for "tomorrow's top 3"
-3. Google Calendar via gog CLI (optional, reuses standup.py pattern)
+2. Work Tasks.md — fallback completed items and open Q1/Q2 items for "tomorrow's top 3"
 
 Outputs:
 - Default: writes 01-Reports/{date}-eod.md AND prints to stdout
@@ -80,6 +79,7 @@ def generate_eod(target_date: datetime = None) -> dict:
 
     parsed = read_canonical_daily_note(target_date.date())
     source = 'TASK_TRACKER_DAILY_NOTES_DIR'
+    _, tasks_data = load_tasks()
 
     if parsed["exists"]:
         done = parsed['done']
@@ -87,12 +87,10 @@ def generate_eod(target_date: datetime = None) -> dict:
     else:
         # Fallback: Work Tasks.md done section (with staleness caveat)
         source = 'Work Tasks.md (fallback — no canonical daily note found)'
-        _, tasks_data = load_tasks()
         done = [t['title'] for t in tasks_data.get('done', [])[:8]]
         not_done = []
 
     # Tomorrow's top 3 from Work Tasks.md
-    _, tasks_data = load_tasks()
     tomorrows_top3 = get_tomorrows_top3(tasks_data)
 
     return {

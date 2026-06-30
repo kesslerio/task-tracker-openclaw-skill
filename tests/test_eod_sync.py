@@ -222,8 +222,11 @@ class TestBuildSyncPlan:
         plan = sync.build_sync_plan(done_items, OPEN_TASKS_SAMPLE, "2026-02-19")
         synced = [r for r in plan if r["status"] == "evidence"]
         # The KPMG task should only match once
-        kpmg_matched_indices = {r["match"]["line_idx"] for r in synced if r["match"] is not None}
-        assert len(kpmg_matched_indices) <= len(synced), "Duplicate match detected"
+        kpmg_matches = [
+            r for r in synced
+            if r["match"] is not None and "KPMG audit package" in r["match"]["body"]
+        ]
+        assert len(kpmg_matches) == 1, "KPMG task matched more than once"
 
     def test_score_in_range(self):
         plan = sync.build_sync_plan(DONE_ITEMS_SAMPLE, OPEN_TASKS_SAMPLE, "2026-02-19")

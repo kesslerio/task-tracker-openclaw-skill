@@ -206,6 +206,7 @@ def test_standup_proposes_at_most_three_daily_top_priorities_not_full_q1(env, mo
             "window": resolved_window.as_dict() if resolved_window else None,
         },
     )
+    monkeypatch.setattr(standup, "task_audit_summary", lambda limit=3: {})
 
     md = standup.generate_standup(json_output=False)
 
@@ -216,6 +217,89 @@ def test_standup_proposes_at_most_three_daily_top_priorities_not_full_q1(env, mo
     assert "Fourth Q1" not in md
     assert "Fifth Q1" not in md
     assert "Urgent & Important (Q1)" not in md
+
+
+def test_idless_top_priority_renders_once_across_top_and_quadrant(env, monkeypatch):
+    env["work"].write_text("""# Work
+
+## 🔴 Q1
+- [ ] **First Q1** task_id::tsk_first area:: Ops
+
+## 🟡 Q2
+- [ ] **Idless ranked task** area:: Product
+""")
+    monkeypatch.setattr(
+        standup,
+        "_standup_harvest_result",
+        lambda date_str, *, trigger, resolved_window=None: {
+            "evidence_candidates": [],
+            "health": {},
+            "window": resolved_window.as_dict() if resolved_window else None,
+        },
+    )
+    monkeypatch.setattr(standup, "task_audit_summary", lambda limit=3: {})
+
+    md = standup.generate_standup(json_output=False)
+
+    assert "Daily Top Priorities" in md
+    assert "2. Idless ranked task" in md
+    assert md.count("Idless ranked task") == 1
+    assert "Important, Not Urgent (Q2)" not in md
+
+
+def test_generate_standup_degrades_neutral_when_focus_records_fail(env, monkeypatch):
+    tomorrow_pointer.set_top("tsk_top0001", "Re-evaluate ActiveCampaign")
+
+    def boom(*_a, **_k):
+        raise RuntimeError("records unavailable")
+
+    import task_records
+
+    monkeypatch.setattr(task_records, "load_records", boom)
+    monkeypatch.setattr(
+        standup,
+        "_standup_harvest_result",
+        lambda date_str, *, trigger, resolved_window=None: {
+            "evidence_candidates": [],
+            "health": {},
+            "window": resolved_window.as_dict() if resolved_window else None,
+        },
+    )
+
+    md = standup.generate_standup(json_output=False)
+
+    assert "No #1 set" in md
+    assert "Last night's #1 is done" not in md
+
+
+def test_active_pointer_is_daily_top_priority_one_when_outside_natural_top3(env, monkeypatch):
+    env["work"].write_text("""# Work
+
+## 🔴 Q1
+- [ ] **First Q1** task_id::tsk_first area:: Ops
+- [ ] **Second Q1** task_id::tsk_second area:: Ops
+- [ ] **Third Q1** task_id::tsk_third area:: Ops
+
+## 🟡 Q2
+- [ ] **Pointer Q2** task_id::tsk_pointer area:: Product
+""")
+    tomorrow_pointer.set_top("tsk_pointer", "Pointer Q2")
+    monkeypatch.setattr(
+        standup,
+        "_standup_harvest_result",
+        lambda date_str, *, trigger, resolved_window=None: {
+            "evidence_candidates": [],
+            "health": {},
+            "window": resolved_window.as_dict() if resolved_window else None,
+        },
+    )
+
+    md = standup.generate_standup(json_output=False)
+
+    assert "Today's #1" in md
+    assert "Daily Top Priorities" in md
+    assert "  1. Pointer Q2" in md
+    assert "  1. First Q1" not in md
 
 
 # --- the deterministic command cron descriptor (CODE-ONLY shape) ---------------

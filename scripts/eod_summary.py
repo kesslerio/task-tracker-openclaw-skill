@@ -134,5 +134,7 @@ def write_summary(
     after = upsert_section(before, section)
     changed = after != before
     if changed:
-        path.write_text(after, encoding="utf-8")
+        tmp_path = path.with_name(f".{path.name}.tmp")
+        tmp_path.write_text(after, encoding="utf-8")
+        tmp_path.replace(path)
     return {"ok": True, "path": str(path), "changed": changed}
