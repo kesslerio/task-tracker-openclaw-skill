@@ -23,6 +23,7 @@ The model (two-layer; Layer 1 = daily priorities lives in ``defended_three.py``)
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 import cos_config
@@ -88,7 +89,40 @@ def active_work_records(records: list[TaskRecord]) -> list[TaskRecord]:
     falsely flagging overcommit. This is the single active-work definition both
     layers share.
     """
-    return [record for record in active_records(records) if not record.is_objective]
+    active = [record for record in active_records(records) if not record.is_objective]
+    return _distinct_active_records(active)
+
+
+def _normalised_title(record: TaskRecord) -> str:
+    return re.sub(r"\s+", " ", record.title).strip().casefold()
+
+
+def _distinct_active_records(records: list[TaskRecord]) -> list[TaskRecord]:
+    """Collapse duplicate active records before they hit count/hour caps.
+
+    Identity wins first: repeated physical lines with the same canonical id are
+    one task. The remaining rows are then collapsed by normalized title so bare
+    duplicate/phantom lines without ``task_id::`` do not consume extra capacity.
+    """
+    by_id: list[TaskRecord] = []
+    seen_ids: set[str] = set()
+    for record in records:
+        if record.canonical_id:
+            if record.canonical_id in seen_ids:
+                continue
+            seen_ids.add(record.canonical_id)
+        by_id.append(record)
+
+    distinct: list[TaskRecord] = []
+    seen_titles: set[str] = set()
+    for record in by_id:
+        title_key = _normalised_title(record)
+        if title_key and title_key in seen_titles:
+            continue
+        if title_key:
+            seen_titles.add(title_key)
+        distinct.append(record)
+    return distinct
 
 
 def _unestimated_minutes() -> int:

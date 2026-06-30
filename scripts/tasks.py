@@ -41,6 +41,7 @@ from task_audit import collect_task_audit, task_audit_summary
 from task_lines import remove_task_line
 from task_repair import repair_missing_ids
 from task_transitions import block_unsafe_query, complete_by_id, print_result
+from rollover import run_rollover
 from task_records import (
     active_records,
     record_to_task_dict,
@@ -780,6 +781,20 @@ def done_task(args):
     print_result(result)
     if not result.get("ok"):
         sys.exit(2)
+
+
+def cmd_rollover(args):
+    """Regenerate the weekly board as one canonical open-task list."""
+    tasks_file, _ = get_tasks_file(args.personal)
+    result = run_rollover(
+        personal=args.personal,
+        target_date=args.date,
+        dry_run=args.dry_run,
+    )
+    if args.dry_run:
+        print(result.content, end="")
+        return
+    print_result(result.payload(tasks_file=tasks_file))
 
 
 def show_blockers(args):
@@ -1928,6 +1943,11 @@ def main():
     done_parser = subparsers.add_parser('done', help='Mark task as done by canonical task_id')
     done_parser.add_argument('query', help='Canonical task_id')
     done_parser.set_defaults(func=done_task)
+
+    rollover_parser = subparsers.add_parser('rollover', help='Regenerate the weekly board deterministically')
+    rollover_parser.add_argument('--date', help='Target date for ISO week header (YYYY-MM-DD)')
+    rollover_parser.add_argument('--dry-run', action='store_true', help='Print result without writing the board')
+    rollover_parser.set_defaults(func=cmd_rollover)
 
     identity_audit_parser = subparsers.add_parser('identity-audit', help='Read-only canonical identity audit')
     identity_audit_parser.set_defaults(func=cmd_identity_audit)
