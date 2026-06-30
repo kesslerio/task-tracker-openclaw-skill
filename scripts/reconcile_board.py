@@ -17,22 +17,26 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
 
+import error_envelope
 from rollover import (
-    PRIORITY_TO_SECTION,
-    SECTION_ORDER,
-    _Candidate,
-    _is_closed_by_ledger,
-    _normalise_title,
-    _render_candidates,
+    Candidate,
+    is_closed_by_ledger,
     ledger_closed_index,
+    normalise_title,
+    render_candidates,
     week_id_for,
 )
 from task_ledger import ledger_path, read_events
 from task_records import TaskRecord, task_records
-from utils import _atomic_write, get_tasks_file
+from utils import PRIORITY_TO_SECTION, _atomic_write, get_tasks_file, load_tasks
+
+try:
+    from utils import SECTION_ORDER
+except ImportError:
+    SECTION_ORDER = ("q1", "q2", "q3", "team", "backlog")
 
 
-TASK_LINE_RE = re.compile(r"^\s*- \[[ xX]\] ")
+TASK_LINE_RE = re.compile(r"^\s*- \[ \] ")
 REPORT_MARKER = "--- reconcile report ---"
 
 
@@ -74,7 +78,7 @@ class _BoardItem:
 
     @property
     def title_key(self) -> str:
-        return _normalise_title(self.record.title)
+        return normalise_title(self.record.title)
 
     @property
     def task_id(self) -> str | None:
@@ -98,7 +102,7 @@ def reconcile_board(
     struck_closed: list[dict[str, Any]] = []
     for item in items:
         candidate = _candidate_for_item(item)
-        if _is_closed_by_ledger(candidate, closed):
+        if is_closed_by_ledger(candidate, closed):
             struck_closed.append(
                 {
                     **_report_item(item),
@@ -110,7 +114,7 @@ def reconcile_board(
 
     deduped, merged_duplicates = _dedupe_items(open_items)
     candidates = [_candidate_for_item(item) for item in deduped]
-    rendered, missing_task_ids, renderer_duplicate_count = _render_candidates(
+    rendered, missing_task_ids, renderer_duplicate_count = render_candidates(
         candidates,
         week_id,
         personal=personal,
@@ -139,7 +143,9 @@ def run_reconcile(
     repair: bool = False,
 ) -> tuple[ReconcileResult, Path, dict[str, Any] | None]:
     tasks_file, fmt = get_tasks_file(personal)
-    content = tasks_file.read_text(encoding="utf-8")
+    if not tasks_file.exists():
+        raise FileNotFoundError(f"Tasks file not found: {tasks_file}")
+    content, _tasks = load_tasks(personal)
     events = read_events(ledger_path(tasks_file))
     result = reconcile_board(
         content,
@@ -167,8 +173,6 @@ def _board_items(content: str, *, personal: bool, fmt: str) -> list[_BoardItem]:
         section = section_by_line.get(record.line_number)
         if section is None and record.line_number not in section_by_line and record.section in SECTION_ORDER:
             section = record.section
-        if section is None:
-            section = "backlog"
         items.append(
             _BoardItem(
                 record=replace(record, section=section),
@@ -216,8 +220,8 @@ def _section_for_header(line: str, *, personal: bool) -> str | None:
     return None
 
 
-def _candidate_for_item(item: _BoardItem) -> _Candidate:
-    return _Candidate(
+def _candidate_for_item(item: _BoardItem) -> Candidate:
+    return Candidate(
         record=item.record,
         raw_line=item.record.raw_line,
         task_id=item.record.canonical_id,
@@ -227,60 +231,66 @@ def _candidate_for_item(item: _BoardItem) -> _Candidate:
 
 
 def _dedupe_items(items: list[_BoardItem]) -> tuple[list[_BoardItem], list[dict[str, Any]]]:
-    kept_by_title: list[_BoardItem] = []
     merged: list[dict[str, Any]] = []
-    by_title: dict[str, list[_BoardItem]] = {}
-    for item in items:
-        by_title.setdefault(item.title_key, []).append(item)
-
-    for title_key in sorted(by_title, key=lambda key: min(item.original_index for item in by_title[key])):
-        group = by_title[title_key]
-        if len(group) == 1:
-            kept_by_title.append(group[0])
-            continue
-        kept = min(group, key=_keep_preference)
-        kept_by_title.append(kept)
-        for dropped in sorted((item for item in group if item is not kept), key=lambda item: item.original_index):
-            merged.append(
-                {
-                    "reason": "duplicate-title",
-                    "title": kept.record.title,
-                    "kept": _report_item(kept),
-                    "dropped": _report_item(dropped),
-                }
-            )
-
-    final: list[_BoardItem] = []
     by_id: dict[str, list[_BoardItem]] = {}
     without_id: list[_BoardItem] = []
-    for item in kept_by_title:
+    for item in items:
         if item.task_id:
             by_id.setdefault(item.task_id, []).append(item)
         else:
             without_id.append(item)
 
-    selected_ids: set[int] = set()
+    kept: list[_BoardItem] = []
+    id_title_owner: dict[str, _BoardItem] = {}
     for task_id in sorted(by_id, key=lambda key: min(item.original_index for item in by_id[key])):
         group = by_id[task_id]
+        selected = min(group, key=_keep_preference)
+        kept.append(selected)
+        if selected.title_key:
+            previous = id_title_owner.get(selected.title_key)
+            if previous is None or selected.original_index < previous.original_index:
+                id_title_owner[selected.title_key] = selected
         if len(group) == 1:
-            selected_ids.add(group[0].original_index)
             continue
-        kept = min(group, key=_keep_preference)
-        selected_ids.add(kept.original_index)
-        for dropped in sorted((item for item in group if item is not kept), key=lambda item: item.original_index):
+        for dropped in sorted((item for item in group if item is not selected), key=lambda item: item.original_index):
             merged.append(
                 {
                     "reason": "duplicate-task-id",
-                    "title": kept.record.title,
-                    "kept": _report_item(kept),
+                    "title": selected.record.title,
+                    "kept": _report_item(selected),
                     "dropped": _report_item(dropped),
                 }
             )
-    selected_ids.update(item.original_index for item in without_id)
 
-    for item in sorted(kept_by_title, key=lambda item: item.original_index):
-        if item.original_index in selected_ids:
-            final.append(item)
+    seen_bare_titles: dict[str, _BoardItem] = {}
+    for item in sorted(without_id, key=lambda item: item.original_index):
+        id_bearing_item = id_title_owner.get(item.title_key)
+        if id_bearing_item is not None:
+            merged.append(
+                {
+                    "reason": "bare-duplicate-of-task-id",
+                    "title": id_bearing_item.record.title,
+                    "kept": _report_item(id_bearing_item),
+                    "dropped": _report_item(item),
+                }
+            )
+            continue
+        if item.title_key in seen_bare_titles:
+            bare_kept = seen_bare_titles[item.title_key]
+            merged.append(
+                {
+                    "reason": "duplicate-bare-title",
+                    "title": bare_kept.record.title,
+                    "kept": _report_item(bare_kept),
+                    "dropped": _report_item(item),
+                }
+            )
+            continue
+        if item.title_key:
+            seen_bare_titles[item.title_key] = item
+        kept.append(item)
+
+    final = sorted(kept, key=lambda item: item.original_index)
     return final, sorted(merged, key=lambda row: row["dropped"]["line_number"] or 0)
 
 
@@ -296,7 +306,7 @@ def _keep_preference(item: _BoardItem) -> tuple[int, int, int, int]:
     )
 
 
-def _closed_match_by(candidate: _Candidate, closed: Any) -> str:
+def _closed_match_by(candidate: Candidate, closed: Any) -> str:
     if candidate.task_id and candidate.task_id in closed.task_ids:
         return "task_id"
     if candidate.task_id is None and candidate.title_key in closed.titles:
@@ -349,4 +359,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(error_envelope.run_main("reconcile_board", main))
