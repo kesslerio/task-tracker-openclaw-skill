@@ -23,6 +23,7 @@ The model (two-layer; Layer 1 = daily priorities lives in ``defended_three.py``)
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 import cos_config
@@ -88,7 +89,46 @@ def active_work_records(records: list[TaskRecord]) -> list[TaskRecord]:
     falsely flagging overcommit. This is the single active-work definition both
     layers share.
     """
-    return [record for record in active_records(records) if not record.is_objective]
+    active = [record for record in active_records(records) if not record.is_objective]
+    return _distinct_active_records(active)
+
+
+def _normalised_title(record: TaskRecord) -> str:
+    return re.sub(r"\s+", " ", record.title).strip().casefold()
+
+
+def _distinct_active_records(records: list[TaskRecord]) -> list[TaskRecord]:
+    """Collapse duplicate active records before they hit count/hour caps.
+
+    Identity wins first: repeated physical lines with the same canonical id are
+    one task. Title is only a fallback for bare rows: a row without a canonical
+    id is skipped when it duplicates an id-bearing task title or a previous bare
+    title. Distinct canonical ids are always distinct tasks even when titles match.
+    """
+    by_id: list[TaskRecord] = []
+    seen_ids: set[str] = set()
+    for record in records:
+        if record.canonical_id:
+            if record.canonical_id in seen_ids:
+                continue
+            seen_ids.add(record.canonical_id)
+        by_id.append(record)
+
+    distinct: list[TaskRecord] = []
+    id_titles = {_normalised_title(record) for record in by_id if record.canonical_id}
+    seen_bare_titles: set[str] = set()
+    for record in by_id:
+        if record.canonical_id:
+            distinct.append(record)
+            continue
+
+        title_key = _normalised_title(record)
+        if title_key and (title_key in id_titles or title_key in seen_bare_titles):
+            continue
+        if title_key:
+            seen_bare_titles.add(title_key)
+        distinct.append(record)
+    return distinct
 
 
 def _unestimated_minutes() -> int:

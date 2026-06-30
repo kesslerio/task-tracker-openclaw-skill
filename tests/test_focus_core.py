@@ -21,6 +21,7 @@ import defended_three  # noqa: E402
 import focus_state  # noqa: E402
 from focus_core import (  # noqa: E402
     count_active_tasks,
+    evaluate_add,
     summarize_capacity,
 )
 from task_records import task_records  # noqa: E402
@@ -153,6 +154,85 @@ def test_count_cap_breaches_independently_of_estimate():
         assert summary.over_cap is True
     finally:
         os.environ["ACTIVE_TASK_HARD_CAP"] = "20"
+
+
+def test_capacity_counts_distinct_active_records_not_raw_lines():
+    content = """# Work
+
+## 🔴 Q1
+- [ ] **Same id first** estimate:: 1h task_id::tsk_same
+- [ ] **Same id duplicate** estimate:: 9h task_id::tsk_same
+- [ ] **Bare duplicate** estimate:: 1h
+- [ ] **Bare duplicate** estimate:: 9h
+
+## 🅿️ Parking Lot
+"""
+    summary = summarize_capacity(_records(content))
+
+    assert summary.active_count == 2
+    assert summary.estimated_minutes == 120
+    assert count_active_tasks(_records(content)) == 2
+
+
+def test_capacity_dedupes_same_task_id_and_same_bare_title():
+    content = """# Work
+
+## 🔴 Q1
+- [ ] **Shared id A** estimate:: 30m task_id::tsk_shared
+- [ ] **Shared id B** estimate:: 30m task_id::tsk_shared
+- [ ] **Repeated bare title** estimate:: 30m
+- [ ] **Repeated bare title** estimate:: 30m
+
+## 🅿️ Parking Lot
+"""
+    summary = summarize_capacity(_records(content))
+
+    assert summary.active_count == 2
+    assert summary.estimated_minutes == 60
+
+
+def test_capacity_counts_same_title_tasks_with_distinct_task_ids():
+    content = """# Work
+
+## 🔴 Q1
+- [ ] **Standup** estimate:: 3h task_id::tsk_standup_a
+- [ ] **Standup** estimate:: 3h task_id::tsk_standup_b
+
+## 🅿️ Parking Lot
+"""
+    summary = summarize_capacity(_records(content))
+
+    assert summary.active_count == 2
+    assert summary.estimated_minutes == 360
+
+
+def test_add_gate_uses_distinct_capacity_before_parking():
+    import os
+
+    os.environ["ACTIVE_TASK_HARD_CAP"] = "3"
+    os.environ["WEEKLY_CAPACITY_HOURS"] = "6"
+    try:
+        content = """# Work
+
+## 🔴 Q1
+- [ ] **Shared id first** estimate:: 2h task_id::tsk_shared
+- [ ] **Shared id duplicate** estimate:: 2h task_id::tsk_shared
+- [ ] **Bare repeated** estimate:: 2h
+- [ ] **Bare repeated** estimate:: 2h
+
+## 🅿️ Parking Lot
+"""
+        decision = evaluate_add(content, "obsidian", "Legitimate new task")
+
+        assert decision.allowed is True
+        assert decision.summary is not None
+        assert decision.summary.active_count == 2
+        assert decision.summary.estimated_minutes == 240
+        assert decision.summary.projected_count == 3
+        assert decision.summary.projected_minutes == 360
+    finally:
+        os.environ["ACTIVE_TASK_HARD_CAP"] = "20"
+        os.environ["WEEKLY_CAPACITY_HOURS"] = "25"
 
 
 # --- I-DAILY3: daily-priorities proposal -----------------------------------
