@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Weekly Review Generator - Summarizes the most recent completed ISO week.
+Weekly Review Generator - Summarizes a completed or in-progress ISO week.
 """
 
 import argparse
@@ -161,7 +161,7 @@ def generate_velocity_section(
         archive_weeks = _parse_archive_weeks(archive_dir)
 
         if completed_this_week is None:
-            all_tasks = tasks_data.get('all', [])
+            all_tasks = tasks_data.get('done', [])
             live_completed = _count_completed_in_range(all_tasks, week_start, week_end)
 
             iso_year_cur, iso_week_cur, _ = week_start.isocalendar()
@@ -263,6 +263,14 @@ def _clean_stale_done_lines(tasks_file: Path, done_tasks: list[dict]) -> int:
     return removed
 
 
+def _board_done_tasks_with_provenance(done_tasks: list[dict]) -> list[dict]:
+    """Return archived done tasks that can be safely removed from the board."""
+    return [
+        task for task in done_tasks
+        if task.get('raw_line') and task.get('line_number')
+    ]
+
+
 def group_by_area(tasks: list[dict]) -> dict[str, list[dict]]:
     """Group tasks by area."""
     areas: dict[str, list[dict]] = {}
@@ -281,6 +289,7 @@ def parse_iso_week(
     today: date | None = None,
 ) -> tuple[date, date]:
     """Parse ISO week string (YYYY-WNN) into start/end dates."""
+    # today= is a test-injection point; runtime callers leave it unset.
     today = today or datetime.now().date()
     if not week:
         anchor = today if this_week else today - timedelta(days=7)
@@ -478,7 +487,11 @@ def _coverage_warning_lines(
     today: date,
     window_completed_count: int,
 ) -> list[str]:
-    """Build coverage-divergence warnings without changing completion counts."""
+    """Build coverage-divergence warnings without changing completion counts.
+
+    The prior-week daily-note check fires only when the reviewed window has
+    zero completions.
+    """
     warnings: list[str] = []
 
     if notes_dir and window_completed_count == 0:
@@ -527,11 +540,14 @@ def generate_weekly_review(
     """Generate weekly review summary."""
     _, tasks_data = load_tasks()
 
+    # today= is a test-injection point; runtime callers leave it unset.
     today = today or datetime.now().date()
     week_start, week_end = parse_iso_week(week, this_week=this_week, today=today)
     notes_dir_raw = os.getenv("TASK_TRACKER_DAILY_NOTES_DIR", None)
     notes_dir = Path(notes_dir_raw) if notes_dir_raw else None
-    reference_date = today if this_week else week_start
+    priority_reference_date = today if this_week else week_start
+    misses_reference_date = today
+    upcoming_start = max(today, week_start)
     iso_year, iso_week, _ = week_start.isocalendar()
     week_label = f"{iso_year}-W{iso_week:02d}"
 
@@ -572,13 +588,16 @@ def generate_weekly_review(
     ))
 
     # Carried Over (Misses): overdue tasks bucketed from utils and then grouped by area
-    missed_buckets = get_missed_tasks_bucketed(tasks_data, reference_date=reference_date.isoformat())
+    missed_buckets = get_missed_tasks_bucketed(
+        tasks_data,
+        reference_date=misses_reference_date.isoformat(),
+    )
     carried_over = flatten_missed_buckets(missed_buckets)
     format_area_grouped(
         lines,
         "⏳ **Carried Over (Misses)**",
         carried_over,
-        lambda t: f"{t['title']} ({format_overdue(t, reference_date)}; due {t['due']})",
+        lambda t: f"{t['title']} ({format_overdue(t, misses_reference_date)}; due {t['due']})",
         "No overdue tasks",
     )
 
@@ -590,7 +609,7 @@ def generate_weekly_review(
             due_date_val = parse_due_date(due_raw)
             if due_raw and (not due_date_val or due_date_val < week_start or due_date_val > week_end):
                 continue
-            eff = effective_priority(task, reference_date)
+            eff = effective_priority(task, priority_reference_date)
             display_label = {'q1': 'Q1', 'q2': 'Q2', 'q3': 'Q3'}.get(eff['section'], priority_label)
             indicator = f" {eff['indicator']}" if eff['indicator'] else ""
             priorities.append({**task, '_priority': display_label, '_escalation_indicator': indicator})
@@ -617,7 +636,7 @@ def generate_weekly_review(
         if not due_date:
             continue
 
-        if due_date < reference_date or due_date > week_end:
+        if due_date < upcoming_start or due_date > week_end:
             continue
 
         upcoming.append((due_date, task))
@@ -667,8 +686,8 @@ def generate_weekly_review(
         archive_name = _archive_to_quarterly(done_tasks)
         # Clean stale [x] lines from the board
         tasks_file, fmt = get_tasks_file()
-        board_done = tasks_data.get('done', [])
-        cleaned = _clean_stale_done_lines(tasks_file, board_done)
+        archived_board_done = _board_done_tasks_with_provenance(done_tasks)
+        cleaned = _clean_stale_done_lines(tasks_file, archived_board_done)
         extra = f" (cleaned {cleaned} stale lines)" if cleaned else ""
         if archive_name:
             lines.append(f"📦 Archived {len(done_tasks)} completed tasks to {archive_name}{extra}.")
