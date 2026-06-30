@@ -1,6 +1,7 @@
 ---
 module: task-tracker
 date: "2026-05-22"
+last_updated: "2026-06-30"
 problem_type: workflow_issue
 category: workflow-issues
 component: development_workflow
@@ -62,6 +63,15 @@ Use one mutation identity. Every active task must have a durable `task_id::`.
 Mutation commands must resolve exactly one active canonical task ID. Titles,
 list positions, quick IDs, legacy fallback IDs, and fuzzy matches are diagnostic
 or suggestion fields only.
+
+Dedup with the same identity rule (added 2026-06-30). When deduplicating board
+rows during a rollover or a one-time reconcile, dedup id-bearing rows by
+`task_id` ONLY. A matching title may suppress a *bare / no-id* duplicate line, but
+a title alone must never merge two id-bearing rows — two distinct tasks that share
+a title would be silently collapsed and one lost. An ambiguous or partial match
+becomes a confirmation **candidate**, never an auto-merge. This is the direct
+dedup corollary of the mutation-identity rule above; see
+`../architecture-patterns/llm-maintained-board-deterministic-rollover-and-mutation-guardrail.md`.
 
 Separate evidence from mutation. Completion evidence from daily notes, EOD
 summaries, Telegram, Lobster, calendar, email, or sessions should be scanned into
