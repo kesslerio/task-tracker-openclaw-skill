@@ -24,8 +24,10 @@ with a file `write`/`edit`/`apply_patch` tool or shell `sed` — doing so strips
 section plus a bare "All Tasks" copy), and resurrects ledger-closed tasks as open,
 corrupting every standup, nag, and weekly review downstream.
 
-- **Add / complete / reschedule:** `python3 scripts/tasks.py add|done|reschedule`
-  (assigns and preserves the canonical `task_id::`).
+- **Add / complete / reschedule / cancel:** `python3 scripts/tasks.py add|done|reschedule|remove`
+  (assigns and preserves the canonical `task_id::`). `remove` cancels a task by
+  canonical id — it records a cancellation, not a completion (no `✅`, not counted
+  in done/velocity).
 - **Weekly rollover (creating the new week's board):** `python3 scripts/rollover.py`
   — the deterministic, ledger-aware rollover. It carries forward open tasks with
   their `task_id::` intact, never re-lists a ledger-closed task as open, and emits
