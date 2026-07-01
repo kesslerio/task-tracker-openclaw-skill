@@ -255,7 +255,7 @@ def test_rejected_or_disabled_envelope_routes_to_candidate_without_auto(
     assert payload["envelope_reason"] == expected_reason
     assert payload["decision_reason"] == (expected_reason or "autowrite-disabled")
     assert work.read_text() == original
-    expected_events = ["candidate_seen", capture_envelope.SEEN_EVENT_TYPE] if case == "flag-off" else ["candidate_seen"]
+    expected_events = [capture_envelope.SEEN_EVENT_TYPE, "candidate_seen"] if case == "flag-off" else ["candidate_seen"]
     assert _event_types(tmp_path) == expected_events
     if case == "flag-off":
         [seen] = _seen_events(tmp_path)
@@ -283,7 +283,7 @@ def test_verified_disabled_envelope_consumes_message_id_before_replay(tmp_path, 
     assert second["envelope_reason"] == "replayed-message-id"
     assert second["decision_reason"] == "replayed-message-id"
     assert work.read_text() == original
-    assert _event_types(tmp_path) == ["candidate_seen", capture_envelope.SEEN_EVENT_TYPE]
+    assert _event_types(tmp_path) == [capture_envelope.SEEN_EVENT_TYPE, "candidate_seen"]
     [seen] = _seen_events(tmp_path)
     assert seen["metadata"]["message_id"] == "disabled-replay"
     assert seen["metadata"]["outcome"] == "autowrite-disabled"
@@ -306,7 +306,7 @@ def test_verified_task_not_found_envelope_consumes_message_id_before_replay(tmp_
     assert second["envelope_reason"] == "replayed-message-id"
     assert second["decision_reason"] == "replayed-message-id"
     assert work.read_text() == original
-    assert _event_types(tmp_path) == ["candidate_seen", capture_envelope.SEEN_EVENT_TYPE]
+    assert _event_types(tmp_path) == [capture_envelope.SEEN_EVENT_TYPE, "candidate_seen"]
     [seen] = _seen_events(tmp_path)
     assert seen["metadata"]["message_id"] == "missing-replay"
     assert seen["metadata"]["outcome"] == "auto-task-not-found"
@@ -470,7 +470,7 @@ def test_envelope_title_or_fuzzy_match_does_not_authorize_auto(tmp_path, monkeyp
     assert payload["decision_reason"] == "auto-task-not-found"
     assert payload["task_id"] == "tsk_ship"
     assert work.read_text() == original
-    assert _event_types(tmp_path) == ["candidate_seen", capture_envelope.SEEN_EVENT_TYPE]
+    assert _event_types(tmp_path) == [capture_envelope.SEEN_EVENT_TYPE, "candidate_seen"]
     [seen] = _seen_events(tmp_path)
     assert seen["metadata"]["message_id"] == "title-id"
     assert seen["metadata"]["outcome"] == "auto-task-not-found"
@@ -527,7 +527,7 @@ def test_recurring_task_in_envelope_becomes_candidate_never_auto(tmp_path, monke
     assert payload["decision_reason"] == "recurring-task"
     assert payload["task_id"] == "tsk_weekly"
     assert work.read_text() == original
-    assert _event_types(tmp_path) == ["candidate_seen", capture_envelope.SEEN_EVENT_TYPE]
+    assert _event_types(tmp_path) == [capture_envelope.SEEN_EVENT_TYPE, "candidate_seen"]
     [seen] = _seen_events(tmp_path)
     assert seen["metadata"]["message_id"] == "recurring"
     assert seen["metadata"]["outcome"] == "recurring-task"
