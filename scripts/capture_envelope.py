@@ -7,6 +7,8 @@ import hashlib
 import hmac
 import json
 import os
+import sys
+from argparse import ArgumentParser
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -152,3 +154,37 @@ def verify_envelope(
         return EnvelopeVerification(False, envelope=envelope, reason="stale-timestamp")
 
     return EnvelopeVerification(True, envelope=envelope)
+
+
+def _sign_cli(raw_json: str) -> int:
+    key = os.getenv(SECRET_ENV)
+    if not key:
+        print(f"{SECRET_ENV} is required", file=sys.stderr)
+        return 2
+
+    envelope = parse_envelope(raw_json)
+    if envelope is None:
+        print("envelope JSON must be an object", file=sys.stderr)
+        return 2
+
+    signed = sign_envelope(envelope, key)
+    print(json.dumps(signed, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    sign_parser = subparsers.add_parser("sign", help="Sign an envelope JSON object")
+    sign_parser.add_argument("--json", required=True, help="Envelope JSON object without sig")
+
+    args = parser.parse_args(argv)
+    if args.command == "sign":
+        return _sign_cli(args.json)
+    parser.error(f"unknown command: {args.command}")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

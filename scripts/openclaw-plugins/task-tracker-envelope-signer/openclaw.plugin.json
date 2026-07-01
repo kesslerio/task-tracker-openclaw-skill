@@ -1,0 +1,42 @@
+{
+  "id": "task-tracker-envelope-signer",
+  "name": "Task Tracker Envelope Signer",
+  "description": "Owner-verifies strict Telegram done <task_id> messages, signs a task-tracker capture envelope via capture_envelope.py, and invokes capture --envelope. Non-owner and free prose never sign.",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": true,
+    "properties": {
+      "commands": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "ownerAllowFrom": {
+            "type": "array",
+            "items": { "type": ["string", "number"] }
+          },
+          "envelopeSignerAllowChats": {
+            "type": "array",
+            "items": {
+              "anyOf": [
+                { "type": ["string", "number"] },
+                {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "required": ["chatId"],
+                  "properties": {
+                    "chatId": { "type": ["string", "number"] },
+                    "threadId": { "type": ["string", "number"] },
+                    "topicId": { "type": ["string", "number"] }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}

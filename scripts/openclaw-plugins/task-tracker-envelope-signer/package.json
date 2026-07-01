@@ -1,0 +1,11 @@
+{
+  "name": "task-tracker-envelope-signer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenClaw inbound-message plugin: owner-verifies strict done <task_id> text, signs a capture envelope via capture_envelope.py, and invokes the task tracker capture lane.",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test-handler.mjs"
+  }
+}

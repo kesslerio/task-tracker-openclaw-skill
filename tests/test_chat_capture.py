@@ -144,6 +144,15 @@ def test_resolve_for_auto_is_exact_active_task_id_only(tmp_path):
     )
     assert resolve_for_auto("legacy_x", legacy_catalog) is None
 
+    objective_catalog = build_task_catalog(
+        task_records(
+            "# Objectives 2026\n\n## Objectives\n- [ ] **Grow revenue** task_id::tsk_objective #Sales\n  - [ ] **Call leads** task_id::tsk_child\n",
+            fmt="obsidian",
+        )
+    )
+    assert resolve_for_auto("tsk_objective", objective_catalog) is None
+    assert resolve_for_auto("tsk_child", objective_catalog).canonical_id == "tsk_child"
+
 
 def test_valid_signed_envelope_autowrites_exact_non_recurring_task(tmp_path, monkeypatch):
     work = _write_work_file(tmp_path)
@@ -531,6 +540,33 @@ def test_recurring_task_in_envelope_becomes_candidate_never_auto(tmp_path, monke
     [seen] = _seen_events(tmp_path)
     assert seen["metadata"]["message_id"] == "recurring"
     assert seen["metadata"]["outcome"] == "recurring-task"
+
+
+def test_objective_task_id_in_envelope_falls_back_not_found_never_auto(tmp_path, monkeypatch):
+    work = _write_work_file(
+        tmp_path,
+        """# Objectives 2026
+
+## Objectives
+- [ ] **Grow revenue** task_id::tsk_objective #Sales
+  - [ ] **Call leads** task_id::tsk_child
+""",
+    )
+    original = work.read_text()
+    _apply_env(monkeypatch, tmp_path, work, autowrite="true")
+
+    payload = chat_capture.capture_text(
+        envelope=_envelope_json(task_id="tsk_objective", message_id="objective-envelope"),
+    )
+
+    assert payload["action"] == "candidate"
+    assert payload["decision_reason"] == "auto-task-not-found"
+    assert payload["task_id"] == "tsk_objective"
+    assert work.read_text() == original
+    assert _event_types(tmp_path) == [capture_envelope.SEEN_EVENT_TYPE, "candidate_seen"]
+    [seen] = _seen_events(tmp_path)
+    assert seen["metadata"]["message_id"] == "objective-envelope"
+    assert seen["metadata"]["outcome"] == "auto-task-not-found"
 
 
 def test_raw_chat_finished_statement_is_candidate_not_auto_even_when_flag_on(tmp_path, monkeypatch):
