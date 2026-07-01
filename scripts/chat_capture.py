@@ -400,18 +400,27 @@ def _envelope_candidate_text(envelope: dict[str, Any] | None, fallback_text: str
     return fallback_text or ""
 
 
-def _envelope_seen_event(envelope: dict[str, Any], completion_event: dict[str, Any]) -> dict[str, Any]:
+def _envelope_seen_event(
+    envelope: dict[str, Any],
+    completion_event: dict[str, Any] | None = None,
+    *,
+    outcome: str | None = None,
+) -> dict[str, Any]:
+    metadata = {
+        "message_id": envelope_message_id(envelope),
+        "sender": envelope.get("sender"),
+        "channel": envelope.get("channel"),
+        "envelope_timestamp": envelope.get("timestamp"),
+    }
+    if completion_event is not None:
+        metadata["completion_event_id"] = completion_event.get("event_id")
+    if outcome is not None:
+        metadata["outcome"] = outcome
     return new_event(
         SEEN_EVENT_TYPE,
         task_id=str(envelope.get("task_id") or "").strip(),
         source="chat_capture",
-        metadata={
-            "message_id": envelope_message_id(envelope),
-            "sender": envelope.get("sender"),
-            "channel": envelope.get("channel"),
-            "envelope_timestamp": envelope.get("timestamp"),
-            "completion_event_id": completion_event.get("event_id"),
-        },
+        metadata=metadata,
     )
 
 
@@ -473,7 +482,7 @@ def _handle_envelope(
     else:
         fallback_reason = verification.reason or "unverified-envelope"
 
-    return verification, _candidate_or_miss_action(
+    action = _candidate_or_miss_action(
         text=_envelope_candidate_text(parsed_envelope, text),
         catalog=catalog,
         source_pointer=source_pointer,
@@ -481,6 +490,12 @@ def _handle_envelope(
         personal=personal,
         suppress_negated_candidate=False,
     )
+    if verified:
+        append_event(
+            _envelope_seen_event(parsed_envelope or {}, outcome=fallback_reason),
+            path=_capture_ledger_path(personal),
+        )
+    return verification, action
 
 
 def capture_text(

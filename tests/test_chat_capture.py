@@ -68,6 +68,10 @@ def _event_types(tmp_path):
     return [event["event_type"] for event in _events(tmp_path)]
 
 
+def _seen_events(tmp_path):
+    return [event for event in _events(tmp_path) if event["event_type"] == capture_envelope.SEEN_EVENT_TYPE]
+
+
 def _envelope_json(
     *,
     task_id="tsk_ship",
@@ -216,7 +220,86 @@ def test_rejected_or_disabled_envelope_routes_to_candidate_without_auto(
     assert payload["envelope_reason"] == expected_reason
     assert payload["decision_reason"] == (expected_reason or "autowrite-disabled")
     assert work.read_text() == original
-    assert _event_types(tmp_path) == ["candidate_seen"]
+    expected_events = ["candidate_seen", capture_envelope.SEEN_EVENT_TYPE] if case == "flag-off" else ["candidate_seen"]
+    assert _event_types(tmp_path) == expected_events
+    if case == "flag-off":
+        [seen] = _seen_events(tmp_path)
+        assert seen["metadata"]["message_id"] == "msg-1"
+        assert seen["metadata"]["outcome"] == "autowrite-disabled"
+    else:
+        assert _seen_events(tmp_path) == []
+
+
+def test_verified_disabled_envelope_consumes_message_id_before_replay(tmp_path, monkeypatch):
+    work = _write_work_file(tmp_path)
+    original = work.read_text()
+    _apply_env(monkeypatch, tmp_path, work, autowrite="false")
+    raw = _envelope_json(message_id="disabled-replay")
+
+    first = chat_capture.capture_text(envelope=raw)
+    monkeypatch.setenv("TASK_TRACKER_CAPTURE_AUTOWRITE_ENABLED", "true")
+    second = chat_capture.capture_text(envelope=raw)
+
+    assert first["action"] == "candidate"
+    assert first["envelope_verified"] is True
+    assert first["decision_reason"] == "autowrite-disabled"
+    assert second["action"] == "candidate"
+    assert second["envelope_verified"] is False
+    assert second["envelope_reason"] == "replayed-message-id"
+    assert second["decision_reason"] == "replayed-message-id"
+    assert work.read_text() == original
+    assert _event_types(tmp_path) == ["candidate_seen", capture_envelope.SEEN_EVENT_TYPE]
+    [seen] = _seen_events(tmp_path)
+    assert seen["metadata"]["message_id"] == "disabled-replay"
+    assert seen["metadata"]["outcome"] == "autowrite-disabled"
+
+
+def test_verified_task_not_found_envelope_consumes_message_id_before_replay(tmp_path, monkeypatch):
+    work = _write_work_file(tmp_path)
+    original = work.read_text()
+    _apply_env(monkeypatch, tmp_path, work, autowrite="true")
+    raw = _envelope_json(task_id="Ship alpha milestone", message_id="missing-replay")
+
+    first = chat_capture.capture_text(envelope=raw)
+    second = chat_capture.capture_text(envelope=raw)
+
+    assert first["action"] == "candidate"
+    assert first["envelope_verified"] is True
+    assert first["decision_reason"] == "auto-task-not-found"
+    assert second["action"] == "candidate"
+    assert second["envelope_verified"] is False
+    assert second["envelope_reason"] == "replayed-message-id"
+    assert second["decision_reason"] == "replayed-message-id"
+    assert work.read_text() == original
+    assert _event_types(tmp_path) == ["candidate_seen", capture_envelope.SEEN_EVENT_TYPE]
+    [seen] = _seen_events(tmp_path)
+    assert seen["metadata"]["message_id"] == "missing-replay"
+    assert seen["metadata"]["outcome"] == "auto-task-not-found"
+
+
+def test_invalid_signature_envelope_does_not_consume_message_id(tmp_path, monkeypatch):
+    work = _write_work_file(tmp_path)
+    _apply_env(monkeypatch, tmp_path, work, autowrite="true")
+    envelope = json.loads(_envelope_json(message_id="bad-then-valid"))
+    envelope["sig"] = "0" * 64
+
+    first = chat_capture.capture_text(envelope=json.dumps(envelope))
+
+    assert first["action"] == "candidate"
+    assert first["envelope_verified"] is False
+    assert first["envelope_reason"] == "invalid-signature"
+    assert _seen_events(tmp_path) == []
+
+    second = chat_capture.capture_text(envelope=_envelope_json(message_id="bad-then-valid"))
+
+    assert second["action"] == "auto"
+    assert second["envelope_verified"] is True
+    assert second["task_id"] == "tsk_ship"
+    assert "Ship alpha milestone" not in work.read_text()
+    assert _event_types(tmp_path) == ["candidate_seen", "state_transition", capture_envelope.SEEN_EVENT_TYPE]
+    [seen] = _seen_events(tmp_path)
+    assert seen["metadata"]["message_id"] == "bad-then-valid"
+    assert "outcome" not in seen["metadata"]
 
 
 def test_prior_verified_envelope_message_id_blocks_replay(tmp_path, monkeypatch):
@@ -352,7 +435,10 @@ def test_envelope_title_or_fuzzy_match_does_not_authorize_auto(tmp_path, monkeyp
     assert payload["decision_reason"] == "auto-task-not-found"
     assert payload["task_id"] == "tsk_ship"
     assert work.read_text() == original
-    assert _event_types(tmp_path) == ["candidate_seen"]
+    assert _event_types(tmp_path) == ["candidate_seen", capture_envelope.SEEN_EVENT_TYPE]
+    [seen] = _seen_events(tmp_path)
+    assert seen["metadata"]["message_id"] == "title-id"
+    assert seen["metadata"]["outcome"] == "auto-task-not-found"
 
 
 def test_quoted_raw_text_is_suppressed_to_miss_not_confirmable_candidate(tmp_path, monkeypatch):
@@ -406,7 +492,10 @@ def test_recurring_task_in_envelope_becomes_candidate_never_auto(tmp_path, monke
     assert payload["decision_reason"] == "recurring-task"
     assert payload["task_id"] == "tsk_weekly"
     assert work.read_text() == original
-    assert _event_types(tmp_path) == ["candidate_seen"]
+    assert _event_types(tmp_path) == ["candidate_seen", capture_envelope.SEEN_EVENT_TYPE]
+    [seen] = _seen_events(tmp_path)
+    assert seen["metadata"]["message_id"] == "recurring"
+    assert seen["metadata"]["outcome"] == "recurring-task"
 
 
 def test_raw_chat_finished_statement_is_candidate_not_auto_even_when_flag_on(tmp_path, monkeypatch):
