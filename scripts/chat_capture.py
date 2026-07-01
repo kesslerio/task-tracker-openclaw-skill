@@ -15,6 +15,7 @@ from typing import Any
 from capture_envelope import (
     SEEN_EVENT_TYPE,
     current_time,
+    envelope_channel,
     envelope_message_id,
     message_ids_from_events,
     parse_timestamp,
@@ -409,7 +410,7 @@ def _envelope_seen_event(
     metadata = {
         "message_id": envelope_message_id(envelope),
         "sender": envelope.get("sender"),
-        "channel": envelope.get("channel"),
+        "channel": envelope_channel(envelope),
         "envelope_timestamp": envelope.get("timestamp"),
     }
     if completion_event is not None:

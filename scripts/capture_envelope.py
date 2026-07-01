@@ -15,6 +15,7 @@ SECRET_ENV = "TASK_TRACKER_CAPTURE_ENVELOPE_SECRET"
 NOW_ENV = "TASK_TRACKER_CAPTURE_NOW"
 FRESHNESS_SECONDS = 300
 SEEN_EVENT_TYPE = "capture_envelope_seen"
+ReplayMessageKey = tuple[str, str]
 
 
 @dataclass(frozen=True)
@@ -77,22 +78,36 @@ def envelope_message_id(envelope: dict[str, Any] | None) -> str | None:
     return None
 
 
-def message_ids_from_events(events: list[dict[str, Any]]) -> set[str]:
-    seen: set[str] = set()
+def envelope_channel(envelope: dict[str, Any] | None) -> str:
+    channel = (envelope or {}).get("channel")
+    if isinstance(channel, str):
+        return channel.strip()
+    return ""
+
+
+def envelope_replay_key(envelope: dict[str, Any] | None) -> ReplayMessageKey | None:
+    message_id = envelope_message_id(envelope)
+    if message_id is None:
+        return None
+    return (envelope_channel(envelope), message_id)
+
+
+def message_ids_from_events(events: list[dict[str, Any]]) -> set[ReplayMessageKey]:
+    seen: set[ReplayMessageKey] = set()
     for event in events:
         if event.get("event_type") != SEEN_EVENT_TYPE:
             continue
         metadata = event.get("metadata") or {}
-        message_id = metadata.get("message_id")
-        if isinstance(message_id, str) and message_id.strip():
-            seen.add(message_id.strip())
+        replay_key = envelope_replay_key(metadata)
+        if replay_key is not None:
+            seen.add(replay_key)
     return seen
 
 
 def verify_envelope(
     raw: str | dict[str, Any],
     *,
-    seen_message_ids: set[str] | None = None,
+    seen_message_ids: set[ReplayMessageKey] | None = None,
     now: datetime | None = None,
     secret: str | None = None,
     freshness_seconds: int = FRESHNESS_SECONDS,
@@ -107,7 +122,8 @@ def verify_envelope(
     message_id = envelope_message_id(envelope)
     if not message_id:
         return EnvelopeVerification(False, envelope=envelope, reason="missing-message-id")
-    if message_id in (seen_message_ids or set()):
+    replay_key = (envelope_channel(envelope), message_id)
+    if replay_key in (seen_message_ids or set()):
         return EnvelopeVerification(False, envelope=envelope, reason="replayed-message-id")
 
     key = secret if secret is not None else os.getenv(SECRET_ENV)

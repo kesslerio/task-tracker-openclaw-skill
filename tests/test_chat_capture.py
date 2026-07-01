@@ -75,6 +75,7 @@ def _seen_events(tmp_path):
 def _envelope_json(
     *,
     task_id="tsk_ship",
+    channel="telegram",
     message_id="msg-1",
     timestamp=NOW,
     intent="complete",
@@ -83,7 +84,7 @@ def _envelope_json(
     envelope = {
         "v": 1,
         "sender": "sender-123",
-        "channel": "telegram",
+        "channel": channel,
         "message_id": message_id,
         "timestamp": timestamp,
         "task_id": task_id,
@@ -160,7 +161,41 @@ def test_valid_signed_envelope_autowrites_exact_non_recurring_task(tmp_path, mon
     assert events[0]["source"] == "chat_capture"
     assert events[0]["metadata"]["completion_id"] == payload["completion_id"]
     assert events[1]["metadata"]["message_id"] == "msg-1"
+    assert events[1]["metadata"]["channel"] == "telegram"
     assert events[1]["metadata"]["completion_event_id"] == payload["completion_id"]
+
+
+def test_same_message_id_on_different_channels_both_auto_complete(tmp_path, monkeypatch):
+    work = _write_work_file(tmp_path)
+    _apply_env(monkeypatch, tmp_path, work, autowrite="true")
+
+    first = chat_capture.capture_text(
+        envelope=_envelope_json(task_id="tsk_ship", channel="telegram", message_id="shared-gateway-id"),
+    )
+    second = chat_capture.capture_text(
+        envelope=_envelope_json(task_id="tsk_login", channel="slack", message_id="shared-gateway-id"),
+    )
+
+    assert first["action"] == "auto"
+    assert first["envelope_verified"] is True
+    assert first["task_id"] == "tsk_ship"
+    assert second["action"] == "auto"
+    assert second["envelope_verified"] is True
+    assert second["task_id"] == "tsk_login"
+    assert "Ship alpha milestone" not in work.read_text()
+    assert "Fix login timeout" not in work.read_text()
+    assert _event_types(tmp_path) == [
+        "state_transition",
+        capture_envelope.SEEN_EVENT_TYPE,
+        "state_transition",
+        capture_envelope.SEEN_EVENT_TYPE,
+    ]
+    seen_events = _seen_events(tmp_path)
+    assert [event["metadata"]["message_id"] for event in seen_events] == [
+        "shared-gateway-id",
+        "shared-gateway-id",
+    ]
+    assert [event["metadata"]["channel"] for event in seen_events] == ["telegram", "slack"]
 
 
 def test_valid_signed_envelope_strips_task_id_before_auto_complete(tmp_path, monkeypatch):
@@ -318,7 +353,7 @@ def test_prior_verified_envelope_message_id_blocks_replay(tmp_path, monkeypatch)
         "next_state": None,
         "reason": None,
         "evidence": None,
-        "metadata": {"message_id": "replay-me"},
+        "metadata": {"channel": "telegram", "message_id": "replay-me"},
     }
     (tmp_path / "events.jsonl").write_text(json.dumps(seen_event) + "\n")
 
