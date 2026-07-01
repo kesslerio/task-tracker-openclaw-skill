@@ -15,7 +15,7 @@ import task_records as task_record_module
 from autonomy import board_snapshot, resolve_board_restore
 from locks import sidecar_flock
 from log_done import log_task_completed
-from task_lines import line_index, remove_task_line, replace_task_line
+from task_lines import line_index, remove_task_line, replace_task_line, task_line_block
 from task_records import active_records, load_records
 from task_ledger import append_event, ledger_path, new_event, read_events
 from utils import next_recurrence_date, _atomic_write
@@ -315,6 +315,35 @@ def _later_unreverted_terminal_event(
     return None
 
 
+def _valid_removed_block(removed_block: Any, raw_line: str) -> bool:
+    if not isinstance(removed_block, str) or not removed_block.strip():
+        return False
+    return removed_block.split("\n", 1)[0] == raw_line
+
+
+def _contains_line_block(lines: list[str], block_lines: list[str]) -> bool:
+    block_len = len(block_lines)
+    return any(lines[index:index + block_len] == block_lines for index in range(len(lines) - block_len + 1))
+
+
+def _restore_removed_block_content(restored_content: str, raw_line: str, removed_block: str) -> str | None:
+    if removed_block == raw_line:
+        return restored_content
+
+    lines = restored_content.split("\n")
+    block_lines = removed_block.split("\n")
+    if _contains_line_block(lines, block_lines):
+        return restored_content
+
+    matches = [index for index, line in enumerate(lines) if line == raw_line]
+    if len(matches) != 1:
+        return None
+
+    index = matches[0]
+    lines[index:index + 1] = block_lines
+    return "\n".join(lines)
+
+
 def complete_by_id(
     task_id: str,
     personal: bool = False,
@@ -371,6 +400,7 @@ def complete_by_id(
                 },
             }
         next_line = None
+        removed_block = None
         if recur_value:
             try:
                 from_date = due_value or datetime.now().date().isoformat()
@@ -386,6 +416,7 @@ def complete_by_id(
                     },
                 }
         else:
+            removed_block = task_line_block(content, record.raw_line, record.line_number)
             new_content = remove_task_line(content, record.raw_line, record.line_number)
         if new_content is None:
             return {
@@ -396,6 +427,20 @@ def complete_by_id(
                 },
             }
 
+        metadata = {
+            "title": record.title,
+            "line_number": record.line_number,
+            "board_snapshot": board_snapshot(
+                tasks_file,
+                record.raw_line,
+                record.line_number,
+                content=content,
+                post_raw_line=next_line,
+            ),
+        }
+        if removed_block is not None:
+            metadata["removed_block"] = removed_block
+
         event = new_event(
             "state_transition",
             task_id=task_id,
@@ -403,17 +448,7 @@ def complete_by_id(
             previous_state="active",
             next_state="done",
             reason="explicit-done-by-canonical-id",
-            metadata={
-                "title": record.title,
-                "line_number": record.line_number,
-                "board_snapshot": board_snapshot(
-                    tasks_file,
-                    record.raw_line,
-                    record.line_number,
-                    content=content,
-                    post_raw_line=next_line,
-                ),
-            },
+            metadata=metadata,
         )
         event["metadata"]["completion_id"] = event["event_id"]
         extra_events = extra_events_factory(event) if extra_events_factory else []
@@ -686,8 +721,30 @@ def revert_completion(completion_id: str, personal: bool = False) -> dict:
                 },
             }
 
+        raw_line = str(snapshot.get("raw_line") or "")
+        restores_removed_block = snapshot.get("post_raw_line") is None
+        removed_block = metadata.get("removed_block")
+        if restores_removed_block and not _valid_removed_block(removed_block, raw_line):
+            return {
+                "ok": False,
+                "error": {
+                    "code": "revert-block-unrecoverable",
+                    "message": "Completion removed a task block, but the exact removed block is unavailable; nothing was changed.",
+                },
+            }
+
         restore = resolve_board_restore(board_content, snapshot)
         if not restore.get("ok"):
+            if restores_removed_block:
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "revert-block-unrecoverable",
+                        "message": "Completion task block restore position could not be resolved; nothing was changed.",
+                        "reason": restore.get("reason"),
+                        "candidates": restore.get("candidates"),
+                    },
+                }
             return {
                 "ok": False,
                 "error": {
@@ -697,6 +754,23 @@ def revert_completion(completion_id: str, personal: bool = False) -> dict:
                     "candidates": restore.get("candidates"),
                 },
             }
+
+        new_board_content = str(restore.get("new_content", board_content))
+        if restores_removed_block:
+            restored_block_content = _restore_removed_block_content(
+                new_board_content,
+                raw_line,
+                removed_block,
+            )
+            if restored_block_content is None:
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "revert-block-unrecoverable",
+                        "message": "Completion task block restore position could not be reconstructed; nothing was changed.",
+                    },
+                }
+            new_board_content = restored_block_content
 
         if not daily_path.exists() or not daily_path.is_file():
             return {
@@ -754,7 +828,6 @@ def revert_completion(completion_id: str, personal: bool = False) -> dict:
 
         write_stage = "board-write"
         try:
-            new_board_content = str(restore.get("new_content", board_content))
             if new_board_content != board_content:
                 _atomic_write(tasks_file, new_board_content)
             write_stage = "completion-log"

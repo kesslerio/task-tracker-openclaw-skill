@@ -1068,6 +1068,41 @@ def test_revert_completion_round_trip_non_recurring(tmp_path, monkeypatch):
     assert post_done_count == pre_done_count
 
 
+def test_revert_completion_restores_indented_child_block(tmp_path, monkeypatch):
+    work = tmp_path / "Work Tasks.md"
+    original = """# Work
+
+## 🔴 Q1
+- [ ] **Parent** task_id::tsk_p area:: Delivery
+  - [ ] child a
+  - note under parent
+- [ ] **Other task** task_id::tsk_other area:: Ops
+"""
+    work.write_text(original)
+    env = _env(tmp_path, work)
+    _apply_env(monkeypatch, env, work)
+
+    completed = task_transitions.complete_by_id("tsk_p")
+
+    assert completed["ok"] is True
+    assert work.read_text() == """# Work
+
+## 🔴 Q1
+- [ ] **Other task** task_id::tsk_other area:: Ops
+"""
+    metadata = completed["event"]["metadata"]
+    assert metadata["removed_block"] == "\n".join([
+        "- [ ] **Parent** task_id::tsk_p area:: Delivery",
+        "  - [ ] child a",
+        "  - note under parent",
+    ])
+
+    reverted = task_transitions.revert_completion(completed["completion_id"])
+
+    assert reverted["ok"] is True
+    assert work.read_text() == original
+
+
 def test_revert_completion_is_idempotent(tmp_path, monkeypatch):
     work = tmp_path / "Work Tasks.md"
     original = """# Work
@@ -1119,7 +1154,7 @@ def test_revert_completion_conflict_changes_nothing(tmp_path, monkeypatch):
     result = task_transitions.revert_completion(completion_id)
 
     assert result["ok"] is False
-    assert result["error"]["code"] == "board-restore-conflict"
+    assert result["error"]["code"] == "revert-block-unrecoverable"
     assert result["error"]["reason"] == "conflict-duplicate"
     assert work.read_text() == drifted
     assert daily_path.read_text() == daily_before
