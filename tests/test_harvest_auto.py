@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import eod_ritual
+import completion_candidates
 import harvest_auto
 import harvest_ledger
 import utils
@@ -446,9 +447,74 @@ def test_flag_on_calendar_declined_or_future_event_does_not_auto_complete(env, m
     result = _run_auto()
 
     assert result["completed"] == []
-    assert [candidate["matched_task_id"] for candidate in result["candidates"]] == ["tsk_future"]
+    assert result["candidates"] == []
+    durable = completion_candidates.project_candidates(personal=False)
+    assert len(durable) == 1
+    assert durable[0]["source"]["source"] == "calendar"
+    assert durable[0]["low_trust"] is True
+    assert durable[0]["candidate_only"] is True
+    assert durable[0]["auto_done_eligible"] is False
     assert "tsk_cal" in env["work"].read_text()
     assert "tsk_future" in env["work"].read_text()
+
+
+def test_low_trust_adapter_records_persist_candidates_and_never_auto_complete(env, monkeypatch):
+    _enable_auto(monkeypatch)
+    monkeypatch.setattr(harvest_ledger, "harvest_github", lambda *args, **kwargs: ([], False))
+    monkeypatch.setattr(harvest_ledger, "harvest_gmail", lambda *args, **kwargs: ([], False))
+    monkeypatch.setattr(
+        harvest_auto.calendar_adapter,
+        "harvest",
+        lambda **kwargs: (
+            [
+                {
+                    "source": "calendar",
+                    "kind": "commitment",
+                    "provider_id": "evt_future",
+                    "provider_state": "status=confirmed;response=accepted;updated=fixture",
+                    "occurred_at": "2026-06-23T15:00:00-07:00",
+                    "match_title": "Camp coordination for June task_id::tsk_def456",
+                    "title": "Camp coordination for June task_id::tsk_def456",
+                    "url": "https://calendar.example.test/evt_future",
+                }
+            ],
+            False,
+        ),
+    )
+    monkeypatch.setattr(
+        harvest_auto.dialpad_adapter,
+        "harvest",
+        lambda **kwargs: (
+            [
+                {
+                    "source": "dialpad_sms",
+                    "kind": "activity",
+                    "provider_id": "sms:+15550101010:2026-06-23",
+                    "provider_state": "outbound=2;chars=48;sha256=fixturehash",
+                    "occurred_at": "2026-06-23T09:00:00-07:00",
+                    "match_title": "SMS thread with +1 (555) 010-1010 (2 sent)",
+                    "title": "SMS thread with +1 (555) 010-1010 (2 sent)",
+                }
+            ],
+            False,
+        ),
+    )
+
+    def fail_complete(*_args, **_kwargs):
+        raise AssertionError("low-trust adapter evidence must not reach complete_by_id")
+
+    monkeypatch.setattr(harvest_auto, "complete_by_id", fail_complete)
+
+    result = _run_auto()
+    durable = completion_candidates.project_candidates(personal=False)
+
+    assert result["completed"] == []
+    assert result["candidates"] == []
+    assert result["low_trust_candidates"]["totals"]["created"] == 2
+    assert {candidate["source"]["source"] for candidate in durable} == {"calendar", "dialpad_sms"}
+    assert all(candidate["low_trust"] is True for candidate in durable)
+    assert all(candidate["candidate_only"] is True for candidate in durable)
+    assert all(candidate["auto_done_eligible"] is False for candidate in durable)
 
 
 def test_flag_on_recurring_exact_match_stays_candidate(env, monkeypatch):

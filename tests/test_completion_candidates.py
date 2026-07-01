@@ -3,12 +3,15 @@ import json
 import os
 import subprocess
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import completion_candidates
+import evidence_matching
+import harvest_window
+import standup_harvest
 import task_records
 import task_transitions
 
@@ -171,6 +174,239 @@ def test_scan_preserves_original_source_line_number(tmp_path):
     )
 
     assert payload["created"][0]["source"]["line_number"] == 3
+
+
+def test_scheduled_calendar_becomes_candidate(tmp_path, monkeypatch):
+    work = _write_work_file(tmp_path)
+    original = work.read_text()
+    env = _env(tmp_path, work)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(evidence_matching, "get_tasks_file", lambda personal=False: (work, "obsidian"))
+    future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+
+    payload = completion_candidates.scan_adapter_records(
+        [
+            {
+                "source": "calendar",
+                "kind": "commitment",
+                "provider_id": "calendar-fixture-event",
+                "provider_state": "status=confirmed;response=accepted;updated=fixture",
+                "occurred_at": future,
+                "match_title": "Ship alpha milestone task_id::tsk_ship",
+                "title": "Ship alpha milestone task_id::tsk_ship",
+            }
+        ]
+    )
+
+    candidate = payload["created"][0]
+    assert payload["totals"]["created"] == 1
+    assert candidate["source"]["source"] == "calendar"
+    assert candidate["low_trust"] is True
+    assert candidate["candidate_only"] is True
+    assert candidate["auto_done_eligible"] is False
+    assert candidate["confirmable_task_id"] == "tsk_ship"
+    assert work.read_text() == original
+    assert [event["event_type"] for event in _ledger_events(tmp_path)] == ["candidate_seen"]
+
+
+def test_sms_becomes_candidate(tmp_path, monkeypatch):
+    work = _write_work_file(tmp_path)
+    original = work.read_text()
+    env = _env(tmp_path, work)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(evidence_matching, "get_tasks_file", lambda personal=False: (work, "obsidian"))
+
+    payload = completion_candidates.scan_adapter_records(
+        [
+            {
+                "source": "dialpad_sms",
+                "kind": "activity",
+                "provider_id": "sms:+15550101010:2026-07-01",
+                "provider_state": "outbound=2;chars=48;sha256=fixturehash",
+                "occurred_at": "2026-07-01T09:00:00+00:00",
+                "match_title": "SMS thread with +1 (555) 010-1010 (2 sent)",
+                "title": "SMS thread with +1 (555) 010-1010 (2 sent)",
+            }
+        ]
+    )
+
+    candidate = payload["created"][0]
+    assert payload["totals"]["created"] == 1
+    assert candidate["source"]["source"] == "dialpad_sms"
+    assert candidate["summary"] == "SMS thread with <contact> (2 sent)"
+    assert candidate["low_trust"] is True
+    assert candidate["candidate_only"] is True
+    assert candidate["auto_done_eligible"] is False
+    assert work.read_text() == original
+    assert [event["event_type"] for event in _ledger_events(tmp_path)] == ["candidate_seen"]
+
+
+def test_sms_candidate_ids_include_provider_identity_after_masking(tmp_path, monkeypatch):
+    work = _write_work_file(tmp_path)
+    env = _env(tmp_path, work)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(evidence_matching, "get_tasks_file", lambda personal=False: (work, "obsidian"))
+
+    payload = completion_candidates.scan_adapter_records(
+        [
+            {
+                "source": "dialpad_sms",
+                "kind": "activity",
+                "provider_id": "sms:+15550101010:2026-07-01",
+                "provider_state": "outbound=2;chars=48;sha256=fixturehash-a",
+                "occurred_at": "2026-07-01T09:00:00+00:00",
+                "match_title": "SMS thread with +1 (555) 010-1010 (2 sent)",
+                "title": "SMS thread with +1 (555) 010-1010 (2 sent)",
+            },
+            {
+                "source": "dialpad_sms",
+                "kind": "activity",
+                "provider_id": "sms:+15550102020:2026-07-01",
+                "provider_state": "outbound=2;chars=48;sha256=fixturehash-b",
+                "occurred_at": "2026-07-01T09:30:00+00:00",
+                "match_title": "SMS thread with +1 (555) 020-2020 (2 sent)",
+                "title": "SMS thread with +1 (555) 020-2020 (2 sent)",
+            },
+        ]
+    )
+
+    candidate_ids = {candidate["candidate_id"] for candidate in payload["created"]}
+    assert payload["totals"]["created"] == 2
+    assert len(candidate_ids) == 2
+    assert {candidate["summary"] for candidate in payload["created"]} == {"SMS thread with <contact> (2 sent)"}
+    assert [event["event_type"] for event in _ledger_events(tmp_path)] == ["candidate_seen", "candidate_seen"]
+
+
+def test_no_raw_sms_body_or_phone_in_candidate(tmp_path, monkeypatch):
+    work = _write_work_file(tmp_path)
+    env = _env(tmp_path, work)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(evidence_matching, "get_tasks_file", lambda personal=False: (work, "obsidian"))
+    raw_phone = "+1 (555) 010-2020"
+    raw_body = "fixture raw body: shipped the alpha milestone"
+
+    payload = completion_candidates.scan_adapter_records(
+        [
+            {
+                "source": "dialpad_sms",
+                "kind": "activity",
+                "provider_id": f"sms:{raw_phone}:2026-07-01",
+                "provider_state": "outbound=3;chars=91;sha256=fixturehash",
+                "occurred_at": "2026-07-01T09:00:00+00:00",
+                "match_title": f"SMS thread with {raw_phone} (3 sent)",
+                "title": f"SMS thread with {raw_phone} (3 sent)",
+                "body": raw_body,
+                "text": raw_body,
+            }
+        ]
+    )
+
+    serialized_candidate = json.dumps(payload["created"][0], sort_keys=True)
+    ledger_text = (tmp_path / "events.jsonl").read_text()
+    assert payload["created"][0]["title"] == "SMS thread with <contact> (3 sent)"
+    assert raw_phone not in serialized_candidate
+    assert raw_body not in serialized_candidate
+    assert raw_phone not in ledger_text
+    assert raw_body not in ledger_text
+
+
+def test_body_style_sms_title_is_replaced_not_passed_through(tmp_path, monkeypatch):
+    work = _write_work_file(tmp_path)
+    env = _env(tmp_path, work)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(evidence_matching, "get_tasks_file", lambda personal=False: (work, "obsidian"))
+    raw_title = "shipped alpha at 3pm"
+
+    payload = completion_candidates.scan_adapter_records(
+        [
+            {
+                "source": "dialpad_sms",
+                "kind": "activity",
+                "provider_id": "sms:+15550103030:2026-07-01",
+                "provider_state": "outbound=4;chars=91;sha256=fixturehash",
+                "occurred_at": "2026-07-01T09:00:00+00:00",
+                "match_title": raw_title,
+                "title": raw_title,
+            }
+        ]
+    )
+
+    candidate = payload["created"][0]
+    assert candidate["title"] == "SMS thread with <contact> (4 sent)"
+    assert raw_title not in candidate["title"]
+    assert raw_title not in candidate["summary"]
+    assert raw_title not in candidate["raw_summary"]
+
+
+def test_low_trust_calendar_classification_response_status_and_malformed_records():
+    declined = {
+        "source": "calendar",
+        "kind": "activity",
+        "provider_state": "status=confirmed;response=declined;updated=fixture",
+        "title": "Declined sync",
+    }
+    tentative = {
+        "source": "calendar",
+        "kind": "activity",
+        "response": "tentative",
+        "title": "Tentative sync",
+    }
+    accepted = {
+        "source": "calendar",
+        "kind": "activity",
+        "provider_state": "status=confirmed;response=accepted;updated=fixture",
+        "title": "Accepted sync",
+    }
+
+    assert completion_candidates._is_low_trust_calendar(declined) is True
+    assert completion_candidates._is_low_trust_calendar(tentative) is True
+    assert completion_candidates._is_low_trust_calendar(accepted) is False
+    assert completion_candidates._is_low_trust_adapter_record({}) is False
+    assert completion_candidates._is_low_trust_adapter_record({"kind": "activity", "title": 123}) is False
+
+
+def test_standup_harvest_persists_low_trust_adapter_candidates(tmp_path, monkeypatch):
+    work = _write_work_file(tmp_path)
+    env = _env(tmp_path, work)
+    env["TASK_MGMT_STATE_DIR"] = str(tmp_path / "state")
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(evidence_matching, "get_tasks_file", lambda personal=False: (work, "obsidian"))
+    monkeypatch.setattr(standup_harvest.standup_summarizer, "summarize", lambda *_args, **_kwargs: {})
+    resolved = harvest_window.resolve_standup_window(target_date=date(2026, 7, 1))
+
+    def harvest_source(source, **_kwargs):
+        if source == "dialpad_sms":
+            return [
+                {
+                    "source": "dialpad_sms",
+                    "kind": "activity",
+                    "provider_id": "sms:+15550104040:2026-07-01",
+                    "provider_state": "outbound=2;chars=48;sha256=fixturehash",
+                    "occurred_at": resolved.evidence_start.isoformat(),
+                    "match_title": "SMS thread with +1 (555) 040-4040 (2 sent)",
+                    "title": "SMS thread with +1 (555) 040-4040 (2 sent)",
+                }
+            ], False
+        return [], False
+
+    monkeypatch.setattr(standup_harvest, "_harvest_source", harvest_source)
+
+    result = standup_harvest.harvest(trigger="test", resolved_window=resolved)
+    durable = completion_candidates.project_candidates(personal=False)
+
+    assert len(result["evidence_candidates"]) == 1
+    assert len(durable) == 1
+    assert durable[0]["source"]["source"] == "dialpad_sms"
+    assert durable[0]["summary"] == "SMS thread with <contact> (2 sent)"
+    assert durable[0]["low_trust"] is True
+    assert durable[0]["candidate_only"] is True
+    assert durable[0]["auto_done_eligible"] is False
 
 
 def test_title_candidate_requires_explicit_task_id_before_confirmation(tmp_path):
@@ -386,6 +622,53 @@ def test_apply_failed_keeps_candidate_retryable_and_board_unchanged(tmp_path):
     assert payload["error"]["code"] == "canonical-id-resolution-failed"
     assert payload["candidate"]["status"] == "apply_failed"
     assert any(event["event_type"] == "candidate_apply_failed" for event in _ledger_events(tmp_path))
+
+
+def test_stale_candidate_confirm_closes_as_duplicate(tmp_path):
+    work = _write_work_file(tmp_path)
+    env = _env(tmp_path, work)
+    scan = _scan_file(tmp_path, env, "- Ship alpha milestone task_id::tsk_ship\n")
+    candidate_id = _candidate_id(scan)
+
+    done = _run(["done", "tsk_ship"], env)
+    proc = _run(["completion-candidates", "confirm", candidate_id], env)
+    payload = _payload(proc)
+    listed = _payload(_run(["completion-candidates", "list"], env))
+
+    events = _ledger_events(tmp_path)
+    event_types = [event["event_type"] for event in events]
+    assert done.returncode == 0
+    assert proc.returncode == 0
+    assert payload["ok"] is True
+    assert payload["candidate"]["status"] == "duplicate"
+    assert payload["candidate"]["duplicate_of_task_id"] == "tsk_ship"
+    assert not str(payload["candidate"].get("duplicate_of") or "").startswith("tsk_")
+    assert event_types == ["candidate_seen", "state_transition", "candidate_duplicate"]
+    assert "candidate_apply_failed" not in event_types
+    assert listed["total"] == 0
+
+
+def test_stale_cancelled_candidate_confirm_closes_as_duplicate(tmp_path):
+    work = _write_work_file(tmp_path)
+    env = _env(tmp_path, work)
+    scan = _scan_file(tmp_path, env, "- Ship alpha milestone task_id::tsk_ship\n")
+    candidate_id = _candidate_id(scan)
+
+    cancelled = _run(["remove", "tsk_ship"], env)
+    proc = _run(["completion-candidates", "confirm", candidate_id], env)
+    payload = _payload(proc)
+    listed = _payload(_run(["completion-candidates", "list"], env))
+
+    events = _ledger_events(tmp_path)
+    event_types = [event["event_type"] for event in events]
+    assert cancelled.returncode == 0
+    assert proc.returncode == 0
+    assert payload["ok"] is True
+    assert payload["candidate"]["status"] == "duplicate"
+    assert payload["candidate"]["duplicate_of_task_id"] == "tsk_ship"
+    assert not str(payload["candidate"].get("duplicate_of") or "").startswith("tsk_")
+    assert event_types == ["candidate_seen", "state_transition", "candidate_duplicate"]
+    assert listed["total"] == 0
 
 
 def test_scan_rejects_conflicting_file_and_date_sources(tmp_path):
