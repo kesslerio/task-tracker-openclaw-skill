@@ -98,6 +98,15 @@ def test_calendar_queries_u1_window_without_today(monkeypatch):
     assert "2026-06-24T00:00:00-07:00" in cmd
 
 
+def test_unconfigured_returns_degraded(monkeypatch):
+    monkeypatch.delenv("STANDUP_CALENDARS", raising=False)
+
+    records, failed = calendar_adapter.harvest(resolved=_resolved(), trigger="test")
+
+    assert records == []
+    assert failed is True
+
+
 def test_past_accepted_event_is_activity(monkeypatch):
     _configure(monkeypatch, [_event("evt_1", "Planning review", "2026-06-23T09:00:00-07:00")])
 

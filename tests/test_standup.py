@@ -177,7 +177,15 @@ def _standup_subprocess_env(tmp_path: Path, *, state_name: str) -> dict[str, str
             "TASK_TRACKER_DONE_LOG_DIR": str(daily),
             "TASK_TRACKER_LEDGER_FILE": str(state_dir / "events.jsonl"),
             "TASK_TRACKER_ERROR_LOG": str(state_dir / "errors.jsonl"),
-            "STANDUP_CALENDARS": "{}",
+            "STANDUP_CALENDARS": json.dumps(
+                {
+                    "work": {
+                        "cmd": "gog",
+                        "calendar_id": "cal_fixture",
+                        "account": "owner@example.test",
+                    }
+                }
+            ),
             "STANDUP_SUMMARIZER_ENABLED": "0",
             "COS_TIMEZONE": "America/Los_Angeles",
         }
