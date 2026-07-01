@@ -483,6 +483,15 @@ def _handle_envelope(
     else:
         fallback_reason = verification.reason or "unverified-envelope"
 
+    # Consume the nonce BEFORE the candidate/miss side effect so a crash between
+    # the two ledger appends fails safe: the verified envelope is marked seen
+    # (never replayable), at worst dropping a candidate rather than leaving a
+    # signed message reusable for a later auto-complete.
+    if verified:
+        append_event(
+            _envelope_seen_event(parsed_envelope or {}, outcome=fallback_reason),
+            path=_capture_ledger_path(personal),
+        )
     action = _candidate_or_miss_action(
         text=_envelope_candidate_text(parsed_envelope, text),
         catalog=catalog,
@@ -491,11 +500,6 @@ def _handle_envelope(
         personal=personal,
         suppress_negated_candidate=False,
     )
-    if verified:
-        append_event(
-            _envelope_seen_event(parsed_envelope or {}, outcome=fallback_reason),
-            path=_capture_ledger_path(personal),
-        )
     return verification, action
 
 
