@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import subprocess
@@ -78,6 +79,19 @@ def _candidate_id(payload, index=0):
     return payload["created"][index]["candidate_id"]
 
 
+def _legacy_candidate_id(source, summary):
+    stable = {
+        "source_type": source.get("type"),
+        "source_path": source.get("path"),
+        "source_date": source.get("date"),
+        "line_number": source.get("line_number"),
+        "timestamp": source.get("timestamp"),
+        "summary": " ".join((summary or "").casefold().split()),
+    }
+    material = json.dumps(stable, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return f"cand_{hashlib.sha256(material.encode('utf-8')).hexdigest()[:20]}"
+
+
 def _ledger_events(tmp_path):
     ledger = tmp_path / "events.jsonl"
     if not ledger.exists():
@@ -97,6 +111,52 @@ def test_scan_dedupes_same_evidence_without_task_mutation(tmp_path):
     assert second["totals"]["created"] == 0
     assert second["totals"]["existing"] == 1
     assert work.read_text() == original
+    assert [event["event_type"] for event in _ledger_events(tmp_path)] == ["candidate_seen"]
+
+
+def test_scan_dedupes_legacy_file_candidate_hash_without_chat_keys(tmp_path):
+    work = _write_work_file(tmp_path)
+    env = _env(tmp_path, work)
+    source = tmp_path / "done.md"
+    source.write_text("- Ship alpha milestone task_id::tsk_ship\n")
+    source_pointer = {"type": "file", "path": str(source), "line_number": 1}
+    summary = "Ship alpha milestone task_id::tsk_ship"
+    legacy_id = _legacy_candidate_id(source_pointer, summary)
+    legacy_event = {
+        "event_id": "evt_legacy_file_candidate",
+        "event_type": "candidate_seen",
+        "timestamp": "2026-05-21T00:00:00+00:00",
+        "actor": "task-tracker",
+        "source": "completion_candidate_scan",
+        "task_id": legacy_id,
+        "previous_state": None,
+        "next_state": None,
+        "reason": None,
+        "evidence": None,
+        "metadata": {
+            "candidate": {
+                "candidate_id": legacy_id,
+                "status": "new",
+                "source": source_pointer,
+                "summary": summary,
+                "matched_task_id": "tsk_ship",
+                "match_metadata": {
+                    "matched_task_id": "tsk_ship",
+                    "match_type": "exact-id-or-link",
+                    "decision": "evidence-link",
+                    "score": 1.0,
+                },
+            }
+        },
+    }
+    (tmp_path / "events.jsonl").write_text(json.dumps(legacy_event) + "\n")
+
+    payload = _payload(_run(["completion-candidates", "scan", "--file", str(source)], env))
+
+    assert completion_candidates.candidate_id_for(source_pointer, summary) == legacy_id
+    assert payload["totals"]["created"] == 0
+    assert payload["totals"]["existing"] == 1
+    assert payload["existing"][0]["candidate_id"] == legacy_id
     assert [event["event_type"] for event in _ledger_events(tmp_path)] == ["candidate_seen"]
 
 

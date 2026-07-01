@@ -20,6 +20,8 @@ import completion_candidates
 # Every event_type the spec requires Phase 0a to register (Contract 1).
 REQUIRED_NEW_TYPES = [
     "system_error",
+    "capture_miss",
+    "capture_envelope_seen",
     "agent_action", "state_transition_reverted", "pre_action_snapshot",
     "pre_action_snapshot_cancelled",
     "focus_proposed", "focus_approved", "focus_vetoed", "wip_cap_enforced",
@@ -52,6 +54,10 @@ def test_all_required_types_are_registered():
 
 def test_agent_autonomous_source_recognised():
     assert "agent_autonomous" in task_ledger.KNOWN_EVENT_SOURCES
+
+
+def test_chat_capture_source_recognised():
+    assert "chat_capture" in task_ledger.KNOWN_EVENT_SOURCES
 
 
 def test_registered_type_emits_no_warning():

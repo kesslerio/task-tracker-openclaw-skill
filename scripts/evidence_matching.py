@@ -154,6 +154,107 @@ def build_task_catalog(records: list) -> list[dict[str, Any]]:
     return catalog
 
 
+def resolve_for_auto(task_id: str | None, catalog: list[dict[str, Any]]):
+    """Resolve only an exact active task_id for trusted gateway auto-complete."""
+    if not isinstance(task_id, str) or not task_id.strip():
+        return None
+    normalized_task_id = task_id.strip()
+    matches = [
+        candidate["record"]
+        for candidate in catalog
+        if (candidate.get("canonical") or {}).get("task_id") == normalized_task_id
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _candidate_sort_key(candidate: dict[str, Any]) -> str:
+    canonical = candidate["canonical"]
+    return canonical.get("task_id") or canonical.get("fallback_id") or canonical.get("title") or ""
+
+
+def _candidate_identity(candidate: dict[str, Any]) -> str:
+    canonical = candidate["canonical"]
+    return (
+        canonical.get("task_id")
+        or canonical.get("fallback_id")
+        or f"{canonical.get('title') or ''}\0{canonical.get('raw_line') or ''}"
+    )
+
+
+def match_evidence_all(
+    line: dict[str, Any],
+    catalog: list[dict[str, Any]],
+    *,
+    fuzzy_limit: int = 5,
+) -> dict[str, Any]:
+    """Return every plausible task match for an evidence statement.
+
+    ``match_evidence_line`` intentionally preserves the legacy single-best
+    contract. This companion API exposes the runner-up set that auto-writers need
+    for ambiguity and margin checks: all exact identifier/link hits, all fallback
+    issue-number hits, all normalized-title collisions, and the top-N fuzzy scores.
+    Matches are de-duplicated by task identity while preserving every match type
+    that applied to that task.
+    """
+
+    matches_by_identity: dict[str, dict[str, Any]] = {}
+
+    def add_match(candidate: dict[str, Any], *, score: float, match_type: str) -> None:
+        identity = _candidate_identity(candidate)
+        canonical = candidate["canonical"]
+        existing = matches_by_identity.get(identity)
+        rounded_score = round(float(score), 4)
+        if existing is None:
+            matches_by_identity[identity] = {
+                "canonical_task": canonical,
+                "matched_task_id": canonical.get("task_id"),
+                "score": rounded_score,
+                "match_type": match_type,
+                "match_types": [match_type],
+            }
+            return
+        if rounded_score > float(existing.get("score") or 0.0):
+            existing["score"] = rounded_score
+            existing["match_type"] = match_type
+        if match_type not in existing["match_types"]:
+            existing["match_types"].append(match_type)
+
+    for candidate in sorted(catalog, key=_candidate_sort_key):
+        if line["exact_identifiers"] and (line["exact_identifiers"] & candidate["exact_identifiers"]):
+            add_match(candidate, score=1.0, match_type="exact-id-or-link")
+
+    for candidate in sorted(catalog, key=_candidate_sort_key):
+        if line["fallback_identifiers"] and (line["fallback_identifiers"] & candidate["fallback_identifiers"]):
+            add_match(candidate, score=0.6, match_type="issue-number-fallback")
+
+    for candidate in sorted(catalog, key=_candidate_sort_key):
+        if candidate["normalized_title"] == line["normalized_title"]:
+            add_match(candidate, score=1.0, match_type="normalized-title")
+
+    scored = []
+    for candidate in catalog:
+        score = fuzzy_score(line["normalized_title"], candidate["normalized_title"])
+        scored.append((score, _candidate_sort_key(candidate), candidate))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    for score, _sort_key, candidate in scored[:max(0, fuzzy_limit)]:
+        add_match(candidate, score=score, match_type="fuzzy")
+
+    matches = sorted(
+        matches_by_identity.values(),
+        key=lambda item: (
+            -float(item.get("score") or 0.0),
+            item.get("matched_task_id") or (item.get("canonical_task") or {}).get("fallback_id") or "",
+        ),
+    )
+
+    return {
+        "raw_line": line["raw_line"],
+        "parsed_title": line["title"],
+        "normalized_title": line["normalized_title"],
+        "matches": matches,
+    }
+
+
 def match_evidence_line(
     line: dict[str, Any],
     catalog: list[dict[str, Any]],

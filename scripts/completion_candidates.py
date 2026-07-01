@@ -54,6 +54,10 @@ def candidate_id_for(source: dict[str, Any], summary: str) -> str:
         "timestamp": source.get("timestamp"),
         "summary": _normalize_summary(summary),
     }
+    for key in ("channel", "sender", "message_id"):
+        value = source.get(key)
+        if value is not None:
+            stable[key] = value
     material = json.dumps(stable, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return f"cand_{hashlib.sha256(material.encode('utf-8')).hexdigest()[:20]}"
 

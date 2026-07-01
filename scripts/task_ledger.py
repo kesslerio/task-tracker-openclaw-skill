@@ -87,6 +87,8 @@ KNOWN_EVENT_TYPES: frozenset[str] = frozenset({
     "candidate_duplicate",
     "candidate_expired",
     "candidate_apply_failed",
+    "capture_miss",
+    "capture_envelope_seen",
     # U1 -- trust foundation.
     "system_error",
     # U2 -- autonomy & audit substrate.
@@ -172,6 +174,7 @@ KNOWN_EVENT_SOURCES: frozenset[str] = frozenset({
     "cli",
     "user_command",
     "completion_candidate_cli",
+    "chat_capture",
     "metadata_repair",
     "ledger_agent",
     "agent_autonomous",
