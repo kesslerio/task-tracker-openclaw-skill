@@ -128,8 +128,14 @@ check(ackText({ ok: true, action: "carry" }).includes("Carried"), "carry success
 check(ackText({ ok: true, action: "drop" }).includes("Dropped"), "drop success ack");
 check(ackText({ ok: true, action: "approve" }).includes("Confirmed"), "approve success ack");
 check(ackText({ ok: true, action: "top" }).includes("#1"), "top success ack");
+check(/edited since the completion/.test(ackText({ ok: true, action: "revert", overwrote_edit: true })),
+  "revert success ack warns when an intervening edit was overwritten");
 check(/Already actioned/i.test(ackText({ ok: false, error: { code: "canonical-id-resolution-failed" } })),
   "stale (already done / not on board) -> clean 'already actioned' ack, not a failure");
+check(/Already actioned/i.test(ackText({ ok: false, error: { code: "completion-out-of-window" } })),
+  "out-of-window undo -> clean stale ack, not a failure");
+check(/Already actioned/i.test(ackText({ ok: false, error: { code: "revert-target-mismatch" } })),
+  "target-mismatch undo -> clean stale ack, not a failure");
 check(/Already actioned/i.test(ackText({ ok: false, reason: "stale-approval" })), "stale-approval -> clean ack");
 check(/Already actioned/i.test(ackText({ ok: false, reason: "no-open-nag" })), "no-open-nag -> clean ack");
 check(/Couldn't action|logged/i.test(ackText({ ok: false, reason: "wrong-topic" })),

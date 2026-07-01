@@ -28,6 +28,8 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const LOG_PREFIX = "[task-tracker-interactive]";
+const REVERT_OVERWROTE_EDIT_WARNING =
+  " ⚠️ this line had been edited since the completion, so that edit was reverted too.";
 
 // This file lives at <repo>/scripts/openclaw-plugins/task-tracker-interactive/index.js, so the
 // repo root is four directories up. Deriving it from the module's own location (rather than a
@@ -52,7 +54,7 @@ function namespace() {
 // The actions that run a command once on tap (terminal one-shot). `rsch` is NOT here: a bare
 // `rsch` (no date) opens the date-option keyboard instead of running, so it is handled as an
 // edit. `rsch:<date>` IS a run (the payload carries a colon), routed by hasArg below.
-const ONE_SHOT = new Set(["done", "start", "snz", "carry", "drop", "appr", "top"]);
+const ONE_SHOT = new Set(["done", "start", "snz", "carry", "drop", "appr", "top", "undo"]);
 
 // Pure routing decision — NO side effects, NO authorization — so it is unit-testable without a
 // live gateway. `payload` is the "<action>:<task_id>[:<arg>]" part AFTER the namespace; senderId
@@ -174,6 +176,8 @@ export function ackText(result) {
     case "drop": return "🗑️ Dropped to the parking lot.";
     case "approve": return "✅ Confirmed.";
     case "top": return "⭐ Set as tomorrow's #1.";
+    case "revert":
+      return `↩️ Reverted.${r.overwrote_edit === true ? REVERT_OVERWROTE_EDIT_WARNING : ""}`;
     default: return "✅ Done.";
   }
 }
@@ -185,7 +189,14 @@ export function ackText(result) {
 const STALE_REASONS = new Set([
   "already_actioned", "already_done", "no-open-nag", "stale-approval", "stale",
 ]);
-const STALE_CODES = new Set(["canonical-id-resolution-failed"]);
+const STALE_CODES = new Set([
+  "canonical-id-resolution-failed",
+  "completion-already-reverted",
+  "completion-out-of-window",
+  "revert-target-mismatch",
+  "revert-out-of-order",
+  "completion-snapshot-missing",
+]);
 export function isStale(result) {
   const r = result || {};
   if (STALE_REASONS.has(r.reason)) return true;
