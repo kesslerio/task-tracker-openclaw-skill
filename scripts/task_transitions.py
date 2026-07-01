@@ -6,14 +6,17 @@ from __future__ import annotations
 import json
 import os
 import re
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
+import task_records as task_record_module
+from locks import sidecar_flock
 from log_done import log_task_completed
 from task_lines import line_index, remove_task_line, replace_task_line
 from task_records import active_records, load_records
-from task_ledger import append_event, ledger_path, new_event
+from task_ledger import append_event, ledger_path, new_event, read_events
 from utils import next_recurrence_date, _atomic_write
 
 INLINE_FIELD_RE = re.compile(r"\s+[A-Za-z_][A-Za-z0-9_-]*::")
@@ -23,6 +26,13 @@ DUE_RE = re.compile(r"(?:🗓️\s*|📅\s*)(\d{4}-\d{2}-\d{2})")
 # task as carried-from-yesterday. It is plain inline metadata (KTD-7): no new board
 # status field, the task stays ACTIVE.
 CARRIED_RE = re.compile(r"\s*carried::\s*\d{4}-\d{2}-\d{2}")
+
+
+@contextmanager
+def board_flock(target: Path) -> Iterator[None]:
+    """Hold the exclusive sidecar flock guarding a board rewrite."""
+    with sidecar_flock(target):
+        yield
 
 
 def _set_due_date(raw_line: str, due_date: str) -> str:
@@ -101,6 +111,11 @@ def _daily_log_file() -> Path | None:
     return Path(raw_dir).expanduser() / f"{datetime.now().strftime('%Y-%m-%d')}.md"
 
 
+def _tasks_file_for_board(personal: bool) -> Path:
+    tasks_file, _fmt = task_record_module.get_tasks_file(personal)
+    return tasks_file
+
+
 def _preflight_ledger(tasks_file: Path) -> dict | None:
     try:
         target = ledger_path(tasks_file)
@@ -137,10 +152,91 @@ def _resolve_by_id(task_id: str, personal: bool = False):
             "error": {
                 "code": "canonical-id-resolution-failed",
                 "message": f"Expected exactly one active task for canonical ID {task_id}; found {len(matches)}.",
+                "matches_found": len(matches),
                 "repair_choices": ["identity-audit", "identity-repair --dry-run"],
             },
         }
     return tasks_file, content, matches[0], None
+
+
+def _latest_terminal_event(
+    events: list[dict],
+    task_id: str,
+    terminal_states: set[str],
+) -> dict | None:
+    for event in reversed(events):
+        if event.get("event_type") != "state_transition":
+            continue
+        if event.get("task_id") != task_id:
+            continue
+        if event.get("next_state") in terminal_states:
+            return event
+    return None
+
+
+def _terminal_noop_result(
+    tasks_file: Path,
+    task_id: str,
+    personal: bool,
+    terminal_states: set[str],
+) -> dict | None:
+    try:
+        _resolved_file, _content, records = load_records(personal)
+    except FileNotFoundError:
+        records = []
+
+    matches = [record for record in records if record.canonical_id == task_id]
+    done_matches = [record for record in matches if record.done]
+    if "done" in terminal_states and len(done_matches) == 1:
+        record = done_matches[0]
+        return {
+            "ok": False,
+            "task_id": task_id,
+            "title": record.title,
+            "noop": True,
+            "reason": "already-done",
+            "error": {
+                "code": "canonical-id-resolution-failed",
+                "message": f"Task {task_id} is already done; no task state was changed.",
+            },
+        }
+
+    terminal_event = _latest_terminal_event(
+        read_events(ledger_path(tasks_file)),
+        task_id,
+        terminal_states,
+    )
+    if terminal_event is None:
+        return None
+
+    state = terminal_event.get("next_state") or "terminal"
+    return {
+        "ok": False,
+        "task_id": task_id,
+        "title": (terminal_event.get("metadata") or {}).get("title"),
+        "noop": True,
+        "reason": f"already-{state}",
+        "error": {
+            "code": "canonical-id-resolution-failed",
+            "message": f"Task {task_id} is already {state}; no task state was changed.",
+        },
+    }
+
+
+def _maybe_terminal_noop(
+    tasks_file: Path,
+    task_id: str,
+    personal: bool,
+    error: dict,
+    terminal_states: set[str],
+) -> dict | None:
+    detail = error.get("error") or {}
+    if (
+        detail.get("code") != "canonical-id-resolution-failed"
+        or detail.get("matches_found") != 0
+    ):
+        return None
+    return _terminal_noop_result(tasks_file, task_id, personal, terminal_states)
 
 
 def complete_by_id(
@@ -149,120 +245,123 @@ def complete_by_id(
     source: str = "user_command",
     extra_events_factory: Callable[[dict], list[dict]] | None = None,
 ) -> dict:
-    tasks_file, content, record, error = _resolve_by_id(task_id, personal)
-    if error:
-        return error
-    ledger_error = _preflight_ledger(tasks_file)
-    if ledger_error:
-        return ledger_error
+    lock_file = _tasks_file_for_board(personal)
+    with board_flock(lock_file):
+        tasks_file, content, record, error = _resolve_by_id(task_id, personal)
+        if error:
+            noop = _maybe_terminal_noop(tasks_file or lock_file, task_id, personal, error, {"done", "cancelled"})
+            return noop or error
+        ledger_error = _preflight_ledger(tasks_file)
+        if ledger_error:
+            return ledger_error
 
-    event = new_event(
-        "state_transition",
-        task_id=task_id,
-        source=source,
-        previous_state="active",
-        next_state="done",
-        reason="explicit-done-by-canonical-id",
-        metadata={"title": record.title, "line_number": record.line_number},
-    )
-    extra_events = extra_events_factory(event) if extra_events_factory else []
-
-    due_value = _extract_due_date(record.raw_line)
-    recur_value = _extract_recur_value(record.raw_line) or ""
-    if record.line_number is None:
-        return {
-            "ok": False,
-            "error": {
-                "code": "task-line-resolution-failed",
-                "message": "Resolved task has no stable line number; active board was not changed.",
-            },
-        }
-    if recur_value:
-        try:
-            from_date = due_value or datetime.now().date().isoformat()
-            next_due = next_recurrence_date(recur_value, from_date)
-            next_line = _set_due_date(record.raw_line, next_due)
-            new_content = replace_task_line(content, record.raw_line, next_line, record.line_number)
-        except ValueError as exc:
-            return {
-                "ok": False,
-                "error": {
-                    "code": "recurrence-rollover-failed",
-                    "message": f"Recurring task could not be rolled forward; active board was not changed: {exc}",
-                },
-            }
-    else:
-        new_content = remove_task_line(content, record.raw_line, record.line_number)
-    if new_content is None:
-        return {
-            "ok": False,
-            "error": {
-                "code": "task-line-resolution-failed",
-                "message": "Resolved task line no longer matches the active board; active board was not changed.",
-            },
-        }
-
-    daily_log_file = _daily_log_file()
-    snapshots = {tasks_file: (True, content)}
-    if daily_log_file is not None:
-        daily_snapshot = _snapshot_regular(daily_log_file)
-        if daily_snapshot is not None:
-            snapshots[daily_log_file] = daily_snapshot
-    ledger_file = ledger_path(tasks_file)
-    ledger_snapshot = _snapshot_regular(ledger_file)
-    if ledger_snapshot is not None:
-        snapshots[ledger_file] = ledger_snapshot
-
-    write_stage = "completion-log"
-    try:
-        logged = log_task_completed(
-            title=record.title,
-            section=record.section,
-            area=record.area,
-            due=due_value,
-            recur=recur_value or None,
-            context={"task_id": task_id, "source": source},
+        event = new_event(
+            "state_transition",
+            task_id=task_id,
+            source=source,
+            previous_state="active",
+            next_state="done",
+            reason="explicit-done-by-canonical-id",
+            metadata={"title": record.title, "line_number": record.line_number},
         )
-        if not logged:
+        extra_events = extra_events_factory(event) if extra_events_factory else []
+
+        due_value = _extract_due_date(record.raw_line)
+        recur_value = _extract_recur_value(record.raw_line) or ""
+        if record.line_number is None:
             return {
                 "ok": False,
                 "error": {
-                    "code": "completion-log-failed",
-                    "message": "Daily-note completion log failed; active board was not changed.",
+                    "code": "task-line-resolution-failed",
+                    "message": "Resolved task has no stable line number; active board was not changed.",
+                },
+            }
+        if recur_value:
+            try:
+                from_date = due_value or datetime.now().date().isoformat()
+                next_due = next_recurrence_date(recur_value, from_date)
+                next_line = _set_due_date(record.raw_line, next_due)
+                new_content = replace_task_line(content, record.raw_line, next_line, record.line_number)
+            except ValueError as exc:
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "recurrence-rollover-failed",
+                        "message": f"Recurring task could not be rolled forward; active board was not changed: {exc}",
+                    },
+                }
+        else:
+            new_content = remove_task_line(content, record.raw_line, record.line_number)
+        if new_content is None:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "task-line-resolution-failed",
+                    "message": "Resolved task line no longer matches the active board; active board was not changed.",
                 },
             }
 
-        write_stage = "board-write"
-        _atomic_write(tasks_file, new_content)
-        write_stage = "ledger-append"
-        append_event(event, path=ledger_path(tasks_file))
-        for extra_event in extra_events:
-            append_event(extra_event, path=ledger_path(tasks_file))
-    except OSError as exc:
-        restore_error = _restore_after_failure(snapshots)
-        code = "ledger-append-failed" if write_stage == "ledger-append" else "task-state-write-failed"
-        error = {
-            "code": code,
-            "message": f"Task completion write failed; snapshots were restored: {exc}",
-        }
-        if restore_error:
-            error["restore_error"] = restore_error
+        daily_log_file = _daily_log_file()
+        snapshots = {tasks_file: (True, content)}
+        if daily_log_file is not None:
+            daily_snapshot = _snapshot_regular(daily_log_file)
+            if daily_snapshot is not None:
+                snapshots[daily_log_file] = daily_snapshot
+        ledger_file = ledger_path(tasks_file)
+        ledger_snapshot = _snapshot_regular(ledger_file)
+        if ledger_snapshot is not None:
+            snapshots[ledger_file] = ledger_snapshot
+
+        write_stage = "completion-log"
+        try:
+            logged = log_task_completed(
+                title=record.title,
+                section=record.section,
+                area=record.area,
+                due=due_value,
+                recur=recur_value or None,
+                context={"task_id": task_id, "source": source},
+            )
+            if not logged:
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "completion-log-failed",
+                        "message": "Daily-note completion log failed; active board was not changed.",
+                    },
+                }
+
+            write_stage = "board-write"
+            _atomic_write(tasks_file, new_content)
+            write_stage = "ledger-append"
+            append_event(event, path=ledger_path(tasks_file))
+            for extra_event in extra_events:
+                append_event(extra_event, path=ledger_path(tasks_file))
+        except OSError as exc:
+            restore_error = _restore_after_failure(snapshots)
+            code = "ledger-append-failed" if write_stage == "ledger-append" else "task-state-write-failed"
+            error = {
+                "code": code,
+                "message": f"Task completion write failed; snapshots were restored: {exc}",
+            }
+            if restore_error:
+                error["restore_error"] = restore_error
+            return {
+                "ok": False,
+                "error": error,
+            }
         return {
-            "ok": False,
-            "error": error,
+            "ok": True,
+            "task_id": task_id,
+            "title": record.title,
+            "event": event,
+            "extra_events": extra_events,
+            # A recurring task is rolled forward (kept on the board with the same
+            # canonical_id and a new due date), not removed. Callers that key state on
+            # task_id (U4's nag loop) need this so they can RESET the loop for the next
+            # recurrence rather than mark it terminally acked.
+            "recurring": bool(recur_value),
         }
-    return {
-        "ok": True,
-        "task_id": task_id,
-        "title": record.title,
-        "event": event,
-        "extra_events": extra_events,
-        # A recurring task is rolled forward (kept on the board with the same
-        # canonical_id and a new due date), not removed. Callers that key state on
-        # task_id (U4's nag loop) need this so they can RESET the loop for the next
-        # recurrence rather than mark it terminally acked.
-        "recurring": bool(recur_value),
-    }
 
 
 def cancel_by_id(
@@ -270,76 +369,79 @@ def cancel_by_id(
     personal: bool = False,
     source: str = "user_command",
 ) -> dict:
-    tasks_file, content, record, error = _resolve_by_id(task_id, personal)
-    if error:
-        return error
-    ledger_error = _preflight_ledger(tasks_file)
-    if ledger_error:
-        return ledger_error
-    if record.line_number is None:
-        return {
-            "ok": False,
-            "error": {
-                "code": "task-line-resolution-failed",
-                "message": "Resolved task has no stable line number; active board was not changed.",
-            },
-        }
+    lock_file = _tasks_file_for_board(personal)
+    with board_flock(lock_file):
+        tasks_file, content, record, error = _resolve_by_id(task_id, personal)
+        if error:
+            noop = _maybe_terminal_noop(tasks_file or lock_file, task_id, personal, error, {"done", "cancelled"})
+            return noop or error
+        ledger_error = _preflight_ledger(tasks_file)
+        if ledger_error:
+            return ledger_error
+        if record.line_number is None:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "task-line-resolution-failed",
+                    "message": "Resolved task has no stable line number; active board was not changed.",
+                },
+            }
 
-    new_content = remove_task_line(content, record.raw_line, record.line_number)
-    if new_content is None:
-        return {
-            "ok": False,
-            "error": {
-                "code": "task-line-resolution-failed",
-                "message": "Resolved task line no longer matches the active board; active board was not changed.",
-            },
-        }
+        new_content = remove_task_line(content, record.raw_line, record.line_number)
+        if new_content is None:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "task-line-resolution-failed",
+                    "message": "Resolved task line no longer matches the active board; active board was not changed.",
+                },
+            }
 
-    event = new_event(
-        "state_transition",
-        task_id=task_id,
-        source=source,
-        previous_state="active",
-        next_state="cancelled",
-        reason="cancelled-by-id",
-        metadata={
+        event = new_event(
+            "state_transition",
+            task_id=task_id,
+            source=source,
+            previous_state="active",
+            next_state="cancelled",
+            reason="cancelled-by-id",
+            metadata={
+                "title": record.title,
+                "line_number": record.line_number,
+                "raw_line": record.raw_line,
+                "section": record.section,
+                "area": record.area,
+            },
+        )
+        snapshots = {tasks_file: (True, content)}
+        ledger_file = ledger_path(tasks_file)
+        ledger_snapshot = _snapshot_regular(ledger_file)
+        if ledger_snapshot is not None:
+            snapshots[ledger_file] = ledger_snapshot
+
+        write_stage = "board-write"
+        try:
+            _atomic_write(tasks_file, new_content)
+            write_stage = "ledger-append"
+            append_event(event, path=ledger_file)
+        except OSError as exc:
+            restore_error = _restore_after_failure(snapshots)
+            code = "ledger-append-failed" if write_stage == "ledger-append" else "task-state-write-failed"
+            error = {
+                "code": code,
+                "message": f"Task cancellation write failed; snapshots were restored: {exc}",
+            }
+            if restore_error:
+                error["restore_error"] = restore_error
+            return {
+                "ok": False,
+                "error": error,
+            }
+        return {
+            "ok": True,
+            "task_id": task_id,
             "title": record.title,
-            "line_number": record.line_number,
-            "raw_line": record.raw_line,
-            "section": record.section,
-            "area": record.area,
-        },
-    )
-    snapshots = {tasks_file: (True, content)}
-    ledger_file = ledger_path(tasks_file)
-    ledger_snapshot = _snapshot_regular(ledger_file)
-    if ledger_snapshot is not None:
-        snapshots[ledger_file] = ledger_snapshot
-
-    write_stage = "board-write"
-    try:
-        _atomic_write(tasks_file, new_content)
-        write_stage = "ledger-append"
-        append_event(event, path=ledger_file)
-    except OSError as exc:
-        restore_error = _restore_after_failure(snapshots)
-        code = "ledger-append-failed" if write_stage == "ledger-append" else "task-state-write-failed"
-        error = {
-            "code": code,
-            "message": f"Task cancellation write failed; snapshots were restored: {exc}",
+            "event": event,
         }
-        if restore_error:
-            error["restore_error"] = restore_error
-        return {
-            "ok": False,
-            "error": error,
-        }
-    return {
-        "ok": True,
-        "task_id": task_id,
-        "title": record.title,
-        "event": event,
-    }
 
 
 def reschedule_by_id(
@@ -365,55 +467,57 @@ def reschedule_by_id(
             "message": f"Due date must be YYYY-MM-DD; got {new_due!r}.",
         }}
 
-    tasks_file, content, record, error = _resolve_by_id(task_id, personal)
-    if error:
-        return error
-    ledger_error = _preflight_ledger(tasks_file)
-    if ledger_error:
-        return ledger_error
-    if record.line_number is None:
-        return {"ok": False, "error": {
-            "code": "task-line-resolution-failed",
-            "message": "Resolved task has no stable line number; active board was not changed.",
-        }}
+    lock_file = _tasks_file_for_board(personal)
+    with board_flock(lock_file):
+        tasks_file, content, record, error = _resolve_by_id(task_id, personal)
+        if error:
+            return error
+        ledger_error = _preflight_ledger(tasks_file)
+        if ledger_error:
+            return ledger_error
+        if record.line_number is None:
+            return {"ok": False, "error": {
+                "code": "task-line-resolution-failed",
+                "message": "Resolved task has no stable line number; active board was not changed.",
+            }}
 
-    new_line = _set_due_date(record.raw_line, new_due)
-    new_content = replace_task_line(content, record.raw_line, new_line, record.line_number)
-    if new_content is None:
-        return {"ok": False, "error": {
-            "code": "task-line-resolution-failed",
-            "message": "Resolved task line no longer matches the active board; active board was not changed.",
-        }}
+        new_line = _set_due_date(record.raw_line, new_due)
+        new_content = replace_task_line(content, record.raw_line, new_line, record.line_number)
+        if new_content is None:
+            return {"ok": False, "error": {
+                "code": "task-line-resolution-failed",
+                "message": "Resolved task line no longer matches the active board; active board was not changed.",
+            }}
 
-    old_due = _extract_due_date(record.raw_line)
-    event = new_event(
-        "state_transition",
-        task_id=task_id,
-        source=source,
-        previous_state="active",
-        next_state="active",
-        reason="rescheduled-by-canonical-id",
-        metadata={"title": record.title, "line_number": record.line_number,
-                  "previous_due": old_due, "new_due": new_due},
-    )
-    snapshots = {tasks_file: (True, content)}
-    ledger_file = ledger_path(tasks_file)
-    ledger_snapshot = _snapshot_regular(ledger_file)
-    if ledger_snapshot is not None:
-        snapshots[ledger_file] = ledger_snapshot
+        old_due = _extract_due_date(record.raw_line)
+        event = new_event(
+            "state_transition",
+            task_id=task_id,
+            source=source,
+            previous_state="active",
+            next_state="active",
+            reason="rescheduled-by-canonical-id",
+            metadata={"title": record.title, "line_number": record.line_number,
+                      "previous_due": old_due, "new_due": new_due},
+        )
+        snapshots = {tasks_file: (True, content)}
+        ledger_file = ledger_path(tasks_file)
+        ledger_snapshot = _snapshot_regular(ledger_file)
+        if ledger_snapshot is not None:
+            snapshots[ledger_file] = ledger_snapshot
 
-    try:
-        _atomic_write(tasks_file, new_content)
-        append_event(event, path=ledger_file)
-    except OSError as exc:
-        restore_error = _restore_after_failure(snapshots)
-        error = {"code": "task-state-write-failed",
-                 "message": f"Reschedule write failed; snapshots were restored: {exc}"}
-        if restore_error:
-            error["restore_error"] = restore_error
-        return {"ok": False, "error": error}
-    return {"ok": True, "task_id": task_id, "title": record.title,
-            "previous_due": old_due, "new_due": new_due, "event": event}
+        try:
+            _atomic_write(tasks_file, new_content)
+            append_event(event, path=ledger_file)
+        except OSError as exc:
+            restore_error = _restore_after_failure(snapshots)
+            error = {"code": "task-state-write-failed",
+                     "message": f"Reschedule write failed; snapshots were restored: {exc}"}
+            if restore_error:
+                error["restore_error"] = restore_error
+            return {"ok": False, "error": error}
+        return {"ok": True, "task_id": task_id, "title": record.title,
+                "previous_due": old_due, "new_due": new_due, "event": event}
 
 
 def carry_by_id(
@@ -437,56 +541,58 @@ def carry_by_id(
     idempotent -- ``_set_carried_marker`` refreshes the date rather than stacking
     markers. The ledger event is the registered ``eod_disposition_carry``.
     """
-    tasks_file, content, record, error = _resolve_by_id(task_id, personal)
-    if error:
-        return error
-    ledger_error = _preflight_ledger(tasks_file)
-    if ledger_error:
-        return ledger_error
-    if record.line_number is None:
-        return {"ok": False, "error": {
-            "code": "task-line-resolution-failed",
-            "message": "Resolved task has no stable line number; active board was not changed.",
-        }}
+    lock_file = _tasks_file_for_board(personal)
+    with board_flock(lock_file):
+        tasks_file, content, record, error = _resolve_by_id(task_id, personal)
+        if error:
+            return error
+        ledger_error = _preflight_ledger(tasks_file)
+        if ledger_error:
+            return ledger_error
+        if record.line_number is None:
+            return {"ok": False, "error": {
+                "code": "task-line-resolution-failed",
+                "message": "Resolved task has no stable line number; active board was not changed.",
+            }}
 
-    carried_date = carried_date or datetime.now().date().isoformat()
-    new_line = _set_carried_marker(record.raw_line, carried_date)
-    new_content = replace_task_line(content, record.raw_line, new_line, record.line_number)
-    if new_content is None:
-        return {"ok": False, "error": {
-            "code": "task-line-resolution-failed",
-            "message": "Resolved task line no longer matches the active board; active board was not changed.",
-        }}
+        carried_date = carried_date or datetime.now().date().isoformat()
+        new_line = _set_carried_marker(record.raw_line, carried_date)
+        new_content = replace_task_line(content, record.raw_line, new_line, record.line_number)
+        if new_content is None:
+            return {"ok": False, "error": {
+                "code": "task-line-resolution-failed",
+                "message": "Resolved task line no longer matches the active board; active board was not changed.",
+            }}
 
-    previous_carried = _extract_carried(record.raw_line)
-    event = new_event(
-        "eod_disposition_carry",
-        task_id=task_id,
-        source=source,
-        previous_state="active",
-        next_state="active",
-        reason="eod-disposition-carry",
-        metadata={"title": record.title, "line_number": record.line_number,
-                  "carried_date": carried_date, "previous_carried": previous_carried},
-    )
-    snapshots = {tasks_file: (True, content)}
-    ledger_file = ledger_path(tasks_file)
-    ledger_snapshot = _snapshot_regular(ledger_file)
-    if ledger_snapshot is not None:
-        snapshots[ledger_file] = ledger_snapshot
+        previous_carried = _extract_carried(record.raw_line)
+        event = new_event(
+            "eod_disposition_carry",
+            task_id=task_id,
+            source=source,
+            previous_state="active",
+            next_state="active",
+            reason="eod-disposition-carry",
+            metadata={"title": record.title, "line_number": record.line_number,
+                      "carried_date": carried_date, "previous_carried": previous_carried},
+        )
+        snapshots = {tasks_file: (True, content)}
+        ledger_file = ledger_path(tasks_file)
+        ledger_snapshot = _snapshot_regular(ledger_file)
+        if ledger_snapshot is not None:
+            snapshots[ledger_file] = ledger_snapshot
 
-    try:
-        _atomic_write(tasks_file, new_content)
-        append_event(event, path=ledger_file)
-    except OSError as exc:
-        restore_error = _restore_after_failure(snapshots)
-        error = {"code": "task-state-write-failed",
-                 "message": f"Carry write failed; snapshots were restored: {exc}"}
-        if restore_error:
-            error["restore_error"] = restore_error
-        return {"ok": False, "error": error}
-    return {"ok": True, "task_id": task_id, "title": record.title,
-            "carried_date": carried_date, "event": event}
+        try:
+            _atomic_write(tasks_file, new_content)
+            append_event(event, path=ledger_file)
+        except OSError as exc:
+            restore_error = _restore_after_failure(snapshots)
+            error = {"code": "task-state-write-failed",
+                     "message": f"Carry write failed; snapshots were restored: {exc}"}
+            if restore_error:
+                error["restore_error"] = restore_error
+            return {"ok": False, "error": error}
+        return {"ok": True, "task_id": task_id, "title": record.title,
+                "carried_date": carried_date, "event": event}
 
 
 def drop_by_id(
@@ -511,56 +617,58 @@ def drop_by_id(
     not a completion, so it must NOT spawn a next occurrence. The ledger event is the
     registered ``eod_disposition_drop``.
     """
-    tasks_file, content, record, error = _resolve_by_id(task_id, personal)
-    if error:
-        return error
-    ledger_error = _preflight_ledger(tasks_file)
-    if ledger_error:
-        return ledger_error
-    if record.line_number is None:
-        return {"ok": False, "error": {
-            "code": "task-line-resolution-failed",
-            "message": "Resolved task has no stable line number; active board was not changed.",
-        }}
+    lock_file = _tasks_file_for_board(personal)
+    with board_flock(lock_file):
+        tasks_file, content, record, error = _resolve_by_id(task_id, personal)
+        if error:
+            return error
+        ledger_error = _preflight_ledger(tasks_file)
+        if ledger_error:
+            return ledger_error
+        if record.line_number is None:
+            return {"ok": False, "error": {
+                "code": "task-line-resolution-failed",
+                "message": "Resolved task has no stable line number; active board was not changed.",
+            }}
 
-    dropped = _drop_to_parking(content, record.raw_line, record.line_number)
-    if dropped is None:
-        return {"ok": False, "error": {
-            "code": "parking-lot-missing",
-            "message": "No 🅿️ Parking Lot section to drop into, or the task line no "
-                       "longer matches; active board was not changed.",
-        }}
-    new_content, parked_line = dropped
+        dropped = _drop_to_parking(content, record.raw_line, record.line_number)
+        if dropped is None:
+            return {"ok": False, "error": {
+                "code": "parking-lot-missing",
+                "message": "No 🅿️ Parking Lot section to drop into, or the task line no "
+                           "longer matches; active board was not changed.",
+            }}
+        new_content, parked_line = dropped
 
-    event = new_event(
-        "eod_disposition_drop",
-        task_id=task_id,
-        source=source,
-        previous_state="active",
-        next_state="parked",
-        reason="eod-disposition-drop",
-        metadata={"title": record.title, "line_number": record.line_number},
-    )
-    snapshots = {tasks_file: (True, content)}
-    ledger_file = ledger_path(tasks_file)
-    ledger_snapshot = _snapshot_regular(ledger_file)
-    if ledger_snapshot is not None:
-        snapshots[ledger_file] = ledger_snapshot
+        event = new_event(
+            "eod_disposition_drop",
+            task_id=task_id,
+            source=source,
+            previous_state="active",
+            next_state="parked",
+            reason="eod-disposition-drop",
+            metadata={"title": record.title, "line_number": record.line_number},
+        )
+        snapshots = {tasks_file: (True, content)}
+        ledger_file = ledger_path(tasks_file)
+        ledger_snapshot = _snapshot_regular(ledger_file)
+        if ledger_snapshot is not None:
+            snapshots[ledger_file] = ledger_snapshot
 
-    try:
-        _atomic_write(tasks_file, new_content)
-        append_event(event, path=ledger_file)
-    except OSError as exc:
-        restore_error = _restore_after_failure(snapshots)
-        error = {"code": "task-state-write-failed",
-                 "message": f"Drop write failed; snapshots were restored: {exc}"}
-        if restore_error:
-            error["restore_error"] = restore_error
-        return {"ok": False, "error": error}
-    return {"ok": True, "task_id": task_id, "title": record.title,
-            "destination": "parking_lot", "parked_line": parked_line,
-            "raw_line": record.raw_line, "line_number": record.line_number,
-            "event": event}
+        try:
+            _atomic_write(tasks_file, new_content)
+            append_event(event, path=ledger_file)
+        except OSError as exc:
+            restore_error = _restore_after_failure(snapshots)
+            error = {"code": "task-state-write-failed",
+                     "message": f"Drop write failed; snapshots were restored: {exc}"}
+            if restore_error:
+                error["restore_error"] = restore_error
+            return {"ok": False, "error": error}
+        return {"ok": True, "task_id": task_id, "title": record.title,
+                "destination": "parking_lot", "parked_line": parked_line,
+                "raw_line": record.raw_line, "line_number": record.line_number,
+                "event": event}
 
 
 def _parked_line(active_line: str) -> str:
