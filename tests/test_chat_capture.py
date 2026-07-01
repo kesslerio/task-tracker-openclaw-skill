@@ -129,6 +129,16 @@ def test_resolve_for_auto_is_exact_active_task_id_only(tmp_path):
     assert resolve_for_auto("ship alpha milestone", catalog) is None
     assert resolve_for_auto("tsk_missing", catalog) is None
 
+    # A legacy id:: is NOT a valid auto-complete target: canonical_id falls back
+    # to it, but resolve_for_auto matches the record's real task_id:: only.
+    legacy_catalog = build_task_catalog(
+        task_records(
+            "# Work\n\n## \U0001F534 Q1\n- [ ] **Legacy only** id::legacy_x\n",
+            fmt="obsidian",
+        )
+    )
+    assert resolve_for_auto("legacy_x", legacy_catalog) is None
+
 
 def test_valid_signed_envelope_autowrites_exact_non_recurring_task(tmp_path, monkeypatch):
     work = _write_work_file(tmp_path)

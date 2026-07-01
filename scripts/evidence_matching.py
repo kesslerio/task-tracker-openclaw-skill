@@ -155,14 +155,20 @@ def build_task_catalog(records: list) -> list[dict[str, Any]]:
 
 
 def resolve_for_auto(task_id: str | None, catalog: list[dict[str, Any]]):
-    """Resolve only an exact active task_id for trusted gateway auto-complete."""
+    """Resolve only an exact active task_id for trusted gateway auto-complete.
+
+    Matches the record's real ``task_id::`` only. A legacy ``id::`` (which
+    ``canonical_id`` falls back to) is NOT a valid auto-complete target — such a
+    record has ``record.task_id is None`` and routes to the candidate lane —
+    keeping the trusted envelope path strictly task_id-scoped.
+    """
     if not isinstance(task_id, str) or not task_id.strip():
         return None
     normalized_task_id = task_id.strip()
     matches = [
         candidate["record"]
         for candidate in catalog
-        if (candidate.get("canonical") or {}).get("task_id") == normalized_task_id
+        if getattr(candidate["record"], "task_id", None) == normalized_task_id
     ]
     return matches[0] if len(matches) == 1 else None
 
@@ -190,9 +196,12 @@ def match_evidence_all(
     """Return every plausible task match for an evidence statement.
 
     ``match_evidence_line`` intentionally preserves the legacy single-best
-    contract. This companion API exposes the runner-up set that auto-writers need
-    for ambiguity and margin checks: all exact identifier/link hits, all fallback
-    issue-number hits, all normalized-title collisions, and the top-N fuzzy scores.
+    contract. This companion API powers Lane-B candidate ranking and prefill
+    only: all exact identifier/link hits, all fallback issue-number hits, all
+    normalized-title collisions, and the top-N fuzzy scores. It is not an
+    authorization boundary; auto-write never calls it and resolves only through
+    ``resolve_for_auto``.
+
     Matches are de-duplicated by task identity while preserving every match type
     that applied to that task.
     """
@@ -261,10 +270,6 @@ def match_evidence_line(
     auto_threshold: float,
     review_threshold: float,
 ) -> dict[str, Any]:
-    def sort_key(candidate: dict[str, Any]) -> str:
-        canonical = candidate["canonical"]
-        return canonical.get("task_id") or canonical.get("fallback_id") or canonical.get("title") or ""
-
     def result(
         *,
         candidate: dict[str, Any] | None,
@@ -293,7 +298,7 @@ def match_evidence_line(
         if line["exact_identifiers"] and (line["exact_identifiers"] & candidate["exact_identifiers"])
     ]
     if exact_matches:
-        chosen = sorted(exact_matches, key=sort_key)[0]
+        chosen = sorted(exact_matches, key=_candidate_sort_key)[0]
         return result(
             candidate=chosen,
             score=1.0,
@@ -307,7 +312,7 @@ def match_evidence_line(
         if line["fallback_identifiers"] and (line["fallback_identifiers"] & candidate["fallback_identifiers"])
     ]
     if fallback_matches:
-        chosen = sorted(fallback_matches, key=sort_key)[0]
+        chosen = sorted(fallback_matches, key=_candidate_sort_key)[0]
         return result(
             candidate=chosen,
             score=0.6,
@@ -319,7 +324,7 @@ def match_evidence_line(
         candidate for candidate in catalog if candidate["normalized_title"] == line["normalized_title"]
     ]
     if exact_title_matches:
-        chosen = sorted(exact_title_matches, key=sort_key)[0]
+        chosen = sorted(exact_title_matches, key=_candidate_sort_key)[0]
         return result(
             candidate=chosen,
             score=1.0,
@@ -330,7 +335,7 @@ def match_evidence_line(
     scored = []
     for candidate in catalog:
         score = fuzzy_score(line["normalized_title"], candidate["normalized_title"])
-        scored.append((score, sort_key(candidate), candidate))
+        scored.append((score, _candidate_sort_key(candidate), candidate))
     scored.sort(key=lambda item: (-item[0], item[1]))
     best_score, _, best = scored[0] if scored else (0.0, "", None)
 

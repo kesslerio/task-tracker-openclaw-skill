@@ -41,6 +41,8 @@ MAX_STORED_PHRASE_CHARS = 512
 MISS_DEDUPE_WINDOW = timedelta(hours=1)
 TRUE_VALUES = {"1", "true", "yes", "on", "enabled"}
 
+# Candidate denoising/ranking heuristics only; never use them as trust gates or
+# authorization to write.
 NEGATED_OR_HEDGED_RE = re.compile(
     r"\b(?:didn['’]?t|did\s+not|not\s+done|not\s+finished|not\s+complete(?:d)?|"
     r"not\s+yet|haven['’]?t|have\s+not|almost|still|will\s+finish|going\s+to|"
@@ -80,12 +82,12 @@ def _stored_phrase(text: str) -> str:
 
 
 def _collapse_statement(text: str) -> str:
-    return " ".join(line.strip() for line in (text.splitlines() or [text]) if line.strip()).strip()
+    return " ".join(line.strip() for line in text.splitlines() if line.strip()).strip()
 
 
 def _strip_transport_markers(text: str) -> str:
     lines: list[str] = []
-    for line in text.splitlines() or [text]:
+    for line in text.splitlines():
         stripped = re.sub(r"^\s*>+\s?", "", line).strip()
         stripped = re.sub(r"^\s*(?:forwarded(?:\s+from)?|fwd|quote|quoted)\b[:\s-]*", "", stripped, flags=re.I)
         stripped = stripped.strip("\"'“” ")
@@ -96,7 +98,7 @@ def _strip_transport_markers(text: str) -> str:
 
 def _phrase_for_matching(text: str) -> str:
     bounded = (text or "")[:MAX_TEXT_CHARS]
-    cleaned = _strip_transport_markers(_collapse_statement(bounded))
+    cleaned = _collapse_statement(_strip_transport_markers(bounded))
     cleaned = re.sub(r"^\s*scratch\s+that[,.;:-]?\s*", "", cleaned, flags=re.I)
     cleaned = re.sub(r"^\s*\[[^\]\n]{1,40}\]\s+", "", cleaned, flags=re.I)
     cleaned = re.sub(
@@ -209,6 +211,7 @@ def _candidate_payload(
     }
     if match_metadata.get("match_type") == "exact-id-or-link" and match_metadata.get("matched_task_id"):
         candidate["confirmable_task_id"] = match_metadata["matched_task_id"]
+        # Skips match review; still requires user confirmation; never auto-writes.
         candidate["review_required"] = False
     return candidate
 
@@ -247,6 +250,14 @@ def _record_candidate(
     return {"candidate": candidate, "created": True}
 
 
+def _event_timestamp(event: dict[str, Any]):
+    timestamp = str(event.get("timestamp") or "")
+    parsed = parse_timestamp(timestamp)
+    if parsed is None:
+        raise ValueError("invalid event timestamp")
+    return parsed
+
+
 def _record_capture_miss(
     *,
     phrase: str,
@@ -265,7 +276,7 @@ def _record_capture_miss(
         if metadata.get("normalized_phrase") != normalized_phrase:
             continue
         try:
-            event_time = current_time_from_event(event)
+            event_time = _event_timestamp(event)
         except ValueError:
             continue
         if now - event_time <= MISS_DEDUPE_WINDOW:
@@ -286,14 +297,6 @@ def _record_capture_miss(
     return event
 
 
-def current_time_from_event(event: dict[str, Any]):
-    timestamp = str(event.get("timestamp") or "")
-    parsed = parse_timestamp(timestamp)
-    if parsed is None:
-        raise ValueError("invalid event timestamp")
-    return parsed
-
-
 def _source_pointer(
     *,
     source: str,
@@ -301,12 +304,12 @@ def _source_pointer(
     channel: str | None,
     message_id: str | None,
     timestamp: str | None,
-    part_index: int = 1,
 ) -> dict[str, Any]:
     pointer: dict[str, Any] = {
         "type": "chat",
         "channel": channel or source,
-        "line_number": part_index,
+        # Chat candidates keep line_number for parity with file-source candidate schemas.
+        "line_number": 1,
         "timestamp": timestamp or current_time().isoformat(),
     }
     if sender:
@@ -419,6 +422,67 @@ def _merge_single_action(payload: dict[str, Any], actions: list[dict[str, Any]])
         payload[key] = value
 
 
+def _handle_envelope(
+    *,
+    text: str | None,
+    envelope: str | dict[str, Any],
+    sender: str | None,
+    source: str,
+    channel: str | None,
+    message_id: str | None,
+    catalog: list[dict[str, Any]],
+    write_enabled: bool,
+    ledger_events: list[dict[str, Any]],
+    personal: bool,
+) -> tuple[Any, dict[str, Any]]:
+    verification = verify_envelope(envelope, seen_message_ids=message_ids_from_events(ledger_events))
+    verified = verification.ok
+    parsed_envelope = verification.envelope
+    source_pointer = _source_pointer(
+        source=source,
+        sender=(parsed_envelope or {}).get("sender") or sender,
+        channel=(parsed_envelope or {}).get("channel") or channel,
+        message_id=(parsed_envelope or {}).get("message_id") or message_id,
+        timestamp=(parsed_envelope or {}).get("timestamp"),
+    )
+
+    fallback_reason: str | None = None
+    if verified and write_enabled:
+        task_id = str((parsed_envelope or {}).get("task_id") or "").strip()
+        record = resolve_for_auto(task_id, catalog)
+        if record is not None and not _record_is_recurring(record):
+            task_id = str(getattr(record, "canonical_id", None) or task_id)
+            completion = complete_by_id(
+                task_id,
+                personal=personal,
+                source="chat_capture",
+                extra_events_factory=lambda event: [_envelope_seen_event(parsed_envelope or {}, event)],
+            )
+            if completion.get("ok"):
+                return verification, {
+                    "action": "auto",
+                    "task_id": completion.get("task_id"),
+                    "completion_id": completion.get("completion_id"),
+                    "envelope_message_id": (parsed_envelope or {}).get("message_id"),
+                }
+            fallback_reason = "auto-complete-failed"
+        else:
+            fallback_reason = "recurring-task" if record is not None else "auto-task-not-found"
+    elif verified:
+        fallback_reason = "autowrite-disabled"
+    else:
+        fallback_reason = verification.reason or "unverified-envelope"
+
+    return verification, _candidate_or_miss_action(
+        text=_envelope_candidate_text(parsed_envelope, text),
+        catalog=catalog,
+        source_pointer=source_pointer,
+        decision_reason=fallback_reason,
+        personal=personal,
+        suppress_negated_candidate=False,
+    )
+
+
 def capture_text(
     text: str | None = None,
     *,
@@ -436,81 +500,19 @@ def capture_text(
     actions: list[dict[str, Any]] = []
 
     if envelope is not None:
-        verification = verify_envelope(envelope, seen_message_ids=message_ids_from_events(ledger_events))
-        verified = verification.ok
-        parsed_envelope = verification.envelope
-        source_pointer = _source_pointer(
+        verification, action = _handle_envelope(
+            text=text,
+            envelope=envelope,
+            sender=sender,
             source=source,
-            sender=(parsed_envelope or {}).get("sender") or sender,
-            channel=(parsed_envelope or {}).get("channel") or channel,
-            message_id=(parsed_envelope or {}).get("message_id") or message_id,
-            timestamp=(parsed_envelope or {}).get("timestamp"),
+            channel=channel,
+            message_id=message_id,
+            catalog=catalog,
+            write_enabled=write_enabled,
+            ledger_events=ledger_events,
+            personal=personal,
         )
-
-        if verified and write_enabled:
-            task_id = str((parsed_envelope or {}).get("task_id") or "").strip()
-            record = resolve_for_auto(task_id, catalog)
-            if record is not None and not _record_is_recurring(record):
-                task_id = str(getattr(record, "canonical_id", None) or task_id)
-                completion = complete_by_id(
-                    task_id,
-                    personal=personal,
-                    source="chat_capture",
-                    extra_events_factory=lambda event: [_envelope_seen_event(parsed_envelope or {}, event)],
-                )
-                if completion.get("ok"):
-                    actions.append(
-                        {
-                            "action": "auto",
-                            "task_id": completion.get("task_id"),
-                            "completion_id": completion.get("completion_id"),
-                            "envelope_message_id": (parsed_envelope or {}).get("message_id"),
-                        }
-                    )
-                else:
-                    actions.append(
-                        _candidate_or_miss_action(
-                            text=_envelope_candidate_text(parsed_envelope, text),
-                            catalog=catalog,
-                            source_pointer=source_pointer,
-                            decision_reason="auto-complete-failed",
-                            personal=personal,
-                            suppress_negated_candidate=False,
-                        )
-                    )
-            else:
-                actions.append(
-                    _candidate_or_miss_action(
-                        text=_envelope_candidate_text(parsed_envelope, text),
-                        catalog=catalog,
-                        source_pointer=source_pointer,
-                        decision_reason="recurring-task" if record is not None else "auto-task-not-found",
-                        personal=personal,
-                        suppress_negated_candidate=False,
-                    )
-                )
-        elif verified:
-            actions.append(
-                _candidate_or_miss_action(
-                    text=_envelope_candidate_text(parsed_envelope, text),
-                    catalog=catalog,
-                    source_pointer=source_pointer,
-                    decision_reason="autowrite-disabled",
-                    personal=personal,
-                    suppress_negated_candidate=False,
-                )
-            )
-        else:
-            actions.append(
-                _candidate_or_miss_action(
-                    text=_envelope_candidate_text(parsed_envelope, text),
-                    catalog=catalog,
-                    source_pointer=source_pointer,
-                    decision_reason=verification.reason or "unverified-envelope",
-                    personal=personal,
-                    suppress_negated_candidate=False,
-                )
-            )
+        actions.append(action)
     else:
         source_pointer = _source_pointer(
             source=source,
