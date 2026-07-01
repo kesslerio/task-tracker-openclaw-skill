@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import task_transitions
 import task_records
+import log_done
 from locks import sidecar_flock
 from rollover import rollover_board
 
@@ -37,6 +38,15 @@ def _apply_env(monkeypatch, env, work):
         value = env[key]
         monkeypatch.setenv(key, value)
     monkeypatch.setattr(task_records, "get_tasks_file", lambda personal=False: (work, "obsidian"))
+
+
+class _FixedDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        fixed = cls(2026, 6, 30, 12, 34, 56)
+        if tz is not None:
+            return fixed.replace(tzinfo=tz)
+        return fixed
 
 
 def test_done_by_canonical_id_completes_one_task_and_writes_ledger(tmp_path):
@@ -846,6 +856,39 @@ def test_restore_snapshots_is_atomic(tmp_path, monkeypatch):
     assert target.read_text() == snapshot_content
 
 
+def test_complete_mints_snapshot_daily_note_identity_and_completion_id(tmp_path, monkeypatch):
+    work = tmp_path / "Work Tasks.md"
+    raw_line = "- [ ] **Ship milestone** task_id::tsk_ship area:: Delivery"
+    work.write_text(f"""# Work
+
+## 🔴 Q1
+{raw_line}
+""")
+    env = _env(tmp_path, work)
+    _apply_env(monkeypatch, env, work)
+
+    result = task_transitions.complete_by_id("tsk_ship")
+
+    assert result["ok"] is True
+    assert result["completion_id"] == result["event"]["event_id"]
+    metadata = result["event"]["metadata"]
+    snapshot = metadata["board_snapshot"]
+    assert snapshot["raw_line"] == raw_line
+    assert snapshot["line_number"] == 4
+    assert snapshot["task_id"] == "tsk_ship"
+    assert snapshot["board_revision"].startswith("sha256:")
+    assert metadata["daily_note_path"].endswith(f"{datetime.now().strftime('%Y-%m-%d')}.md")
+    assert metadata["daily_note_line"].endswith("✅ Ship milestone")
+    assert metadata["daily_note_context_line"].startswith("  {")
+    assert '"task_id": "tsk_ship"' in metadata["daily_note_context_line"]
+
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    assert events[0]["event_id"] == result["completion_id"]
+    assert events[0]["metadata"]["board_snapshot"]["raw_line"] == raw_line
+    assert events[0]["metadata"]["daily_note_line"] == metadata["daily_note_line"]
+    assert events[0]["metadata"]["daily_note_context_line"] == metadata["daily_note_context_line"]
+
+
 # --- U8a board mutation lock -------------------------------------------------
 
 
@@ -983,6 +1026,275 @@ def test_concurrent_complete_recurring_serializes_to_one_completion(tmp_path):
     assert "Daily race task" in content
     assert "🗓️2026-05-21" in content
     assert "🗓️2026-05-22" not in content
+
+
+def test_revert_completion_round_trip_non_recurring(tmp_path, monkeypatch):
+    from daily_notes import extract_completed_tasks
+
+    work = tmp_path / "Work Tasks.md"
+    original = """# Work
+
+## 🔴 Q1
+- [ ] **Ship milestone** task_id::tsk_ship area:: Delivery
+- [ ] **Other task** task_id::tsk_other area:: Ops
+"""
+    work.write_text(original)
+    env = _env(tmp_path, work)
+    _apply_env(monkeypatch, env, work)
+    today = datetime.now().date()
+    pre_done_count = len(extract_completed_tasks(tmp_path / "daily", today, today))
+
+    completed = task_transitions.complete_by_id("tsk_ship")
+    assert completed["ok"] is True
+    completion_id = completed["completion_id"]
+    daily_path = Path(completed["event"]["metadata"]["daily_note_path"])
+    daily_line = completed["event"]["metadata"]["daily_note_line"]
+    daily_context_line = completed["event"]["metadata"]["daily_note_context_line"]
+    assert daily_line in daily_path.read_text()
+    assert daily_context_line in daily_path.read_text()
+
+    reverted = task_transitions.revert_completion(completion_id)
+
+    assert reverted["ok"] is True
+    assert work.read_text() == original
+    assert daily_line not in daily_path.read_text()
+    assert daily_context_line not in daily_path.read_text()
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    reverts = [event for event in events if event["event_type"] == "state_transition_reverted"]
+    assert len(reverts) == 1
+    assert reverts[0]["metadata"]["completion_id"] == completion_id
+    assert reverts[0]["metadata"]["reverted_event_id"] == completion_id
+    post_done_count = len(extract_completed_tasks(tmp_path / "daily", today, today))
+    assert post_done_count == pre_done_count
+
+
+def test_revert_completion_is_idempotent(tmp_path, monkeypatch):
+    work = tmp_path / "Work Tasks.md"
+    original = """# Work
+
+## 🔴 Q1
+- [ ] **Ship milestone** task_id::tsk_ship area:: Delivery
+"""
+    work.write_text(original)
+    env = _env(tmp_path, work)
+    _apply_env(monkeypatch, env, work)
+    completed = task_transitions.complete_by_id("tsk_ship")
+    completion_id = completed["completion_id"]
+
+    first = task_transitions.revert_completion(completion_id)
+    board_after_first = work.read_text()
+    second = task_transitions.revert_completion(completion_id)
+
+    assert first["ok"] is True
+    assert second["ok"] is False
+    assert second["error"]["code"] == "completion-already-reverted"
+    assert work.read_text() == board_after_first == original
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    reverts = [event for event in events if event["event_type"] == "state_transition_reverted"]
+    assert len(reverts) == 1
+
+
+def test_revert_completion_conflict_changes_nothing(tmp_path, monkeypatch):
+    work = tmp_path / "Work Tasks.md"
+    raw_line = "- [ ] **Ship milestone** task_id::tsk_ship area:: Delivery"
+    work.write_text(f"""# Work
+
+## 🔴 Q1
+{raw_line}
+""")
+    env = _env(tmp_path, work)
+    _apply_env(monkeypatch, env, work)
+    completed = task_transitions.complete_by_id("tsk_ship")
+    completion_id = completed["completion_id"]
+    daily_path = Path(completed["event"]["metadata"]["daily_note_path"])
+    daily_before = daily_path.read_text()
+    drifted = f"""# Work
+
+## 🔴 Q1
+{raw_line}
+{raw_line}
+"""
+    work.write_text(drifted)
+
+    result = task_transitions.revert_completion(completion_id)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "board-restore-conflict"
+    assert result["error"]["reason"] == "conflict-duplicate"
+    assert work.read_text() == drifted
+    assert daily_path.read_text() == daily_before
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    assert [event["event_type"] for event in events].count("state_transition_reverted") == 0
+
+
+def test_revert_completion_round_trip_recurring_post_raw_line(tmp_path, monkeypatch):
+    work = tmp_path / "Work Tasks.md"
+    original = """# Work
+
+## 🔴 Q1
+- [ ] **Send weekly update** task_id::tsk_weekly recur::weekly 🗓️2026-05-20
+"""
+    work.write_text(original)
+    env = _env(tmp_path, work)
+    _apply_env(monkeypatch, env, work)
+
+    completed = task_transitions.complete_by_id("tsk_weekly")
+    assert completed["ok"] is True
+    assert "🗓️2026-05-27" in work.read_text()
+    assert "🗓️2026-05-20" not in work.read_text()
+    metadata = completed["event"]["metadata"]
+    daily_path = Path(metadata["daily_note_path"])
+
+    reverted = task_transitions.revert_completion(completed["completion_id"])
+
+    assert reverted["ok"] is True
+    assert reverted["overwrote_edit"] is False
+    assert work.read_text() == original
+    daily_text = daily_path.read_text()
+    assert metadata["daily_note_line"] not in daily_text
+    assert metadata["daily_note_context_line"] not in daily_text
+
+
+def test_revert_completion_refuses_older_recurring_completion_out_of_order(tmp_path, monkeypatch):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text("""# Work
+
+## 🔴 Q1
+- [ ] **Send weekly update** task_id::tsk_weekly recur::weekly 🗓️2026-05-20
+""")
+    env = _env(tmp_path, work)
+    _apply_env(monkeypatch, env, work)
+
+    first = task_transitions.complete_by_id("tsk_weekly")
+    second = task_transitions.complete_by_id("tsk_weekly")
+    assert first["ok"] is True
+    assert second["ok"] is True
+    board_after_second = work.read_text()
+    daily_path = Path(first["event"]["metadata"]["daily_note_path"])
+    daily_after_second = daily_path.read_text()
+
+    older_revert = task_transitions.revert_completion(first["completion_id"])
+
+    assert older_revert["ok"] is False
+    assert older_revert["error"]["code"] == "revert-out-of-order"
+    assert older_revert["error"]["message"] == "revert the newer completion first"
+    assert work.read_text() == board_after_second
+    assert daily_path.read_text() == daily_after_second
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    assert [event["event_type"] for event in events].count("state_transition_reverted") == 0
+
+    newer_revert = task_transitions.revert_completion(second["completion_id"])
+
+    assert newer_revert["ok"] is True
+    assert "🗓️2026-05-27" in work.read_text()
+    assert "🗓️2026-06-03" not in work.read_text()
+
+
+def test_revert_completion_removes_exact_daily_note_block_for_same_minute_same_title(
+    tmp_path,
+    monkeypatch,
+):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text("""# Work
+
+## 🔴 Q1
+- [ ] **Same title** task_id::tsk_one area:: Delivery
+- [ ] **Same title** task_id::tsk_two area:: Delivery
+""")
+    env = _env(tmp_path, work)
+    _apply_env(monkeypatch, env, work)
+    monkeypatch.setattr(task_transitions, "datetime", _FixedDateTime)
+    monkeypatch.setattr(log_done, "datetime", _FixedDateTime)
+
+    first = task_transitions.complete_by_id("tsk_one")
+    second = task_transitions.complete_by_id("tsk_two")
+    first_meta = first["event"]["metadata"]
+    second_meta = second["event"]["metadata"]
+    assert first_meta["daily_note_line"] == second_meta["daily_note_line"]
+    assert first_meta["daily_note_context_line"] != second_meta["daily_note_context_line"]
+
+    reverted = task_transitions.revert_completion(first["completion_id"])
+
+    assert reverted["ok"] is True
+    daily_path = Path(first_meta["daily_note_path"])
+    assert daily_path == Path(second_meta["daily_note_path"])
+    daily_lines = daily_path.read_text().splitlines()
+    assert daily_lines == [
+        second_meta["daily_note_line"],
+        second_meta["daily_note_context_line"],
+    ]
+    assert "task_id::tsk_one" in work.read_text()
+    assert "task_id::tsk_two" not in work.read_text()
+
+
+def test_revert_completion_wrong_personal_flag_refuses_target_mismatch(tmp_path, monkeypatch):
+    work = tmp_path / "Work Tasks.md"
+    personal_board = tmp_path / "Personal Tasks.md"
+    work_original = """# Work
+
+## 🔴 Q1
+- [ ] **Work task** task_id::tsk_work area:: Delivery
+"""
+    personal_original = """# Personal
+
+## 🔴 Q1
+- [ ] **Personal task** task_id::tsk_personal area:: Home
+    """
+    work.write_text(work_original)
+    personal_board.write_text(personal_original)
+    env = _env(tmp_path, work)
+    for key in (
+        "TASK_TRACKER_WORK_FILE",
+        "TASK_TRACKER_DAILY_NOTES_DIR",
+        "TASK_TRACKER_DONE_LOG_DIR",
+        "TASK_TRACKER_LEDGER_FILE",
+        "STANDUP_CALENDARS",
+    ):
+        monkeypatch.setenv(key, env[key])
+    monkeypatch.setattr(
+        task_records,
+        "get_tasks_file",
+        lambda personal=False: ((personal_board if personal else work), "obsidian"),
+    )
+
+    completed = task_transitions.complete_by_id("tsk_work", personal=False)
+    assert completed["ok"] is True
+    daily_path = Path(completed["event"]["metadata"]["daily_note_path"])
+    daily_after_complete = daily_path.read_text()
+    board_after_complete = work.read_text()
+
+    result = task_transitions.revert_completion(completed["completion_id"], personal=True)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "revert-target-mismatch"
+    assert work.read_text() == board_after_complete
+    assert personal_board.read_text() == personal_original
+    assert daily_path.read_text() == daily_after_complete
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    assert [event["event_type"] for event in events].count("state_transition_reverted") == 0
+
+
+def test_revert_completion_surfaces_overwrote_edit_for_recurring_line(tmp_path, monkeypatch):
+    work = tmp_path / "Work Tasks.md"
+    original = """# Work
+
+## 🔴 Q1
+- [ ] **Send weekly update** task_id::tsk_weekly recur::weekly 🗓️2026-05-20
+"""
+    work.write_text(original)
+    env = _env(tmp_path, work)
+    _apply_env(monkeypatch, env, work)
+
+    completed = task_transitions.complete_by_id("tsk_weekly")
+    rolled = work.read_text()
+    assert "🗓️2026-05-27" in rolled
+    work.write_text(rolled.replace("**Send weekly update**", "**Send weekly update edited**"))
+
+    result = task_transitions.revert_completion(completed["completion_id"])
+
+    assert result["ok"] is True
+    assert result["overwrote_edit"] is True
+    assert work.read_text() == original
 
 
 def test_reschedule_carry_drop_hold_board_lock_around_board_write(tmp_path, monkeypatch):

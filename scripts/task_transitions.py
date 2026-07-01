@@ -9,9 +9,10 @@ import re
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Any, Callable, Iterator
 
 import task_records as task_record_module
+from autonomy import board_snapshot, resolve_board_restore
 from locks import sidecar_flock
 from log_done import log_task_completed
 from task_lines import line_index, remove_task_line, replace_task_line
@@ -159,13 +160,29 @@ def _resolve_by_id(task_id: str, personal: bool = False):
     return tasks_file, content, matches[0], None
 
 
-def _latest_terminal_event(
-    events: list[dict],
+def _reverted_transition_ids(events: list[dict[str, Any]]) -> set[str]:
+    reverted: set[str] = set()
+    for event in events:
+        if event.get("event_type") != "state_transition_reverted":
+            continue
+        metadata = event.get("metadata") or {}
+        for key in ("completion_id", "reverted_event_id"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value:
+                reverted.add(value)
+    return reverted
+
+
+def _latest_unreverted_terminal_event(
+    events: list[dict[str, Any]],
     task_id: str,
     terminal_states: set[str],
-) -> dict | None:
+) -> dict[str, Any] | None:
+    reverted = _reverted_transition_ids(events)
     for event in reversed(events):
         if event.get("event_type") != "state_transition":
+            continue
+        if event.get("event_id") in reverted:
             continue
         if event.get("task_id") != task_id:
             continue
@@ -201,7 +218,7 @@ def _terminal_noop_result(
             },
         }
 
-    terminal_event = _latest_terminal_event(
+    terminal_event = _latest_unreverted_terminal_event(
         read_events(ledger_path(tasks_file)),
         task_id,
         terminal_states,
@@ -237,6 +254,65 @@ def _maybe_terminal_noop(
     ):
         return None
     return _terminal_noop_result(tasks_file, task_id, personal, terminal_states)
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    return left.expanduser().resolve(strict=False) == right.expanduser().resolve(strict=False)
+
+
+def _daily_context_task_id(context_line: str) -> str | None:
+    try:
+        parsed = json.loads(context_line.strip())
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    value = parsed.get("task_id")
+    return value if isinstance(value, str) and value else None
+
+
+def _remove_exact_completion_block(
+    content: str,
+    action_line: str,
+    context_line: str,
+    task_id: str,
+) -> tuple[str, int]:
+    if _daily_context_task_id(context_line) != task_id:
+        return content, 0
+
+    lines = content.splitlines(keepends=True)
+    matches: list[int] = []
+    for index in range(0, max(0, len(lines) - 1)):
+        if (
+            lines[index].rstrip("\r\n") == action_line
+            and lines[index + 1].rstrip("\r\n") == context_line
+            and _daily_context_task_id(lines[index + 1].rstrip("\r\n")) == task_id
+        ):
+            matches.append(index)
+    if len(matches) != 1:
+        return content, len(matches)
+    index = matches[0]
+    del lines[index:index + 2]
+    return "".join(lines), 1
+
+
+def _later_unreverted_terminal_event(
+    events: list[dict[str, Any]],
+    completion_index: int,
+    task_id: str,
+) -> dict[str, Any] | None:
+    reverted = _reverted_transition_ids(events)
+    for event in events[completion_index + 1:]:
+        event_id = event.get("event_id")
+        if event.get("event_type") != "state_transition":
+            continue
+        if isinstance(event_id, str) and event_id in reverted:
+            continue
+        if event.get("task_id") != task_id:
+            continue
+        if event.get("next_state") in {"done", "cancelled"}:
+            return event
+    return None
 
 
 def complete_by_id(
@@ -284,17 +360,6 @@ def complete_by_id(
         if ledger_error:
             return ledger_error
 
-        event = new_event(
-            "state_transition",
-            task_id=task_id,
-            source=source,
-            previous_state="active",
-            next_state="done",
-            reason="explicit-done-by-canonical-id",
-            metadata={"title": record.title, "line_number": record.line_number},
-        )
-        extra_events = extra_events_factory(event) if extra_events_factory else []
-
         due_value = _extract_due_date(record.raw_line)
         recur_value = _extract_recur_value(record.raw_line) or ""
         if record.line_number is None:
@@ -305,6 +370,7 @@ def complete_by_id(
                     "message": "Resolved task has no stable line number; active board was not changed.",
                 },
             }
+        next_line = None
         if recur_value:
             try:
                 from_date = due_value or datetime.now().date().isoformat()
@@ -329,6 +395,28 @@ def complete_by_id(
                     "message": "Resolved task line no longer matches the active board; active board was not changed.",
                 },
             }
+
+        event = new_event(
+            "state_transition",
+            task_id=task_id,
+            source=source,
+            previous_state="active",
+            next_state="done",
+            reason="explicit-done-by-canonical-id",
+            metadata={
+                "title": record.title,
+                "line_number": record.line_number,
+                "board_snapshot": board_snapshot(
+                    tasks_file,
+                    record.raw_line,
+                    record.line_number,
+                    content=content,
+                    post_raw_line=next_line,
+                ),
+            },
+        )
+        event["metadata"]["completion_id"] = event["event_id"]
+        extra_events = extra_events_factory(event) if extra_events_factory else []
 
         daily_log_file = _daily_log_file()
         snapshots = {tasks_file: (True, content)}
@@ -359,13 +447,14 @@ def complete_by_id(
                         "message": "Daily-note completion log failed; active board was not changed.",
                     },
                 }
+            event["metadata"].update(logged)
 
             write_stage = "board-write"
             _atomic_write(tasks_file, new_content)
             write_stage = "ledger-append"
-            append_event(event, path=ledger_path(tasks_file))
+            append_event(event, path=ledger_file)
             for extra_event in extra_events:
-                append_event(extra_event, path=ledger_path(tasks_file))
+                append_event(extra_event, path=ledger_file)
         except OSError as exc:
             restore_error = _restore_after_failure(snapshots)
             code = "ledger-append-failed" if write_stage == "ledger-append" else "task-state-write-failed"
@@ -383,6 +472,7 @@ def complete_by_id(
             "ok": True,
             "task_id": task_id,
             "title": record.title,
+            "completion_id": event["event_id"],
             "event": event,
             "extra_events": extra_events,
             # A recurring task is rolled forward (kept on the board with the same
@@ -470,6 +560,229 @@ def cancel_by_id(
             "task_id": task_id,
             "title": record.title,
             "event": event,
+        }
+
+
+def revert_completion(completion_id: str, personal: bool = False) -> dict:
+    lock_file = _tasks_file_for_board(personal)
+    with board_flock(lock_file):
+        ledger_file = ledger_path(lock_file)
+        events = read_events(ledger_file)
+        completion_index = -1
+        completion: dict[str, Any] | None = None
+        for index, event in enumerate(events):
+            if (
+                event.get("event_id") == completion_id
+                and event.get("event_type") == "state_transition"
+                and event.get("next_state") == "done"
+            ):
+                completion_index = index
+                completion = event
+                break
+        if completion is None:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "completion-not-found",
+                    "message": f"No completion state_transition event found for {completion_id}.",
+                },
+            }
+
+        if completion_id in _reverted_transition_ids(events):
+            return {
+                "ok": False,
+                "error": {
+                    "code": "completion-already-reverted",
+                    "message": f"Completion {completion_id} has already been reverted.",
+                },
+            }
+
+        metadata = completion.get("metadata") or {}
+        snapshot = metadata.get("board_snapshot")
+        if not isinstance(snapshot, dict):
+            return {
+                "ok": False,
+                "error": {
+                    "code": "completion-snapshot-missing",
+                    "message": "Completion event has no board_snapshot metadata; nothing was changed.",
+                },
+            }
+
+        completion_task_id = completion.get("task_id")
+        snapshot_task_id = snapshot.get("task_id")
+        if (
+            not isinstance(completion_task_id, str)
+            or not completion_task_id
+            or snapshot_task_id != completion_task_id
+        ):
+            return {
+                "ok": False,
+                "error": {
+                    "code": "revert-target-mismatch",
+                    "message": "Completion snapshot task_id does not match the completion event; nothing was changed.",
+                },
+            }
+
+        snapshot_file_raw = snapshot.get("file")
+        tasks_file = lock_file
+        if isinstance(snapshot_file_raw, str) and snapshot_file_raw:
+            tasks_file = Path(snapshot_file_raw).expanduser()
+            if not _same_path(tasks_file, lock_file):
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "revert-target-mismatch",
+                        "message": "Completion snapshot targets a different board than the requested personal flag; nothing was changed.",
+                    },
+                }
+
+        later_terminal = _later_unreverted_terminal_event(events, completion_index, completion_task_id)
+        if later_terminal is not None:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "revert-out-of-order",
+                    "message": "revert the newer completion first",
+                    "later_event_id": later_terminal.get("event_id"),
+                },
+            }
+
+        daily_path_raw = metadata.get("daily_note_path")
+        daily_line = metadata.get("daily_note_line")
+        daily_context_line = metadata.get("daily_note_context_line")
+        if (
+            not isinstance(daily_path_raw, str)
+            or not daily_path_raw
+            or not isinstance(daily_line, str)
+            or not daily_line
+            or not isinstance(daily_context_line, str)
+            or not daily_context_line
+        ):
+            return {
+                "ok": False,
+                "error": {
+                    "code": "completion-log-metadata-missing",
+                    "message": "Completion event has no daily-note block identity; nothing was changed.",
+                },
+            }
+        daily_path = Path(daily_path_raw).expanduser()
+
+        try:
+            board_content = tasks_file.read_text(encoding="utf-8")
+        except FileNotFoundError as exc:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "tasks-file-missing",
+                    "message": str(exc),
+                },
+            }
+        except OSError as exc:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "task-state-read-failed",
+                    "message": f"Could not read active board; nothing was changed: {exc}",
+                },
+            }
+
+        restore = resolve_board_restore(board_content, snapshot)
+        if not restore.get("ok"):
+            return {
+                "ok": False,
+                "error": {
+                    "code": "board-restore-conflict",
+                    "message": "Completion could not be reverted because the board restore is ambiguous; nothing was changed.",
+                    "reason": restore.get("reason"),
+                    "candidates": restore.get("candidates"),
+                },
+            }
+
+        if not daily_path.exists() or not daily_path.is_file():
+            return {
+                "ok": False,
+                "error": {
+                    "code": "completion-log-line-missing",
+                    "message": "Daily-note completion line is not present; nothing was changed.",
+                },
+            }
+        try:
+            daily_content = daily_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "completion-log-read-failed",
+                    "message": f"Could not read daily note; nothing was changed: {exc}",
+                },
+            }
+        new_daily_content, daily_block_matches = _remove_exact_completion_block(
+            daily_content,
+            daily_line,
+            daily_context_line,
+            completion_task_id,
+        )
+        if daily_block_matches != 1:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "completion-log-line-ambiguous",
+                    "message": "Daily-note completion block could not be unambiguously located; nothing was changed.",
+                    "candidates": daily_block_matches,
+                },
+            }
+
+        revert_event = new_event(
+            "state_transition_reverted",
+            task_id=completion_task_id,
+            source="user_command",
+            reason="revert_completion",
+            metadata={
+                "completion_id": completion_id,
+                "reverted_event_id": completion_id,
+                "task_id": completion_task_id,
+            },
+        )
+
+        snapshots = {
+            tasks_file: (True, board_content),
+            daily_path: (True, daily_content),
+        }
+        ledger_snapshot = _snapshot_regular(ledger_file)
+        if ledger_snapshot is not None:
+            snapshots[ledger_file] = ledger_snapshot
+
+        write_stage = "board-write"
+        try:
+            new_board_content = str(restore.get("new_content", board_content))
+            if new_board_content != board_content:
+                _atomic_write(tasks_file, new_board_content)
+            write_stage = "completion-log"
+            _atomic_write(daily_path, new_daily_content)
+            write_stage = "ledger-append"
+            append_event(revert_event, path=ledger_file)
+        except OSError as exc:
+            restore_error = _restore_after_failure(snapshots)
+            code = "ledger-append-failed" if write_stage == "ledger-append" else "task-state-write-failed"
+            error = {
+                "code": code,
+                "message": f"Completion revert write failed; snapshots were restored: {exc}",
+            }
+            if restore_error:
+                error["restore_error"] = restore_error
+            return {
+                "ok": False,
+                "error": error,
+            }
+
+        return {
+            "ok": True,
+            "completion_id": completion_id,
+            "task_id": completion_task_id,
+            "board_restored": bool(restore.get("restored")),
+            "daily_note_line_removed": True,
+            "overwrote_edit": bool(restore.get("overwrote_edit")),
+            "event": revert_event,
         }
 
 
