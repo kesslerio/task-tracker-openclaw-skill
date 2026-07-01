@@ -178,6 +178,8 @@ KNOWN_EVENT_SOURCES: frozenset[str] = frozenset({
     "metadata_repair",
     "ledger_agent",
     "agent_autonomous",
+    "merged_pr",
+    "calendar",
 })
 
 

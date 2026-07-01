@@ -17,7 +17,7 @@ import initiation_eval as ev  # noqa: E402
 import initiation_store as store  # noqa: E402
 
 TASK = "tsk_aaaaaaaaaaaaaaaa"
-NOW = cos_config.local_now().replace(microsecond=0)
+NOW = cos_config.local_now().replace(hour=12, minute=0, second=0, microsecond=0)
 TODAY = NOW.astimezone(cos_config.local_tz()).date().isoformat()
 SLOT = ic.focus_episode_slot("work", TASK, TODAY)
 

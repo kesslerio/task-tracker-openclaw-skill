@@ -128,6 +128,35 @@ def _evidence(
 # error handling ONCE, so github/gmail never copy-paste a try/except.
 
 
+def _run_json_harvest(
+    source: str,
+    cmd: list[str],
+    *,
+    trigger: str,
+    timeout: int = 15,
+    log_failure: bool = True,
+) -> tuple[Any | None, bool]:
+    """Run one harvest subprocess and decode JSON.
+
+    ``log_failure=False`` is for capability probes where a fallback command is
+    expected, such as older ``gh`` builds rejecting an expanded ``--json`` list.
+    """
+    component = f"{COMPONENT}:{source}"
+    if error_envelope.breaker_open(component):
+        return None, True
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(
+                result.returncode, cmd[0], output=result.stdout, stderr=result.stderr
+            )
+        return json.loads(result.stdout), False
+    except _SUBPROCESS_FAILURES as exc:
+        if log_failure:
+            error_envelope.log_degraded(component, exc, trigger=trigger, check=source)
+        return None, True
+
+
 def _harvest(
     source: str,
     cmd: list[str],
@@ -150,19 +179,10 @@ def _harvest(
     failure too: the source is unprovenly skipped, NOT confirmed empty. Without this
     flag a gh/gog subprocess failure silently swallows to ``[]`` and false-greens.
     """
-    component = f"{COMPONENT}:{source}"
-    if error_envelope.breaker_open(component):
+    payload, failed = _run_json_harvest(source, cmd, trigger=trigger, timeout=timeout)
+    if failed:
         return [], True
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        if result.returncode != 0:
-            raise subprocess.CalledProcessError(
-                result.returncode, cmd[0], output=result.stdout, stderr=result.stderr
-            )
-        return parse(json.loads(result.stdout)), False
-    except _SUBPROCESS_FAILURES as exc:
-        error_envelope.log_degraded(component, exc, trigger=trigger, check=source)
-        return [], True
+    return parse(payload), False
 
 
 def _since_date(window: str, since_override: str | None, reference: date | None = None) -> str:
@@ -215,6 +235,91 @@ def _first_line(value: Any) -> str:
     return _WHITESPACE_RE.sub(" ", str(value or "").splitlines()[0] if str(value or "").splitlines() else "").strip()
 
 
+def _repo_name_with_owner(repo: dict[str, Any]) -> str:
+    value = repo.get("nameWithOwner") or repo.get("fullName")
+    if value:
+        return str(value)
+    owner = repo.get("owner")
+    owner_login = owner.get("login") if isinstance(owner, dict) else None
+    name = repo.get("name")
+    if owner_login and name:
+        return f"{owner_login}/{name}"
+    return str(name or "")
+
+
+def _issue_repo_name(issue: dict[str, Any], fallback_repo: str) -> str:
+    repo = issue.get("repository") if isinstance(issue.get("repository"), dict) else {}
+    return _repo_name_with_owner(repo) or fallback_repo
+
+
+def _closed_issue_references(pr: dict[str, Any], *, fallback_repo: str) -> list[str]:
+    """Return closure references as repo#number and issue URL strings."""
+    raw = pr.get("closingIssuesReferences")
+    if isinstance(raw, dict):
+        raw = raw.get("nodes") or raw.get("items") or []
+    if not isinstance(raw, list):
+        return []
+    refs: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: Any) -> None:
+        text = str(value or "").strip()
+        if text and text not in seen:
+            refs.append(text)
+            seen.add(text)
+
+    for issue in raw:
+        if not isinstance(issue, dict):
+            continue
+        number = issue.get("number")
+        if number in (None, ""):
+            continue
+        repo_name = _issue_repo_name(issue, fallback_repo)
+        if repo_name:
+            add(f"{repo_name}#{number}")
+        add(issue.get("url"))
+    return refs
+
+
+def _pr_author_login(pr: dict[str, Any]) -> str | None:
+    author = pr.get("author")
+    if isinstance(author, dict):
+        login = author.get("login")
+        return str(login).strip() if login else None
+    if author:
+        return str(author).strip()
+    return None
+
+
+def _view_pr_details(repo_name: str, number: Any, *, trigger: str) -> dict[str, Any]:
+    if not repo_name or number in (None, ""):
+        return {}
+    cmd = [
+        "gh", "pr", "view", str(number),
+        "--repo", repo_name,
+        "--json", "closingIssuesReferences,number,url,author,mergedAt,state",
+    ]
+    try:
+        payload, failed = _run_json_harvest(
+            "github-pr-view",
+            cmd,
+            trigger=trigger,
+            log_failure=False,
+        )
+    except Exception:
+        return {}
+    return payload if not failed and isinstance(payload, dict) else {}
+
+
+def _merge_pr_details(pr: dict[str, Any], details: dict[str, Any]) -> dict[str, Any]:
+    for key in ("closingIssuesReferences", "author", "mergedAt", "state", "number", "url"):
+        value = details.get(key)
+        if key not in pr or pr.get(key) in (None, "", []):
+            if value not in (None, ""):
+                pr[key] = value
+    return pr
+
+
 def harvest_github(
     since: str,
     *,
@@ -232,9 +337,13 @@ def harvest_github(
         items = payload if isinstance(payload, list) else payload.get("items", []) if isinstance(payload, dict) else []
         evidence: list[dict[str, Any]] = []
         for pr in items:
+            if not isinstance(pr, dict):
+                continue
             repo = pr.get("repository") or {}
-            repo_name = repo.get("nameWithOwner") or repo.get("name") or ""
+            repo_name = _repo_name_with_owner(repo)
             number = pr.get("number")
+            if "closingIssuesReferences" not in pr or pr.get("author") is None:
+                pr = _merge_pr_details(pr, _view_pr_details(repo_name, number, trigger=trigger))
             url = pr.get("url")
             title = pr.get("title") or ""
             if not title or number is None:
@@ -259,19 +368,35 @@ def harvest_github(
                 {
                     "provider_id": canonical,
                     "provider_state": provider_state,
+                    "state": pr.get("state"),
+                    "merged_at": pr.get("mergedAt"),
+                    "author": pr.get("author"),
+                    "author_login": _pr_author_login(pr),
+                    "closes_issues": _closed_issue_references(pr, fallback_repo=repo_name),
                     "occurred_at": occurred_at,
                 }
             )
             evidence.append(item)
         return evidence
 
+    pr_fields = "title,closedAt,mergedAt,repository,url,number,state,author,closingIssuesReferences"
+    fallback_pr_fields = "title,closedAt,repository,url,number"
     pr_cmd = [
         "gh", "search", "prs", "--author", "@me", "--merged",
         "--merged-at", _date_range(query_start, query_end, since),
-        "--json", "title,closedAt,repository,url,number",
+        "--json", pr_fields,
         "--limit", "100",
     ]
-    pr_evidence, pr_failed = _harvest("github", pr_cmd, parse_prs, trigger=trigger)
+    pr_payload, pr_failed = _run_json_harvest("github", pr_cmd, trigger=trigger, log_failure=False)
+    if pr_failed:
+        fallback_pr_cmd = [
+            "gh", "search", "prs", "--author", "@me", "--merged",
+            "--merged-at", _date_range(query_start, query_end, since),
+            "--json", fallback_pr_fields,
+            "--limit", "100",
+        ]
+        pr_payload, pr_failed = _run_json_harvest("github", fallback_pr_cmd, trigger=trigger)
+    pr_evidence = [] if pr_failed else parse_prs(pr_payload)
     if not harvest_commits:
         return pr_evidence, pr_failed
 
@@ -467,7 +592,7 @@ def _synthetic_content(evidence: list[dict[str, Any]]) -> str:
     return "\n".join(f"- [x] {_synthetic_line_title(item['match_title'])}" for item in evidence)
 
 
-def match_evidence(evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def match_evidence(evidence: list[dict[str, Any]], *, personal: bool = False) -> list[dict[str, Any]]:
     """Match harvested evidence against the active board via the shared matcher.
 
     Returns one enriched record per evidence item, carrying its source metadata
@@ -479,7 +604,7 @@ def match_evidence(evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not evidence:
         return []
     content = _synthetic_content(evidence)
-    _parsed, matched = match_evidence_content(content)
+    _parsed, matched = match_evidence_content(content, personal=personal)
     if len(matched) != len(evidence):
         # The placeholder guard makes this unreachable; assert rather than risk
         # silent wrong-task attribution from a positional zip over misaligned lists.
