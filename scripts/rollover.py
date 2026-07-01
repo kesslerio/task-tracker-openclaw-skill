@@ -20,7 +20,7 @@ from typing import Any, Iterable
 import cos_config
 import error_envelope
 from task_ledger import ledger_path, read_events
-from task_records import TaskRecord, task_records
+from task_records import TaskRecord, repair_hint, task_records
 from task_transitions import _extract_due_date, _set_due_date
 from utils import (
     PRIORITY_TO_SECTION,
@@ -343,7 +343,7 @@ def render_candidates(
                         "raw_line": candidate.record.raw_line,
                     }
                 )
-                lines.append(f"<!-- repair: missing task_id:: for \"{candidate.record.title}\" -->")
+                lines.append(repair_hint(candidate.record.title))
     if parking_lot_lines is not None:
         lines.extend(["", *parking_lot_lines])
     return "\n".join(lines).rstrip() + "\n", missing, duplicate_count
