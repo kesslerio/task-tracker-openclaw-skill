@@ -68,6 +68,7 @@ _SEP = ":"
 # * ``drop``  none      -> drop to the parking lot                 (EOD disposition)
 # * ``appr``  none      -> confirm a detected completion           (EOD confirm-gate)
 # * ``top``   none      -> set as tomorrow's #1                    (EOD)
+# * ``undo``  none      -> revert an auto completion by completion_id (standup veto)
 _ARG_POLICY: dict[str, str] = {
     "done": "none",
     "start": "none",
@@ -77,6 +78,7 @@ _ARG_POLICY: dict[str, str] = {
     "drop": "none",
     "appr": "none",
     "top": "none",
+    "undo": "none",
 }
 
 # The known actions, derived from the policy map so the two can never drift.
@@ -228,6 +230,11 @@ def approve_button(task_id: str) -> dict[str, Any] | None:
 def set_top_button(task_id: str) -> dict[str, Any] | None:
     """``tt:top:<id>`` -- set the task as tomorrow's #1 (EOD)."""
     return _button("Set as #1", "top", task_id)
+
+
+def undo_button(completion_id: str) -> dict[str, Any] | None:
+    """``tt:undo:<completion_id>`` -- revert an auto completion (standup veto)."""
+    return _button("UNDO", "undo", completion_id)
 
 
 def nag_row(task_id: str, *, snooze_span: str = "1d") -> list[dict[str, Any]]:

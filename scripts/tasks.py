@@ -7,6 +7,7 @@ Usage:
     tasks.py --personal list
     tasks.py add "Task title" [--priority high|medium|low] [--due YYYY-MM-DD]
     tasks.py done "task_id"
+    tasks.py revert "completion_id"
     tasks.py blockers [--person NAME]
     tasks.py archive
 """
@@ -40,7 +41,7 @@ from task_identity import audit_payload, print_json as print_identity_json
 from task_audit import collect_task_audit, task_audit_summary
 from task_lines import remove_task_line
 from task_repair import repair_missing_ids
-from task_transitions import block_unsafe_query, cancel_by_id, complete_by_id, print_result
+from task_transitions import block_unsafe_query, cancel_by_id, complete_by_id, print_result, revert_completion
 from rollover import run_rollover
 from task_records import (
     active_records,
@@ -60,6 +61,7 @@ from utils import (
     _atomic_write,
 )
 
+COMPLETION_ID_RE = re.compile(r"evt_[0-9a-f]{32}")
 TASK_PRIMITIVES_SCHEMA_VERSION = "v1"
 
 
@@ -778,6 +780,39 @@ def done_task(args):
         sys.exit(2)
 
     result = complete_by_id(query, personal=args.personal, source="user_command")
+    print_result(result)
+    if not result.get("ok"):
+        sys.exit(2)
+
+
+def revert_task(args):
+    """Revert a completion by completion_id only."""
+    completion_id = args.completion_id.strip()
+    if not COMPLETION_ID_RE.fullmatch(completion_id):
+        print_result(
+            {
+                "ok": False,
+                "action": "revert",
+                "reason": "unsafe-completion-id",
+                "message": "Completion undo requires a completion_id.",
+                "error": {
+                    "code": "unsafe-completion-id",
+                    "message": "Completion undo requires a completion_id.",
+                    "query": args.completion_id,
+                },
+            }
+        )
+        sys.exit(2)
+
+    result = revert_completion(completion_id, personal=args.personal)
+    result.setdefault("action", "revert")
+    if result.get("ok"):
+        result.setdefault("reason", "reverted")
+        result.setdefault("message", f"Completion {completion_id} reverted.")
+    else:
+        error = result.get("error") or {}
+        result.setdefault("reason", error.get("code") or "revert-failed")
+        result.setdefault("message", error.get("message") or "Completion could not be reverted.")
     print_result(result)
     if not result.get("ok"):
         sys.exit(2)
@@ -1990,6 +2025,10 @@ def main():
     done_parser = subparsers.add_parser('done', help='Mark task as done by canonical task_id')
     done_parser.add_argument('query', help='Canonical task_id')
     done_parser.set_defaults(func=done_task)
+
+    revert_parser = subparsers.add_parser('revert', help='Revert a completion by completion_id')
+    revert_parser.add_argument('completion_id', help='Completion id returned by done/auto-complete')
+    revert_parser.set_defaults(func=revert_task)
 
     capture_parser = subparsers.add_parser(
         'capture',

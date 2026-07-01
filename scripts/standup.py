@@ -6,12 +6,14 @@ Daily Standup Generator - Creates a concise summary of today's priorities.
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).parent))
+import cos_config
 from candidate_review import candidate_review_summary
 from task_audit import task_audit_summary
 from daily_notes import extract_completed_actions, extract_completed_tasks
@@ -29,9 +31,12 @@ from standup_common import (
 )
 import error_envelope
 import reconcile
+import telegram_buttons
+from task_ledger import read_events
 from task_records import fallback_id_for
 from utils import (
     load_tasks,
+    get_tasks_file,
     get_missed_tasks_bucketed,
     regroup_by_effective_priority,
     summarize_objective_progress,
@@ -41,6 +46,18 @@ from utils import (
     format_duration,
     dependency_suffix,
     sprint_suffix,
+)
+
+AUTO_COMPLETION_SOURCES = frozenset({"chat_capture", "merged_pr", "calendar"})
+TAPPED_COMPLETION_SOURCES = frozenset({"user_command", "completion_candidate", "ledger_agent"})
+EXPLICIT_RECALL_AUTO_EVENTS = frozenset({"auto_completion_shown"})
+EXPLICIT_RECALL_ACCEPTED_EVENTS = frozenset({"auto_completion_accepted", "accepted"})
+EXPLICIT_RECALL_EXPIRED_EVENTS = frozenset({"auto_completion_expired", "expired"})
+EXPLICIT_RECALL_EVENTS = (
+    EXPLICIT_RECALL_AUTO_EVENTS
+    | EXPLICIT_RECALL_ACCEPTED_EVENTS
+    | EXPLICIT_RECALL_EXPIRED_EVENTS
+    | {"capture_miss"}
 )
 
 
@@ -376,6 +393,262 @@ def _draft_summary_lines(summary: dict | None, *, indent: str = "  ") -> list[st
     return lines
 
 
+def _local_aware(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=cos_config.local_tz())
+    return dt.astimezone(cos_config.local_tz())
+
+
+def _parse_event_timestamp(event: dict) -> datetime | None:
+    raw = event.get("timestamp")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return _local_aware(parsed)
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    return left.expanduser().resolve(strict=False) == right.expanduser().resolve(strict=False)
+
+
+def _work_board_path() -> Path | None:
+    raw = os.getenv("TASK_TRACKER_WORK_FILE")
+    if raw:
+        return Path(raw).expanduser()
+    try:
+        path, _fmt = get_tasks_file(personal=False)
+    except Exception:  # noqa: BLE001 -- standup must degrade instead of blanking
+        return None
+    return path
+
+
+def _parse_since_env(raw: str, now: datetime) -> datetime | None:
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        parsed = None
+    if parsed is not None:
+        return _local_aware(parsed)
+
+    match = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?", raw)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2) or "0")
+    if hour > 23 or minute > 59:
+        return None
+    return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def _auto_completion_since(now: datetime | None = None) -> datetime:
+    now = _local_aware(now or cos_config.local_now())
+    raw_since = os.getenv("TASK_TRACKER_MORNING_VETO_SINCE")
+    if raw_since:
+        parsed = _parse_since_env(raw_since, now)
+        if parsed is not None:
+            return parsed
+
+    try:
+        hour = int(os.getenv("TASK_TRACKER_MORNING_VETO_SINCE_HOUR", "6"))
+    except ValueError:
+        hour = 6
+    hour = min(max(hour, 0), 23)
+    return now.replace(hour=hour, minute=0, second=0, microsecond=0)
+
+
+def _completion_id(event: dict) -> str | None:
+    metadata = event.get("metadata") or {}
+    value = metadata.get("completion_id") or event.get("event_id")
+    return value if isinstance(value, str) and value else None
+
+
+def _reverted_completion_ids(events: list[dict]) -> set[str]:
+    reverted: set[str] = set()
+    for event in events:
+        if event.get("event_type") != "state_transition_reverted":
+            continue
+        metadata = event.get("metadata") or {}
+        for key in ("completion_id", "reverted_event_id"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value:
+                reverted.add(value)
+    return reverted
+
+
+def _has_auto_marker(event: dict) -> bool:
+    metadata = event.get("metadata") or {}
+    for key in (
+        "auto",
+        "auto_completion",
+        "auto_completed",
+        "auto_done",
+        "auto_marker",
+        "autowrite",
+        "high_trust_auto",
+    ):
+        if metadata.get(key) is True:
+            return True
+    marker = str(metadata.get("source") or metadata.get("origin") or "").casefold()
+    return marker in AUTO_COMPLETION_SOURCES or marker.startswith("auto")
+
+
+def _is_auto_completion(event: dict) -> bool:
+    return (
+        event.get("event_type") == "state_transition"
+        and event.get("next_state") == "done"
+        and _completion_id(event) is not None
+        and (
+            str(event.get("source") or "").casefold() in AUTO_COMPLETION_SOURCES
+            or _has_auto_marker(event)
+        )
+    )
+
+
+def _is_tapped_completion(event: dict) -> bool:
+    return (
+        event.get("event_type") == "state_transition"
+        and event.get("next_state") == "done"
+        and str(event.get("source") or "").casefold() in TAPPED_COMPLETION_SOURCES
+    )
+
+
+def _in_window(event: dict, *, since: datetime, now: datetime) -> bool:
+    stamped = _parse_event_timestamp(event)
+    return stamped is not None and since <= stamped <= now
+
+
+def _recall_counts(events: list[dict], *, since: datetime, now: datetime) -> dict:
+    windowed = [event for event in events if _in_window(event, since=since, now=now)]
+    shown = sum(1 for event in windowed if event.get("event_type") in EXPLICIT_RECALL_AUTO_EVENTS)
+    accepted = sum(1 for event in windowed if event.get("event_type") in EXPLICIT_RECALL_ACCEPTED_EVENTS)
+    expired = sum(1 for event in windowed if event.get("event_type") in EXPLICIT_RECALL_EXPIRED_EVENTS)
+    missed = sum(1 for event in windowed if event.get("event_type") == "capture_miss")
+    explicit = any(event.get("event_type") in EXPLICIT_RECALL_EVENTS for event in windowed)
+
+    auto = shown if shown else sum(1 for event in windowed if _is_auto_completion(event))
+    tapped = accepted if accepted else sum(1 for event in windowed if _is_tapped_completion(event))
+    return {
+        "auto": auto,
+        "shown": shown,
+        "accepted": accepted,
+        "tapped": tapped,
+        "expired": expired,
+        "missed_captures": missed,
+        "has_explicit_events": explicit,
+        "line": (
+            f"Recall: auto {auto}; tapped {tapped}; expired {expired}; "
+            f"missed captures {missed}"
+        ),
+    }
+
+
+def _undo_action(completion_id: str) -> dict:
+    callback_data = telegram_buttons.encode("undo", completion_id)
+    action = {
+        "label": "UNDO",
+        "completion_id": completion_id,
+        "command": ["python3", "scripts/tasks.py", "revert", completion_id],
+    }
+    if callback_data:
+        action["value"] = callback_data
+        action["callback_data"] = callback_data
+    return action
+
+
+def _auto_completion_row(event: dict) -> dict:
+    metadata = event.get("metadata") or {}
+    completion_id = _completion_id(event) or ""
+    stamped = _parse_event_timestamp(event)
+    completed_at = stamped.isoformat() if stamped else None
+    title = metadata.get("title") or event.get("title") or event.get("task_id") or completion_id
+    return {
+        "completion_id": completion_id,
+        "task_id": event.get("task_id"),
+        "title": str(title),
+        "source": event.get("source"),
+        "completed_at": completed_at,
+        "completed_time": stamped.strftime("%-I:%M %p") if stamped else "",
+        "action": _undo_action(completion_id),
+    }
+
+
+def _is_work_board_completion(event: dict, work_board: Path | None) -> bool:
+    metadata = event.get("metadata") or {}
+    snapshot = metadata.get("board_snapshot")
+    if not isinstance(snapshot, dict):
+        return False
+    raw_file = snapshot.get("file")
+    if not isinstance(raw_file, str) or not raw_file:
+        return False
+    if work_board is None:
+        return False
+    return _same_path(Path(raw_file), work_board)
+
+
+def _auto_completions_section(events: list[dict] | None = None, *, now: datetime | None = None) -> dict | None:
+    """Recent auto-completions from the current morning window, keyed by completion_id."""
+    now = _local_aware(now or cos_config.local_now())
+    since = _auto_completion_since(now)
+    work_board = _work_board_path()
+    try:
+        ledger_events = read_events() if events is None else events
+    except Exception as exc:  # noqa: BLE001 -- standup must degrade, not blank
+        error_envelope.log_degraded("standup:auto-completions", exc, trigger="user_command:/standup")
+        return None
+
+    reverted = _reverted_completion_ids(ledger_events)
+    rows = []
+    seen_completion_ids: set[str] = set()
+    for event in ledger_events:
+        completion_id = _completion_id(event)
+        if not completion_id or completion_id in reverted or completion_id in seen_completion_ids:
+            continue
+        if not _in_window(event, since=since, now=now):
+            continue
+        if not _is_auto_completion(event):
+            continue
+        # U6 callback dispatch currently reverts through tasks.py on the WORK board only.
+        # Until personal-board threading exists, only surface rows whose snapshot proves
+        # they belong to the configured work board.
+        if not _is_work_board_completion(event, work_board):
+            continue
+        seen_completion_ids.add(completion_id)
+        rows.append(_auto_completion_row(event))
+
+    recall = _recall_counts(ledger_events, since=since, now=now)
+    if not rows and not recall["has_explicit_events"]:
+        return None
+
+    return {
+        "schema_version": "1",
+        "window": {"since": since.isoformat(), "until": now.isoformat()},
+        "items": rows,
+        "recall": recall,
+    }
+
+
+def _render_auto_completions_section(lines: list[str], section: dict | None) -> None:
+    if not section:
+        return
+    items = section.get("items") or []
+    if not items and not (section.get("recall") or {}).get("has_explicit_events"):
+        return
+    lines.append("↩️ **Recent auto-completions:**")
+    for item in items:
+        when = f"{item.get('completed_time')} — " if item.get("completed_time") else ""
+        lines.append(f"  • {when}{item.get('title')}")
+    recall = section.get("recall") or {}
+    if recall.get("line"):
+        lines.append(f"  {recall['line']}.")
+    lines.append("")
+
+
 def format_split_standup(output: dict, date_display: str) -> list:
     """Format standup as 3 separate messages.
     
@@ -409,6 +682,11 @@ def format_split_standup(output: dict, date_display: str) -> list:
     if summary_lines:
         msg1_lines.append("")
         msg1_lines.extend(summary_lines)
+    auto_completion_lines: list[str] = []
+    _render_auto_completions_section(auto_completion_lines, output.get("auto_completions"))
+    if auto_completion_lines:
+        msg1_lines.append("")
+        msg1_lines.extend(line for line in auto_completion_lines if line)
     messages.append('\n'.join(msg1_lines).strip())
     
     # Message 2: Calendar events
@@ -601,6 +879,7 @@ def build_compact_standup_sections(output: dict) -> dict:
         "dos": dos,
         "completion_candidates": output.get("completion_candidates") or {},
         "evidence_candidates": output.get("evidence_candidates") or [],
+        "auto_completions": output.get("auto_completions"),
         "links": _build_daily_note_links(output.get("date")),
     }
 
@@ -660,6 +939,7 @@ def generate_standup(
         'completed': [],
         'evidence_candidates': [],
         'evidence_harvest': {},
+        'auto_completions': None,
         'objective_progress': {},
         'capacity': None,
         'capacity_pushback': None,
@@ -741,6 +1021,7 @@ def generate_standup(
     output['objective_progress'] = summarize_objective_progress(tasks_data)
     output['completion_candidates'] = candidate_review_summary()
     output['task_audit'] = task_audit_summary(limit=3)
+    output['auto_completions'] = _auto_completions_section()
 
     if json_output:
         return output
@@ -755,6 +1036,7 @@ def generate_standup(
     # line of the standup -- the read side of the daily loop.
     lines.append(output['tomorrow_pointer_line'])
     lines.append("")
+    _render_auto_completions_section(lines, output.get("auto_completions"))
 
     rendered_seen: set[tuple[str, str]] = set()
 

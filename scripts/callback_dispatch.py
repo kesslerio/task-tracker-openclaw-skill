@@ -10,7 +10,7 @@ first ``:``), so we re-prepend ``tt:`` and decode it with the SAME U1 codec
 
 What this module IS: a thin transport that turns a decoded tap into ONE invocation of an
 EXISTING command (``done`` / ``snooze`` / ``reschedule`` / ``carry`` / ``drop`` / ``approve`` /
-``set-top``) and prints ONE compact JSON result line. It adds no board semantics: every mutation
+``set-top`` / ``revert``) and prints ONE compact JSON result line. It adds no board semantics: every mutation
 goes through the existing reversible, gated, receipted command path.
 
 It invokes the underlying command MODULE directly (``nag_commands.py`` / ``harvest_ledger.py``)
@@ -107,6 +107,10 @@ def _set_top_argv(task_id: str, arg: str | None, topic_id: str) -> list[str]:
     return ["set-top", "--", task_id]
 
 
+def _undo_argv(completion_id: str, arg: str | None, topic_id: str) -> list[str]:
+    return ["revert", "--", completion_id]
+
+
 def _approve_argv(task_id: str, arg: str | None, topic_id: str) -> list[str]:
     # ``approve --topic-id <inbound topic> -- <task_id>``: the inbound topic id is forwarded so the
     # downstream topic guard (the authority) can accept or reject. We never gate it here. The
@@ -132,6 +136,7 @@ _ACTION_TO_COMMAND: dict[str, tuple[str, ArgvBuilder]] = {
     "carry": ("nag_commands.py", _carry_argv),
     "drop": ("nag_commands.py", _drop_argv),
     "top": ("nag_commands.py", _set_top_argv),
+    "undo": ("tasks.py", _undo_argv),
 }
 
 

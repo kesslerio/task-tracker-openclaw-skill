@@ -89,6 +89,11 @@ KNOWN_EVENT_TYPES: frozenset[str] = frozenset({
     "candidate_apply_failed",
     "capture_miss",
     "capture_envelope_seen",
+    "auto_completion_shown",
+    "auto_completion_accepted",
+    "auto_completion_expired",
+    "accepted",
+    "expired",
     # U1 -- trust foundation.
     "system_error",
     # U2 -- autonomy & audit substrate.

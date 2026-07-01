@@ -7,10 +7,11 @@ import json
 import os
 import re
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+import cos_config
 import task_records as task_record_module
 from autonomy import board_snapshot, resolve_board_restore
 from locks import sidecar_flock
@@ -27,6 +28,9 @@ DUE_RE = re.compile(r"(?:🗓️\s*|📅\s*)(\d{4}-\d{2}-\d{2})")
 # task as carried-from-yesterday. It is plain inline metadata (KTD-7): no new board
 # status field, the task stays ACTIVE.
 CARRIED_RE = re.compile(r"\s*carried::\s*\d{4}-\d{2}-\d{2}")
+COMPLETION_REVERT_OVERWROTE_EDIT_WARNING = (
+    " ⚠️ this line had been edited since the completion, so that edit was reverted too."
+)
 
 
 @contextmanager
@@ -258,6 +262,29 @@ def _maybe_terminal_noop(
 
 def _same_path(left: Path, right: Path) -> bool:
     return left.expanduser().resolve(strict=False) == right.expanduser().resolve(strict=False)
+
+
+def _local_aware(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=cos_config.local_tz())
+    return dt.astimezone(cos_config.local_tz())
+
+
+def _event_local_timestamp(event: dict[str, Any]) -> datetime | None:
+    raw = event.get("timestamp")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return _local_aware(parsed)
+
+
+def _completion_revert_cutoff(now: datetime | None = None) -> tuple[datetime, int]:
+    window_hours = max(0, cos_config.undo_window_board_hours())
+    ref = _local_aware(now or cos_config.local_now())
+    return ref - timedelta(hours=window_hours), window_hours
 
 
 def _daily_context_task_id(context_line: str) -> str | None:
@@ -632,6 +659,21 @@ def revert_completion(completion_id: str, personal: bool = False) -> dict:
                 },
             }
 
+        stamped = _event_local_timestamp(completion)
+        cutoff, window_hours = _completion_revert_cutoff()
+        if stamped is None or stamped < cutoff:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "completion-out-of-window",
+                    "message": (
+                        "Completion undo is outside the board undo window; "
+                        "nothing was changed."
+                    ),
+                    "window_hours": window_hours,
+                },
+            }
+
         metadata = completion.get("metadata") or {}
         snapshot = metadata.get("board_snapshot")
         if not isinstance(snapshot, dict):
@@ -848,13 +890,18 @@ def revert_completion(completion_id: str, personal: bool = False) -> dict:
                 "error": error,
             }
 
+        overwrote_edit = bool(restore.get("overwrote_edit"))
         return {
             "ok": True,
             "completion_id": completion_id,
             "task_id": completion_task_id,
             "board_restored": bool(restore.get("restored")),
             "daily_note_line_removed": True,
-            "overwrote_edit": bool(restore.get("overwrote_edit")),
+            "overwrote_edit": overwrote_edit,
+            "message": (
+                f"Completion {completion_id} reverted."
+                f"{COMPLETION_REVERT_OVERWROTE_EDIT_WARNING if overwrote_edit else ''}"
+            ),
             "event": revert_event,
         }
 
