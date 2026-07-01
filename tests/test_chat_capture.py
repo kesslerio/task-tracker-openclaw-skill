@@ -371,6 +371,21 @@ def test_quoted_raw_text_is_suppressed_to_miss_not_confirmable_candidate(tmp_pat
     assert "candidate_seen" not in _event_types(tmp_path)
 
 
+def test_raw_chat_retry_same_message_id_dedupes_candidate(tmp_path, monkeypatch):
+    work = _write_work_file(tmp_path)
+    _apply_env(monkeypatch, tmp_path, work, autowrite="false")
+
+    first = chat_capture.capture_text("finished Ship alpha milestone", message_id="tg-77")
+    # A gateway retry of the SAME message a moment later (different capture time)
+    # must dedupe on message_id, not spawn a second candidate.
+    monkeypatch.setenv("TASK_TRACKER_CAPTURE_NOW", "2999-01-01T00:00:00+00:00")
+    second = chat_capture.capture_text("finished Ship alpha milestone", message_id="tg-77")
+
+    assert first["action"] == "candidate"
+    assert second["action"] == "candidate"
+    assert _event_types(tmp_path).count("candidate_seen") == 1
+
+
 def test_recurring_task_in_envelope_becomes_candidate_never_auto(tmp_path, monkeypatch):
     work = _write_work_file(
         tmp_path,
