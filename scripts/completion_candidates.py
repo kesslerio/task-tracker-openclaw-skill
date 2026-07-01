@@ -51,9 +51,22 @@ def candidate_id_for(source: dict[str, Any], summary: str) -> str:
         "source_path": source.get("path"),
         "source_date": source.get("date"),
         "line_number": source.get("line_number"),
-        "timestamp": source.get("timestamp"),
         "summary": _normalize_summary(summary),
     }
+    message_id = source.get("message_id")
+    if message_id is not None:
+        # A chat message_id is the stable identity of its source message, so a
+        # retry of the same message dedupes to the same candidate. Exclude the
+        # (possibly auto-generated) timestamp from the hash — otherwise a retried
+        # capture a few seconds later hashes differently and spams a duplicate.
+        stable["message_id"] = message_id
+    else:
+        # Non-chat sources keep the legacy timestamp-in-hash identity unchanged.
+        stable["timestamp"] = source.get("timestamp")
+    for key in ("channel", "sender"):
+        value = source.get(key)
+        if value is not None:
+            stable[key] = value
     material = json.dumps(stable, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return f"cand_{hashlib.sha256(material.encode('utf-8')).hexdigest()[:20]}"
 

@@ -783,6 +783,40 @@ def done_task(args):
         sys.exit(2)
 
 
+def capture_task(args):
+    """Capture a chat-stated completion through the two-lane U3 pipeline."""
+    from chat_capture import capture_text
+
+    if args.personal:
+        print_result(
+            {
+                "ok": False,
+                "action": "refused",
+                "error": {
+                    "code": "personal-capture-refused",
+                    "message": (
+                        "capture refuses --personal; the gateway wrapper pins board "
+                        "scope per channel."
+                    ),
+                },
+            }
+        )
+        sys.exit(2)
+
+    result = capture_text(
+        args.text,
+        envelope=args.envelope,
+        sender=args.sender,
+        source=args.source,
+        channel=args.channel,
+        message_id=args.message_id,
+        personal=args.personal,
+    )
+    print_result(result)
+    if not result.get("ok"):
+        sys.exit(2)
+
+
 def remove_task(args):
     """Cancel/remove a task by canonical ID only."""
     query = args.query.strip()
@@ -1956,6 +1990,25 @@ def main():
     done_parser = subparsers.add_parser('done', help='Mark task as done by canonical task_id')
     done_parser.add_argument('query', help='Canonical task_id')
     done_parser.set_defaults(func=done_task)
+
+    capture_parser = subparsers.add_parser(
+        'capture',
+        help=(
+            'Capture a chat-stated completion on the work board. Raw text is '
+            'candidate-only; auto-write requires a verified gateway envelope.'
+        ),
+    )
+    capture_input = capture_parser.add_mutually_exclusive_group(required=True)
+    capture_input.add_argument('--text', help='Raw chat statement to stage as a candidate or miss')
+    capture_input.add_argument('--envelope', help='Signed gateway envelope JSON for verified auto-complete')
+    capture_parser.add_argument(
+        '--sender',
+        help='Sender id recorded for candidate/miss provenance only',
+    )
+    capture_parser.add_argument('--channel', help='Channel recorded for candidate/miss provenance')
+    capture_parser.add_argument('--message-id', help='Message id recorded for candidate/miss provenance')
+    capture_parser.add_argument('--source', default='chat', help='Source label stored on the candidate/miss')
+    capture_parser.set_defaults(func=capture_task)
 
     # Remove/cancel command
     remove_parser = subparsers.add_parser(

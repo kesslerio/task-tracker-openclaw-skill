@@ -66,6 +66,21 @@ Completion evidence candidates are suggestions stored in the ledger. Scanning
 daily-log/EOD-style evidence never changes active tasks. Candidate confirmation
 uses the same canonical-ID completion path as `tasks.py done`.
 
+Chat capture uses a two-lane trust model. **Free-form chat prose never
+auto-writes** — every raw `tasks.py capture --text "..."` message becomes a
+one-tap candidate (the extractor only ranks/prefills the suggested task; it is
+not an authorization boundary). Auto-write happens **only** via `tasks.py capture
+--envelope '<json>'` with a gateway-signed envelope: it requires both
+`TASK_TRACKER_CAPTURE_AUTOWRITE_ENABLED=true` and a valid HMAC signature over the
+envelope (keyed by `TASK_TRACKER_CAPTURE_ENVELOPE_SECRET`), and it resolves the
+completion by **exact `task_id` only** (no fuzzy/title matching), excluding
+recurring tasks. Envelopes carry a `message_id` (replay-guarded) and a fresh
+`timestamp`. Only the future gateway owner-verification wrapper — which verifies
+the sender and holds the signing secret in its own process environment — can
+produce a valid envelope, so a direct shell/agent `capture --text` call cannot
+auto-write no matter what the prose says. The wrapper also owns channel-to-board
+scope; `tasks.py --personal capture ...` is refused.
+
 Candidate JSON distinguishes direct confirmation from suggestions:
 `confirmable_task_id` appears only for exact canonical ID/link evidence.
 Title, fuzzy, fallback, and normalized-title evidence expose `suggested_match`
