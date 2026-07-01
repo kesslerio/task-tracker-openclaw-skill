@@ -18,6 +18,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cos_health
+import completion_candidates
 import evidence_record
 import harvest_ledger
 import harvest_state
@@ -297,6 +298,7 @@ def harvest(
         mutate,
         window=harvest_state.WINDOW_STANDUP,
     )
+    completion_candidates.scan_adapter_records(persisted_fresh)
 
     summary = standup_summarizer.summarize(_github_summary_metadata(persisted_fresh))
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,9 @@ from evidence_matching import (
     FUZZY_REVIEW_THRESHOLD,
     build_task_catalog,
     extract_done_lines,
+    extract_inline_identifiers,
     match_evidence_line,
+    normalize_title,
     safe_load_task_records,
 )
 from task_ledger import append_event, ledger_path, new_event, read_events
@@ -23,6 +26,7 @@ from utils import get_tasks_file
 
 ACTIVE_STATUSES = {"new", "shown", "snoozed", "apply_failed"}
 TERMINAL_STATUSES = {"confirmed", "rejected", "duplicate", "expired"}
+SMS_SOURCES = {"dialpad_sms", "sms", "dialpad"}
 DECISION_EVENTS = {
     "candidate_seen",
     "candidate_shown",
@@ -33,6 +37,10 @@ DECISION_EVENTS = {
     "candidate_expired",
     "candidate_apply_failed",
 }
+_SMS_SENT_RE = re.compile(r"\((\d+)\s+sent\)", re.IGNORECASE)
+_SMS_CANONICAL_RE = re.compile(r"^SMS thread with .+ \((\d+) sent\)$", re.IGNORECASE)
+_SMS_PROVIDER_OUTBOUND_RE = re.compile(r"(?:^|;)outbound=(\d+)(?:;|$)")
+_PROVIDER_STATE_RESPONSE_RE = re.compile(r"(?:^|;)response=([^;]*)")
 
 
 def _candidate_ledger_path(personal: bool = False) -> Path:
@@ -43,6 +51,92 @@ def _candidate_ledger_path(personal: bool = False) -> Path:
 def _normalize_summary(value: str) -> str:
     normalized = " ".join((value or "").casefold().split())
     return normalized
+
+
+def _hash_value(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:20]
+
+
+def _record_source(record: dict[str, Any]) -> str:
+    return str(record.get("source") or record.get("source_type") or "").strip().lower()
+
+
+def _record_response_status(record: dict[str, Any]) -> str:
+    for key in (
+        "self_response",
+        "self_response_status",
+        "selfResponseStatus",
+        "response",
+        "response_status",
+        "responseStatus",
+    ):
+        value = record.get(key)
+        if value not in (None, ""):
+            return str(value).strip().lower()
+    provider_state = str(record.get("provider_state") or "")
+    match = _PROVIDER_STATE_RESPONSE_RE.search(provider_state)
+    return match.group(1).strip().lower() if match else ""
+
+
+def _is_low_trust_calendar(record: dict[str, Any]) -> bool:
+    if _record_source(record) != "calendar":
+        return False
+    if str(record.get("kind") or "").strip().lower() == "commitment":
+        return True
+    return _record_response_status(record) != "accepted"
+
+
+def _is_sms(record: dict[str, Any]) -> bool:
+    return _record_source(record) in SMS_SOURCES
+
+
+def _is_low_trust_adapter_record(record: dict[str, Any]) -> bool:
+    return _is_sms(record) or _is_low_trust_calendar(record)
+
+
+def _sms_sent_count(record: dict[str, Any], text: str) -> str:
+    for match in (
+        _SMS_CANONICAL_RE.match(text),
+        _SMS_SENT_RE.search(text),
+        _SMS_PROVIDER_OUTBOUND_RE.search(str(record.get("provider_state") or "")),
+    ):
+        if match:
+            return match.group(1)
+    return "1"
+
+
+def _mask_sms_title(record: dict[str, Any], value: Any) -> str:
+    text = " ".join(str(value or "").split())
+    sent_count = _sms_sent_count(record, text)
+    return f"SMS thread with <contact> ({sent_count} sent)"
+
+
+def _adapter_summary(record: dict[str, Any]) -> str:
+    value = record.get("match_title") or record.get("title") or ""
+    if _is_sms(record):
+        return _mask_sms_title(record, value)
+    return " ".join(str(value).split())
+
+
+def _adapter_source_pointer(record: dict[str, Any]) -> dict[str, Any]:
+    pointer: dict[str, Any] = {
+        "type": "adapter",
+        "source": _record_source(record),
+        "kind": record.get("kind"),
+    }
+    evidence_hash = record.get("evidence_hash")
+    if evidence_hash:
+        pointer["evidence_hash"] = str(evidence_hash)
+    provider_id_hash = _hash_value(record.get("provider_id"))
+    if provider_id_hash:
+        pointer["provider_id_hash"] = provider_id_hash
+    provider_state_hash = _hash_value(record.get("provider_state"))
+    if provider_state_hash:
+        pointer["provider_state_hash"] = provider_state_hash
+    return pointer
 
 
 def candidate_id_for(source: dict[str, Any], summary: str) -> str:
@@ -64,6 +158,10 @@ def candidate_id_for(source: dict[str, Any], summary: str) -> str:
         # Non-chat sources keep the legacy timestamp-in-hash identity unchanged.
         stable["timestamp"] = source.get("timestamp")
     for key in ("channel", "sender"):
+        value = source.get(key)
+        if value is not None:
+            stable[key] = value
+    for key in ("provider_id_hash", "provider_state_hash", "evidence_hash"):
         value = source.get(key)
         if value is not None:
             stable[key] = value
@@ -141,7 +239,10 @@ def project_candidates(
             candidate["snoozed_until"] = metadata.get("until")
         elif event_type == "candidate_duplicate":
             candidate["status"] = "duplicate"
-            candidate["duplicate_of"] = metadata.get("duplicate_of")
+            if metadata.get("duplicate_of") is not None:
+                candidate["duplicate_of"] = metadata.get("duplicate_of")
+            if metadata.get("duplicate_of_task_id") is not None:
+                candidate["duplicate_of_task_id"] = metadata.get("duplicate_of_task_id")
         elif event_type == "candidate_expired":
             candidate["status"] = "expired"
             candidate["reason"] = metadata.get("reason")
@@ -194,6 +295,58 @@ def _build_candidate_from_match(item: dict[str, Any], source: dict[str, Any]) ->
     return candidate
 
 
+def _match_adapter_record(record: dict[str, Any], summary: str, *, personal: bool = False) -> dict[str, Any]:
+    identifiers = extract_inline_identifiers(summary)
+    line = {
+        "raw_line": summary,
+        "title": summary,
+        "normalized_title": normalize_title(summary),
+        "exact_identifiers": identifiers["exact"],
+        "fallback_identifiers": identifiers["fallback"],
+    }
+    records = safe_load_task_records(personal)
+    catalog = build_task_catalog(records)
+    return match_evidence_line(
+        line,
+        catalog,
+        auto_threshold=FUZZY_EVIDENCE_LINK_THRESHOLD,
+        review_threshold=FUZZY_REVIEW_THRESHOLD,
+    )
+
+
+def _build_candidate_from_adapter_record(record: dict[str, Any], *, personal: bool = False) -> dict[str, Any]:
+    summary = _adapter_summary(record)
+    source_pointer = _adapter_source_pointer(record)
+    candidate_id = candidate_id_for(source_pointer, summary)
+    match = _match_adapter_record(record, summary, personal=personal)
+    candidate = _build_candidate_from_match(match, source_pointer)
+    candidate.update(
+        {
+            "candidate_id": candidate_id,
+            "source": source_pointer,
+            "title": summary,
+            "raw_summary": summary,
+            "summary": summary,
+            "normalized_summary": normalize_title(summary),
+            "low_trust": True,
+            "trust": "low",
+            "candidate_only": True,
+            "auto_done_eligible": False,
+        }
+    )
+    return candidate
+
+
+def _append_candidate_seen(candidate: dict[str, Any], *, personal: bool = False) -> None:
+    event = new_event(
+        "candidate_seen",
+        task_id=candidate["candidate_id"],
+        source="completion_candidate_scan",
+        metadata={"candidate": candidate},
+    )
+    append_event(event, path=_candidate_ledger_path(personal))
+
+
 def _source_from_file(path: Path) -> tuple[str, dict[str, Any]]:
     content = path.read_text(encoding="utf-8")
     return content, {"type": "file", "path": str(path)}
@@ -242,13 +395,38 @@ def scan_content(content: str, source: dict[str, Any], *, personal: bool = False
         if candidate["candidate_id"] in existing:
             already_seen.append(existing[candidate["candidate_id"]])
             continue
-        event = new_event(
-            "candidate_seen",
-            task_id=candidate["candidate_id"],
-            source="completion_candidate_scan",
-            metadata={"candidate": candidate},
-        )
-        append_event(event, path=_candidate_ledger_path(personal))
+        _append_candidate_seen(candidate, personal=personal)
+        created.append(candidate)
+
+    return {
+        "created": created,
+        "existing": already_seen,
+        "totals": {
+            "parsed_evidence": len(candidates),
+            "created": len(created),
+            "existing": len(already_seen),
+        },
+    }
+
+
+def scan_adapter_records(records: list[dict[str, Any]], *, personal: bool = False) -> dict[str, Any]:
+    candidates = [
+        _build_candidate_from_adapter_record(record, personal=personal)
+        for record in records
+        if _is_low_trust_adapter_record(record)
+    ]
+    existing = {
+        candidate["candidate_id"]: candidate
+        for candidate in project_candidates(include_terminal=True, personal=personal)
+    }
+    created: list[dict[str, Any]] = []
+    already_seen: list[dict[str, Any]] = []
+
+    for candidate in candidates:
+        if candidate["candidate_id"] in existing:
+            already_seen.append(existing[candidate["candidate_id"]])
+            continue
+        _append_candidate_seen(candidate, personal=personal)
         created.append(candidate)
 
     return {
@@ -367,6 +545,13 @@ def _candidate_task_id(candidate: dict[str, Any], explicit_task_id: str | None) 
     return task_id, None
 
 
+def _terminal_noop_reason(result: dict[str, Any]) -> str | None:
+    if result.get("ok") or not result.get("noop"):
+        return None
+    reason = str(result.get("reason") or "")
+    return reason if reason.startswith("already-") else None
+
+
 def confirm_candidate(candidate_id: str, *, task_id: str | None = None, personal: bool = False) -> dict[str, Any]:
     candidate = get_candidate(candidate_id, personal=personal)
     if candidate is None:
@@ -398,6 +583,26 @@ def confirm_candidate(candidate_id: str, *, task_id: str | None = None, personal
         extra_events_factory=confirmed_events,
     )
     if not result.get("ok"):
+        terminal_reason = _terminal_noop_reason(result)
+        if terminal_reason:
+            append_event(
+                new_event(
+                    "candidate_duplicate",
+                    task_id=candidate_id,
+                    source="completion_candidate_cli",
+                    metadata={
+                        "task_id": resolved_task_id,
+                        "duplicate_of_task_id": resolved_task_id,
+                        "reason": terminal_reason,
+                    },
+                ),
+                path=_candidate_ledger_path(personal),
+            )
+            return {
+                "ok": True,
+                "candidate": get_candidate(candidate_id, include_terminal=True, personal=personal),
+                "completion": result,
+            }
         append_event(
             new_event(
                 "candidate_apply_failed",

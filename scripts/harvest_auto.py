@@ -20,11 +20,12 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cos_config
+import completion_candidates
 import error_envelope
 import harvest_ledger
 import harvest_state
 import harvest_window
-from adapters import calendar_adapter
+from adapters import calendar_adapter, dialpad_adapter
 from evidence_matching import (
     build_task_catalog,
     extract_inline_identifiers,
@@ -38,6 +39,7 @@ AUTO_ENV = "TASK_TRACKER_HIGH_TRUST_AUTO_ENABLED"
 TRUE_VALUES = {"1", "true", "yes", "on", "enabled"}
 ACTOR = "niemand-work"
 CALENDAR_COMPONENT = "ledger_harvest:calendar"
+SMS_COMPONENT = "ledger_harvest:dialpad_sms"
 RECURRING_RE = re.compile(r"\brecur\s*::", re.IGNORECASE)
 
 
@@ -414,6 +416,57 @@ def _calendar_evidence(
     return evidence, failed
 
 
+def _dialpad_evidence(
+    *,
+    since_override: str | None,
+    trigger: str,
+    evidence_window: harvest_window.HarvestWindow | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    resolved = evidence_window or harvest_window.resolve_standup_window(
+        target_date=_calendar_target_date(since_override)
+    )
+    try:
+        records, failed = dialpad_adapter.harvest(resolved=resolved, trigger=trigger)
+    except Exception as exc:  # noqa: BLE001 - SMS is additive, never a blocker.
+        error_envelope.log_degraded(SMS_COMPONENT, exc, trigger=trigger, check="dialpad_sms")
+        return [], True
+
+    evidence: list[dict[str, Any]] = []
+    for record in records:
+        provider_id = str(record.get("provider_id") or record.get("title") or "")
+        if not provider_id:
+            continue
+        item = dict(record)
+        item.setdefault("source", "dialpad_sms")
+        item.setdefault("source_type", "dialpad_sms")
+        item.setdefault("evidence_hash", harvest_ledger._evidence_hash("dialpad_sms", provider_id))
+        evidence.append(item)
+    return evidence, failed
+
+
+def _persist_low_trust_candidates(
+    records: list[dict[str, Any]],
+    *,
+    personal: bool,
+    dry_run: bool,
+) -> dict[str, Any]:
+    low_trust = [
+        record for record in records
+        if completion_candidates._is_low_trust_adapter_record(record)
+    ]
+    if dry_run or not low_trust:
+        return {
+            "created": [],
+            "existing": [],
+            "totals": {
+                "parsed_evidence": len(low_trust),
+                "created": 0,
+                "existing": 0,
+            },
+        }
+    return completion_candidates.scan_adapter_records(low_trust, personal=personal)
+
+
 def _auto_evidence_window(now: datetime | None) -> harvest_window.HarvestWindow | None:
     if now is None:
         return None
@@ -500,7 +553,22 @@ def run_auto_harvest(
         trigger=trigger,
         evidence_window=evidence_window,
     )
-    evidence = list(evidence) + calendar_evidence
+    dialpad_evidence, dialpad_failed = _dialpad_evidence(
+        since_override=since_override,
+        trigger=trigger,
+        evidence_window=evidence_window,
+    )
+    adapter_evidence = calendar_evidence + dialpad_evidence
+    low_trust_scan = _persist_low_trust_candidates(
+        adapter_evidence,
+        personal=personal,
+        dry_run=dry_run,
+    )
+    high_trust_adapter_evidence = [
+        item for item in adapter_evidence
+        if not completion_candidates._is_low_trust_adapter_record(item)
+    ]
+    evidence = list(evidence) + high_trust_adapter_evidence
     for item in evidence:
         item.setdefault("run_id", run_id)
     fresh = [
@@ -556,10 +624,11 @@ def run_auto_harvest(
         "completed": completed,
         "auto_completed": auto_completed,
         "candidates": candidates,
+        "low_trust_candidates": low_trust_scan,
         "dry_run": dry_run,
         "auto_eligible_count": len(auto_eligible),
-        "source_error": bool(source_error or calendar_failed),
-        "sources_tried": sources_tried + 1,
+        "source_error": bool(source_error or calendar_failed or dialpad_failed),
+        "sources_tried": sources_tried + 2,
         "evidence_count": len(fresh),
         "harvest_window_id": harvest_window_id,
         "run_id": run_id,
