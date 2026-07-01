@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import utils  # noqa: E402
 from rollover import rollover_board  # noqa: E402
+from task_records import repair_hint  # noqa: E402
 
 CANONICAL_HEADERS = (
     "## 🔴 Q1: Urgent & Important",
@@ -188,11 +189,44 @@ def test_rollover_carries_missing_task_id_and_flags_for_repair():
 
     assert "- [ ] **Bare open task** area:: Ops 🗓️2026-06-30" in result.content
     assert "task_id::tsk_" not in result.content
-    assert '<!-- repair: missing task_id:: for "Bare open task" -->' in result.content
+    assert repair_hint("Bare open task") in result.content
     assert result.missing_task_ids[0]["title"] == "Bare open task"
     q3_start = result.content.index("## 🟠 Q3: Waiting / Blocked")
     team_start = result.content.index("## 👥 Team Tasks")
     assert q3_start < result.content.index("Bare open task") < team_start
+
+
+def test_rollover_does_not_report_valid_task_id_as_missing():
+    board = """# Weekly TODOs — 2026-W25
+
+## 🔴 Q1
+- [ ] **Has valid id** task_id::tsk_marker area:: Ops
+"""
+    result = rollover_board(board, [], target_date="2026-06-29")
+
+    assert "- [ ] **Has valid id** task_id::tsk_marker area:: Ops" in result.content
+    assert "<!-- repair:" not in result.content
+    assert result.missing_task_ids == ()
+
+
+def test_rollover_reports_malformed_task_id_marker_for_repair():
+    raw_line = "- [ ] **Malformed marker** task_id:: area:: Ops"
+    board = f"""# Weekly TODOs — 2026-W25
+
+## 🔴 Q1
+{raw_line}
+"""
+    result = rollover_board(board, [], target_date="2026-06-29")
+
+    assert raw_line in result.content
+    assert repair_hint("Malformed marker") in result.content
+    assert result.missing_task_ids == (
+        {
+            "line_number": 4,
+            "title": "Malformed marker",
+            "raw_line": raw_line,
+        },
+    )
 
 
 def test_rollover_preserves_parking_lot_section_and_does_not_backlog_parked_tasks():

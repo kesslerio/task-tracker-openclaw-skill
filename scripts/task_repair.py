@@ -8,12 +8,22 @@ from pathlib import Path
 
 from task_identity import audit_identity, load_records, opaque_task_id
 from task_ledger import append_event, ledger_path, new_event
+from task_records import REPAIR_HINT_RE, TASK_ID_RE
 
 
 def _insert_task_id(raw_line: str, task_id: str) -> str:
     if "task_id::" in raw_line:
         return raw_line
     return f"{raw_line.rstrip()} task_id::{task_id}"
+
+
+def _adjacent_repair_hint_index(lines: list[str], idx: int) -> int | None:
+    if idx < 0 or idx >= len(lines) or not TASK_ID_RE.search(lines[idx]):
+        return None
+    adjacent = idx + 1
+    if adjacent < len(lines) and REPAIR_HINT_RE.match(lines[adjacent]):
+        return adjacent
+    return None
 
 
 def _preflight_ledger(tasks_file: Path) -> dict | None:
@@ -109,6 +119,7 @@ def repair_missing_ids(personal: bool = False, apply: bool = False) -> dict:
 
     lines = content.split("\n")
     event_objects = []
+    hint_indexes: set[int] = set()
     for repair in proposed:
         line_number = int(repair["line_number"])
         idx = line_number - 1
@@ -123,6 +134,9 @@ def repair_missing_ids(personal: bool = False, apply: bool = False) -> dict:
             }
         task_id = repair.get("task_id") or opaque_task_id(repair["raw_line"], line_number)
         lines[idx] = _insert_task_id(lines[idx], task_id)
+        hint_idx = _adjacent_repair_hint_index(lines, idx)
+        if hint_idx is not None:
+            hint_indexes.add(hint_idx)
         event = new_event(
             "metadata_repair",
             task_id=task_id,
@@ -131,6 +145,9 @@ def repair_missing_ids(personal: bool = False, apply: bool = False) -> dict:
             metadata={"line_number": line_number, "title": repair.get("title")},
         )
         event_objects.append(event)
+
+    for idx in sorted(hint_indexes, reverse=True):
+        del lines[idx]
 
     tasks_file.write_text("\n".join(lines), encoding="utf-8")
     events = []
