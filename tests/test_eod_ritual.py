@@ -23,6 +23,7 @@ env-sourced at runtime, never committed.
 
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import eod_ritual
+import harvest_auto
 import harvest_ledger
 import harvest_state
 import nag_commands
@@ -62,18 +64,26 @@ def env(tmp_path, monkeypatch):
     """Isolate every state file + the board + the ledger under tmp_path."""
     state_dir = tmp_path / "state"
     work = tmp_path / "Work Tasks.md"
+    personal = tmp_path / "Personal Tasks.md"
     work.write_text(WORK_BOARD)
+    personal.write_text("""# Personal
+
+## Q1
+- [ ] **Buy groceries** task_id::tsk_personal area:: Home
+""")
     ledger = tmp_path / "events.jsonl"
     daily = tmp_path / "daily"
 
     monkeypatch.setenv("TASK_MGMT_STATE_DIR", str(state_dir))
     monkeypatch.setenv("TASK_TRACKER_WORK_FILE", str(work))
+    monkeypatch.setenv("TASK_TRACKER_PERSONAL_FILE", str(personal))
     monkeypatch.setenv("TASK_TRACKER_LEDGER_FILE", str(ledger))
     monkeypatch.setenv("TASK_TRACKER_DAILY_NOTES_DIR", str(daily))
     monkeypatch.setenv("TASK_TRACKER_DONE_LOG_DIR", str(daily))
     monkeypatch.setenv("TASK_TRACKER_ERROR_LOG", str(state_dir / "errors.jsonl"))
     monkeypatch.setattr(utils, "OBSIDIAN_WORK", work)
-    return {"work": work, "ledger": ledger, "state_dir": state_dir, "daily": daily}
+    monkeypatch.setattr(utils, "OBSIDIAN_PERSONAL", personal)
+    return {"work": work, "personal": personal, "ledger": ledger, "state_dir": state_dir, "daily": daily}
 
 
 def _set_productivity_env(monkeypatch):
@@ -190,6 +200,73 @@ def test_zero_detections_is_a_clean_path_not_an_empty_prompt(env, monkeypatch):
     # No Confirm button anywhere, and no "until you tap" prompt for absent items.
     assert "tt:appr" not in payload["message"]
     assert "Tap Confirm" not in payload["message"]
+
+
+def test_auto_completed_task_is_named_when_no_candidates_remain(env, monkeypatch):
+    env["work"].write_text("""# Work
+
+## 🔴 Q1
+- [ ] **Add social updates to World Cup skill** https://github.com/kesslerio/world-cup-skill/issues/101 task_id::tsk_abc123 area:: Delivery
+""")
+    monkeypatch.setenv(harvest_auto.AUTO_ENV, "true")
+    monkeypatch.setenv("TASK_TRACKER_GITHUB_OWNER", "niemand")
+    _set_productivity_env(monkeypatch)
+    _stub_sources(
+        monkeypatch,
+        gh_payload=[{
+            "title": "Ship social updates",
+            "number": 7,
+            "repository": {"nameWithOwner": "kesslerio/world-cup-skill"},
+            "url": "https://github.com/kesslerio/world-cup-skill/pull/7",
+            "state": "MERGED",
+            "mergedAt": "2026-06-23T18:00:00Z",
+            "author": {"login": "niemand"},
+            "closingIssuesReferences": [{
+                "number": 101,
+                "repository": {"nameWithOwner": "kesslerio/world-cup-skill"},
+                "url": "https://github.com/kesslerio/world-cup-skill/issues/101",
+            }],
+        }],
+        gog_payload={"threads": []},
+    )
+
+    payload = eod_ritual.build_confirm_step()
+
+    assert payload["completed_count"] == 1
+    assert payload["detection_count"] == 0
+    assert payload["auto_completed"] == [{
+        "task_id": "tsk_abc123",
+        "title": "Add social updates to World Cup skill",
+        "source": "merged_pr",
+        "url": "https://github.com/kesslerio/world-cup-skill/pull/7",
+    }]
+    assert "Auto-completed 1 task" in payload["message"]
+    assert "Add social updates to World Cup skill" in payload["message"]
+    assert "Nothing auto-detected" not in payload["message"]
+    assert "tsk_abc123" not in env["work"].read_text()
+
+
+def test_confirm_step_threads_frozen_now_into_auto_harvest_window(env, monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[0] == "gh":
+            return _FakeCompleted(0, "[]")
+        if cmd[0] == "gog":
+            return _FakeCompleted(0, json.dumps({"threads": []}))
+        raise AssertionError(f"unexpected command {cmd!r}")
+
+    monkeypatch.setattr(harvest_ledger.subprocess, "run", fake_run)
+
+    payload = eod_ritual.build_confirm_step(now=datetime.fromisoformat("2026-06-23T18:00:00-07:00"))
+
+    assert payload["harvest_window_id"] == "2026-W26:2026-06-23:standup"
+    gh_cmd = next(cmd for cmd in calls if cmd[0] == "gh")
+    assert any("2026-06-22..2026-06-23" in arg for arg in gh_cmd)
+    gmail_cmd = next(cmd for cmd in calls if cmd[0] == "gog")
+    assert any("in:sent after:2026/06/22 before:2026/06/24" in arg for arg in gmail_cmd)
+    assert payload["message"].count("Nothing auto-detected") == 1
 
 
 # --- A no-match item is reported but NOT confirmable (no spurious button) -----
@@ -477,6 +554,40 @@ class _StubSender:
     def __call__(self, target, text, buttons=None):
         self.calls.append({"target": target, "text": text, "buttons": buttons})
         return {"message_id": f"msg-{len(self.calls)}"}
+
+
+def test_personal_eod_does_not_auto_complete_work_board(env, monkeypatch):
+    env["work"].write_text("""# Work
+
+## 🔴 Q1
+- [ ] **Add social updates to World Cup skill** https://github.com/kesslerio/world-cup-skill/issues/101 task_id::tsk_abc123 area:: Delivery
+""")
+    monkeypatch.setenv(harvest_auto.AUTO_ENV, "true")
+    monkeypatch.setenv("TASK_TRACKER_GITHUB_OWNER", "niemand")
+    _set_productivity_env(monkeypatch)
+    _stub_sources(
+        monkeypatch,
+        gh_payload=[{
+            "title": "Ship social updates",
+            "number": 7,
+            "repository": {"nameWithOwner": "kesslerio/world-cup-skill"},
+            "url": "https://github.com/kesslerio/world-cup-skill/pull/7",
+            "state": "MERGED",
+            "mergedAt": "2026-06-23T18:00:00Z",
+            "author": {"login": "niemand"},
+            "closingIssuesReferences": [{
+                "number": 101,
+                "repository": {"nameWithOwner": "kesslerio/world-cup-skill"},
+                "url": "https://github.com/kesslerio/world-cup-skill/issues/101",
+            }],
+        }],
+    )
+
+    result = eod_ritual.run(personal=True, sender=_StubSender())
+
+    assert result["ok"] is True
+    assert "tsk_abc123" in env["work"].read_text()
+    assert "Buy groceries" in env["personal"].read_text()
 
 
 def _read_summary(env):

@@ -106,6 +106,7 @@ def test_past_accepted_event_is_activity(monkeypatch):
     assert failed is False
     assert records[0]["kind"] == "activity"
     assert records[0]["provider_id"] == "evt_1"
+    assert records[0]["organizer_self"] is False
     assert "response=accepted" in records[0]["provider_state"]
 
 
@@ -124,6 +125,7 @@ def test_past_organized_event_is_activity(monkeypatch):
 
     assert len(records) == 1
     assert records[0]["kind"] == "activity"
+    assert records[0]["organizer_self"] is True
     assert "response=organized" in records[0]["provider_state"]
 
 

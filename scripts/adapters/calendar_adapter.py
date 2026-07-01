@@ -85,6 +85,14 @@ def _is_organized_by_self(event: dict[str, Any], account: str | None) -> bool:
     return False
 
 
+def _organizer_self_flag(event: dict[str, Any]) -> bool:
+    for key in ("organizer", "creator"):
+        value = event.get(key)
+        if isinstance(value, dict) and value.get("self") is True:
+            return True
+    return False
+
+
 def _event_allowed(event: dict[str, Any], *, account: str | None) -> tuple[bool, str]:
     status = str(event.get("status") or "").strip().lower()
     if status == "cancelled":
@@ -197,6 +205,7 @@ def _record_from_event(
         "occurred_at": start.isoformat(),
         "match_title": title,
         "title": title,
+        "organizer_self": _organizer_self_flag(event),
         "url": event.get("htmlLink"),
     }
 

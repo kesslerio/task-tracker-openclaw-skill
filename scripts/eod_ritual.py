@@ -1,38 +1,36 @@
 #!/usr/bin/env python3
-"""U4 EOD ritual -- the detect + button-confirm slice (first of the EOD units).
+"""U4 EOD ritual -- detect, high-trust auto-write, and button-confirm.
 
 This is the thin orchestration layer for the evening ritual's FIRST step: detect
-what got done today and render each detected completion with a tappable Confirm
-button. It owns NO new detection logic and NO new board semantics -- it reuses the
-existing ``done24h`` harvest (``harvest_ledger.run_harvest`` -- merged PRs + sent
-mail matched to the active board + manual ``/win`` captures) and the existing
+what got done today, auto-complete only the high-trust subset when explicitly
+enabled, and render the remaining detected completions with tappable Confirm
+buttons. It owns NO new matching logic and NO raw board writes -- it reuses the
+existing harvest/match seams and the existing
 ``tt:appr:<task_id>`` confirm-gate (U1's ``telegram_buttons`` builder; the U2
 plugin + dispatcher already route ``appr`` -> ``harvest_ledger.approve``, which is
 topic-guarded + reversible + ledger-writing).
 
-Invariant (mirrors ``/approve``): **NO board change without a tap.** U4 only
-DETECTS + RENDERS the confirm step; it marks NOTHING done. The harvest runs in
-``dry_run`` mode so it neither pushes a digest nor consumes/writes any state --
-detection is read-only. The actual confirmation happens later, when the user taps
-a Confirm button -> the U2 dispatcher invokes the existing ``harvest_ledger.approve``
-through the topic-guarded, reversible path. ``eod_ritual`` never auto-approves.
+Invariant: when ``TASK_TRACKER_HIGH_TRUST_AUTO_ENABLED`` is off, behavior remains
+the tap-confirm path. When the flag is on, only externally verified exact,
+unambiguous, non-recurring matches are completed via ``complete_by_id`` before
+buttons are rendered; all other evidence remains tap-confirmed.
 
 Scope boundary: this module spans detect + confirm (U4), the forced disposition (U5),
 setting tomorrow's #1 (U6), AND -- as of U7 -- the live DELIVERY of the assembled ritual
 through the receipt-backed seam, the human-readable Obsidian ``## EOD Summary``, the
 ``eod_review`` health record, and the deterministic-cron descriptor. It does NOT build
 the morning-standup reader (U8). ``eod_review.py`` already parses the daily note for
-done/not-done; this unit reuses ``run_harvest`` rather than re-implementing evidence
-detection, and leaves daily-note parsing to ``eod_review`` where the later EOD slices
-need it.
+done/not-done; this unit reuses the ``harvest_auto`` / ``harvest_ledger`` evidence
+seams and leaves daily-note parsing to ``eod_review`` where the later EOD slices need it.
 
 U7 -- delivery + summary + health + cron (KTD-1, KTD-5): the assembled EOD (the detect,
 disposition, and tomorrow's-#1 steps' text + buttons) is delivered through the SAME
 prove -> gate -> assert -> ``outbox.deliver_once`` seam the weekly digest uses
 (``ledger_delivery.deliver_auto_digest``), keyed on the local DATE so a same-day re-fire
-never double-sends. The board mutations U4/U5/U6 commit happen ONLY on the user's taps and
-are NOT coupled to this send: an env-unset / gate-blocked delivery returns a clean reason
-with NO partial send, and the confirmed taps already stand on the board regardless. On a
+never double-sends. Delivery is not coupled to board mutation: high-trust U4 writes
+already happened through ``complete_by_id`` before rendering, and all U5/U6 button
+writes still happen only on taps. An env-unset / gate-blocked delivery returns a
+clean reason with NO partial send, and any completed board changes already stand. On a
 delivered EOD the human-readable ``## EOD Summary`` (done today / still-open / tomorrow's
 #1) is upserted to the Obsidian daily note (``eod_summary``; IDEMPOTENT -- a re-run
 REPLACES the section, never appends). ``run_main`` records the REAL ``eod_review`` health
@@ -58,10 +56,10 @@ through the U2 dispatcher to the existing reversible, gated command path (``done
 ``carry`` / ``reschedule`` / ``drop``).
 
 Robustness: a broken harvest source (``gh``/``gog`` non-zero, a tripped circuit
-breaker) is absorbed inside ``run_harvest`` -- it returns ``source_error: True`` and
-yields whatever evidence the surviving sources produced (possibly none). U4 reports
-that as a one-line "harvest unavailable" note and STILL completes the detect step,
-so a flaky source never aborts the EOD (later slices proceed to disposition).
+breaker) is absorbed inside the harvest layer -- it returns ``source_error: True``
+and yields whatever evidence the surviving sources produced (possibly none). U4
+reports that as a one-line "harvest unavailable" note and STILL completes the
+detect step, so a flaky source never aborts the EOD.
 """
 
 from __future__ import annotations
@@ -81,7 +79,7 @@ import cos_config
 import delivery_target
 import eod_summary
 import error_envelope
-import harvest_ledger
+import harvest_auto
 import harvest_state
 import outbox
 import telegram_buttons
@@ -148,13 +146,13 @@ def _detection(match: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def detect(*, trigger: str = TRIGGER, now=None) -> dict[str, Any]:
-    """Detect today's completions via the ``done24h`` harvest -- READ-ONLY.
+def detect(*, trigger: str = TRIGGER, now=None, personal: bool = False) -> dict[str, Any]:
+    """Detect today's completions and split auto-complete vs confirm candidates.
 
-    Runs ``harvest_ledger.run_harvest`` on the 24h window in ``dry_run`` mode: the
-    harvest matches merged PRs + sent mail + manual wins against the active board
-    but pushes NO digest and writes NO state (detection never consumes evidence or
-    mutates anything). Returns a structured detect result:
+    Runs the high-trust auto orchestrator on the 24h window. With the feature flag
+    off this is the legacy read-only candidate path. With the flag on, eligible
+    matches are completed through ``complete_by_id`` before candidate buttons are
+    built. Returns a structured detect result:
 
     * ``detections`` -- the confirmable completions (each with a ``tt:appr`` Confirm
       button); EMPTY when nothing auto-detected (the caller renders a clean
@@ -170,18 +168,15 @@ def detect(*, trigger: str = TRIGGER, now=None) -> dict[str, Any]:
     ``run_harvest`` (it returns ``source_error`` rather than propagating); the
     ``main`` envelope classifies any other unhandled exception.
     """
-    result = harvest_ledger.run_harvest(
+    result = harvest_auto.run_auto_harvest(
         harvest_state.WINDOW_24H,
         since_override=None,
-        dry_run=True,
         trigger=trigger,
+        personal=personal,
+        dry_run=False,
         now=now,
     )
-    # ``run_harvest`` returns two result shapes: the full shape (with ``matches``)
-    # when there was content, and an early "nothing/blocked" shape (no ``matches``
-    # key) when the source was empty or the push was gated off. ``.get`` over both
-    # keeps detect agnostic to which path the harvest took.
-    matches = result.get("matches") or []
+    matches = result.get("candidates") or []
     detections = [_detection(m) for m in matches if _confirmable(m)]
     other_evidence_count = sum(1 for m in matches if not _confirmable(m))
     return {
@@ -189,6 +184,9 @@ def detect(*, trigger: str = TRIGGER, now=None) -> dict[str, Any]:
         "detections": detections,
         "detection_count": len(detections),
         "other_evidence_count": other_evidence_count,
+        "completed": result.get("completed") or [],
+        "auto_completed": result.get("auto_completed") or [],
+        "completed_count": sum(1 for item in result.get("completed") or [] if item.get("ok")),
         "harvest_unavailable": bool(result.get("source_error")),
         "harvest_window_id": result.get("harvest_window_id"),
     }
@@ -203,7 +201,14 @@ def _confirm_message(detect_result: dict[str, Any]) -> str:
     the user knows detection was partial, without any raw error text.
     """
     detections = detect_result["detections"]
+    auto_completed = detect_result.get("auto_completed") or []
     lines = ["EOD — detected completions"]
+    if auto_completed:
+        lines.append("")
+        plural = "s" if len(auto_completed) != 1 else ""
+        lines.append(f"Auto-completed {len(auto_completed)} task{plural}:")
+        for item in auto_completed:
+            lines.append(f"• {item.get('title') or item.get('task_id') or '(untitled)'}")
     if detections:
         lines.append("")
         lines.append("Tap Confirm to mark each done (nothing changes until you tap):")
@@ -211,24 +216,25 @@ def _confirm_message(detect_result: dict[str, Any]) -> str:
             suffix = f" [{det['source_type']}]" if det.get("source_type") else ""
             lines.append(f"• {det['title']}{suffix}")
     else:
-        lines.append("")
-        lines.append("Nothing auto-detected today.")
+        if not auto_completed:
+            lines.append("")
+            lines.append("Nothing auto-detected today.")
     if detect_result.get("harvest_unavailable"):
         lines.append("")
         lines.append(error_envelope.degraded_notice("harvest"))
     return "\n".join(lines)
 
 
-def build_confirm_step(*, trigger: str = TRIGGER, now=None) -> dict[str, Any]:
+def build_confirm_step(*, trigger: str = TRIGGER, now=None, personal: bool = False) -> dict[str, Any]:
     """Assemble the EOD detect + confirm-step output (structured, no delivery).
 
     This is the U4 deliverable: a structured payload carrying the confirm-step
     ``message`` text and the per-detection Confirm buttons. It performs NO live
-    send (U7 wires the receipt-backed delivery) and mutates NOTHING -- a tap on a
-    rendered ``tt:appr`` button later drives ``harvest_ledger.approve`` through the
-    existing reversible, topic-guarded path.
+    send (U7 wires the receipt-backed delivery). With high-trust auto disabled it
+    mutates nothing; with the flag enabled, only eligible matches have already gone
+    through ``complete_by_id`` before this payload is rendered.
     """
-    detected = detect(trigger=trigger, now=now)
+    detected = detect(trigger=trigger, now=now, personal=personal)
     return {
         "ok": True,
         "step": "detect_confirm",
@@ -236,6 +242,9 @@ def build_confirm_step(*, trigger: str = TRIGGER, now=None) -> dict[str, Any]:
         "detections": detected["detections"],
         "detection_count": detected["detection_count"],
         "other_evidence_count": detected["other_evidence_count"],
+        "completed": detected["completed"],
+        "auto_completed": detected["auto_completed"],
+        "completed_count": detected["completed_count"],
         "harvest_unavailable": detected["harvest_unavailable"],
         "harvest_window_id": detected["harvest_window_id"],
     }
@@ -581,7 +590,7 @@ def _eod_items(*, personal: bool = False, now: datetime | None = None) -> dict[s
     Returns ``{"chunks", "confirm", "disposition", "tomorrow"}`` -- the steps are kept so
     the ## EOD Summary derives from the same structured output.
     """
-    confirm = build_confirm_step()
+    confirm = build_confirm_step(personal=personal, now=now)
     disposition = build_disposition_step(personal=personal, now=now)
     tomorrow = build_tomorrow_step(personal=personal)
 
