@@ -104,6 +104,18 @@ def test_long_reference_field_is_not_over_redacted():
     long_title = "T" * 2000
     out = redaction.redact_event({"event_type": "x", "evidence": {"title": long_title}})
     assert out["evidence"]["title"] == long_title
+    daily_note_context_line = "  " + json.dumps({"task_id": "tsk_1", "title": long_title})
+    out = redaction.redact_event({
+        "event_type": "state_transition",
+        "metadata": {
+            "daily_note_path": "/tmp/" + "d" * 600,
+            "daily_note_line": "- 12:34 ✅ " + long_title,
+            "daily_note_context_line": daily_note_context_line,
+        },
+    })
+    assert out["metadata"]["daily_note_path"] == "/tmp/" + "d" * 600
+    assert out["metadata"]["daily_note_line"] == "- 12:34 ✅ " + long_title
+    assert out["metadata"]["daily_note_context_line"] == daily_note_context_line
 
 
 def test_short_text_reference_survives_long_text_blob_truncated():
