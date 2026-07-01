@@ -246,11 +246,40 @@ def complete_by_id(
     extra_events_factory: Callable[[dict], list[dict]] | None = None,
 ) -> dict:
     lock_file = _tasks_file_for_board(personal)
+    initial_tasks_file, _initial_content, initial_record, initial_error = _resolve_by_id(task_id, personal)
+    if initial_error:
+        noop = _maybe_terminal_noop(
+            initial_tasks_file or lock_file,
+            task_id,
+            personal,
+            initial_error,
+            {"done", "cancelled"},
+        )
+        return noop or initial_error
+    target_raw_line = initial_record.raw_line
+
     with board_flock(lock_file):
         tasks_file, content, record, error = _resolve_by_id(task_id, personal)
         if error:
             noop = _maybe_terminal_noop(tasks_file or lock_file, task_id, personal, error, {"done", "cancelled"})
             return noop or error
+        # Concurrency guard (recurring-safe): if a winner completed this occurrence
+        # while we waited on the board lock, our pre-lock target line is either gone
+        # (non-recurring removal) or rolled forward to a new due (recurring keeps the
+        # same task_id active). Either way the occurrence we captured is already done,
+        # so no-op instead of double-completing / advancing the recurrence twice.
+        # (Verified by test_concurrent_complete_recurring_serializes_to_one_completion.)
+        if record.raw_line != target_raw_line:
+            noop = _terminal_noop_result(tasks_file, task_id, personal, {"done", "cancelled"})
+            if noop:
+                return noop
+            return {
+                "ok": False,
+                "error": {
+                    "code": "task-line-resolution-failed",
+                    "message": "Target task line no longer matches the active board; active board was not changed.",
+                },
+            }
         ledger_error = _preflight_ledger(tasks_file)
         if ledger_error:
             return ledger_error
