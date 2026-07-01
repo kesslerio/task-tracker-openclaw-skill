@@ -169,6 +169,7 @@ def resolve_for_auto(task_id: str | None, catalog: list[dict[str, Any]]):
         candidate["record"]
         for candidate in catalog
         if getattr(candidate["record"], "task_id", None) == normalized_task_id
+        and not getattr(candidate["record"], "is_objective", False)
     ]
     return matches[0] if len(matches) == 1 else None
 

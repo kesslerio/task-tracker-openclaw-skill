@@ -343,10 +343,34 @@ The plugin authorizes nothing — the skill command + topic guard are the single
 authority, so a forged/stale tap can only no-op. `callback_data` is hard-capped at
 64 bytes (over-budget → the button is dropped and the typed command survives).
 
-> **Operator step (required for taps to work):** register the plugin in
-> `openclaw.json` `plugins.allow` + `entries`, boot-sync it as REAL files into the
-> AlphaClaw state root (never symlinks), and restart the gateway. Until then the
-> buttons render but a tap is a silent no-op.
+### Chat envelope signer (KTD8)
+
+The gateway chat auto-complete path is split into a sideloaded OpenClaw plugin
+and the existing Python capture verifier:
+
+- Plugin: `scripts/openclaw-plugins/task-tracker-envelope-signer/`
+- HMAC source of truth: `scripts/capture_envelope.py sign --json '<envelope>'`
+- Board write path: `scripts/tasks.py capture --envelope '<signed-envelope>'`
+
+The plugin uses OpenClaw's broad `message_received` typed hook. That hook carries
+the inbound text plus sender id, channel, message id, timestamp, and thread
+metadata, and it is fire-and-forget so normal agent dispatch continues even when
+the signer fails. The plugin only signs strict `done <task_id>` /
+`done task_id::<task_id>` text from a sender that exactly matches
+`commands.ownerAllowFrom` owner identity keys. Non-owners, missing owner config,
+free prose, nonexistent ids, duplicate ids, done tasks, and recurring tasks never
+receive a signed envelope.
+
+Set `TASK_TRACKER_CAPTURE_ENVELOPE_SECRET` and
+`TASK_TRACKER_CAPTURE_AUTOWRITE_ENABLED=1` in the gateway environment to enable
+verified auto-completion. The secret is never stored in this repo and must not be
+printed in logs.
+
+> **Operator step (required for the OpenClaw plugins to run):** register the
+> relevant plugin in `openclaw.json` `plugins.allow` + `entries`, boot-sync it as
+> REAL files into the AlphaClaw state root (never symlinks), and restart the
+> gateway. Until then the buttons render but taps are silent no-ops, and the chat
+> envelope signer does not observe inbound messages.
 
 ## Agent Invocation Guidance
 
