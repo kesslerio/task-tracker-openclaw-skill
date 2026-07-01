@@ -85,17 +85,12 @@ def _format_context(context: Optional[Dict[str, object]]) -> str:
     return f"  {rendered}\n"
 
 
-def log_done(
+def _append_log_entry(
     action: str,
     summary: str,
     context: Optional[Dict[str, object]] = None,
     log_path: Optional[Union[str, Path]] = None,
-) -> bool:
-    """
-    Log a completed action to today's markdown file.
-
-    Returns True when the entry is written, otherwise False.
-    """
+) -> Optional[dict[str, str]]:
     if not isinstance(action, str) or not action.strip():
         raise ValueError("action must be a non-empty string")
     if not isinstance(summary, str) or not summary.strip():
@@ -114,23 +109,25 @@ def log_done(
 
     log_dir = _resolve_log_dir(log_path)
     if log_dir is None:
-        return False
+        return None
 
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
     except (PermissionError, OSError) as exc:
         print(f"Error: cannot create log directory '{log_dir}': {exc}", file=sys.stderr)
-        return False
+        return None
 
     now = datetime.now()
     date_str = now.strftime("%Y-%m-%d")
     timestamp = now.strftime("%H:%M")
     log_file = log_dir / f"{date_str}.md"
     context_line = _format_context(context)
+    context_line_identity = context_line.rstrip("\r\n") if context_line else ""
 
     try:
         # Build the full entry as a single string so append is atomic-ish
-        entry = f"- {timestamp} ✅ {normalized_summary}\n"
+        action_line = f"- {timestamp} ✅ {normalized_summary}"
+        entry = f"{action_line}\n"
         if context_line:
             entry += context_line
 
@@ -138,9 +135,27 @@ def log_done(
             handle.write(entry)
     except (PermissionError, OSError) as exc:
         print(f"Error: cannot write log file '{log_file}': {exc}", file=sys.stderr)
-        return False
+        return None
 
-    return True
+    return {
+        "daily_note_path": str(log_file),
+        "daily_note_line": action_line,
+        "daily_note_context_line": context_line_identity,
+    }
+
+
+def log_done(
+    action: str,
+    summary: str,
+    context: Optional[Dict[str, object]] = None,
+    log_path: Optional[Union[str, Path]] = None,
+) -> bool:
+    """
+    Log a completed action to today's markdown file.
+
+    Returns True when the entry is written, otherwise False.
+    """
+    return _append_log_entry(action, summary, context, log_path) is not None
 
 
 def _merge_context(base: Optional[Dict[str, object]], extra: dict) -> dict:
@@ -214,8 +229,8 @@ def log_task_completed(
     due: Optional[str] = None,
     recur: Optional[str] = None,
     context: Optional[Dict[str, object]] = None,
-) -> bool:
-    """Log a completed task to daily notes."""
+) -> Optional[dict[str, str]]:
+    """Log a completed task and return the exact daily-note line identity."""
     extra: dict = {}
     if section:
         extra["section"] = section
@@ -225,7 +240,7 @@ def log_task_completed(
         extra["due"] = due
     if recur:
         extra["recur"] = recur
-    return log_done(
+    return _append_log_entry(
         action="task_completed",
         summary=title,
         context=_merge_context(context, extra) if extra else context,

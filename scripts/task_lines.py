@@ -19,12 +19,7 @@ def leading_indent_width(line: str) -> int:
     return len(line) - len(line.lstrip(" \t"))
 
 
-def remove_task_line(content: str, raw_line: str, line_number: int | None) -> str | None:
-    lines = content.split("\n")
-    target_index = line_index(lines, raw_line, line_number)
-    if target_index is None:
-        return None
-    target_indent = leading_indent_width(raw_line)
+def _task_block_end(lines: list[str], target_index: int, target_indent: int) -> int:
     remove_until = target_index + 1
     while remove_until < len(lines):
         line = lines[remove_until]
@@ -43,6 +38,26 @@ def remove_task_line(content: str, raw_line: str, line_number: int | None) -> st
             remove_until += 1
             continue
         break
+    return remove_until
+
+
+def task_line_block(content: str, raw_line: str, line_number: int | None) -> str | None:
+    lines = content.split("\n")
+    target_index = line_index(lines, raw_line, line_number)
+    if target_index is None:
+        return None
+    target_indent = leading_indent_width(raw_line)
+    remove_until = _task_block_end(lines, target_index, target_indent)
+    return "\n".join(lines[target_index:remove_until])
+
+
+def remove_task_line(content: str, raw_line: str, line_number: int | None) -> str | None:
+    lines = content.split("\n")
+    target_index = line_index(lines, raw_line, line_number)
+    if target_index is None:
+        return None
+    target_indent = leading_indent_width(raw_line)
+    remove_until = _task_block_end(lines, target_index, target_indent)
     return "\n".join(lines[:target_index] + lines[remove_until:])
 
 
