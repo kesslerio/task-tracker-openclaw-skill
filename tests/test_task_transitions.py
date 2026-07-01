@@ -1,6 +1,9 @@
 import json
 import os
 import subprocess
+import textwrap
+import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -9,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import task_transitions
 import task_records
+from locks import sidecar_flock
 from rollover import rollover_board
 
 
@@ -20,6 +24,19 @@ def _env(tmp_path, work):
     env["TASK_TRACKER_LEDGER_FILE"] = str(tmp_path / "events.jsonl")
     env["STANDUP_CALENDARS"] = "{}"
     return env
+
+
+def _apply_env(monkeypatch, env, work):
+    for key in (
+        "TASK_TRACKER_WORK_FILE",
+        "TASK_TRACKER_DAILY_NOTES_DIR",
+        "TASK_TRACKER_DONE_LOG_DIR",
+        "TASK_TRACKER_LEDGER_FILE",
+        "STANDUP_CALENDARS",
+    ):
+        value = env[key]
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(task_records, "get_tasks_file", lambda personal=False: (work, "obsidian"))
 
 
 def test_done_by_canonical_id_completes_one_task_and_writes_ledger(tmp_path):
@@ -625,6 +642,35 @@ def test_done_recurring_task_rolls_forward_next_due_date(tmp_path):
     assert "🗓️2026-05-27" in content
 
 
+def test_done_recurring_task_sequential_double_complete_advances_two_occurrences(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text("""# Work
+
+## 🔴 Q1
+- [ ] **Send daily update** task_id::tsk_daily recur::daily 🗓️2026-05-20
+""")
+    env = _env(tmp_path, work)
+
+    for _ in range(2):
+        proc = subprocess.run(
+            ["python3", "scripts/tasks.py", "done", "tsk_daily"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+        assert proc.returncode == 0
+        assert json.loads(proc.stdout)["ok"] is True
+
+    content = work.read_text()
+    assert "Send daily update" in content
+    assert "🗓️2026-05-22" in content
+    assert "🗓️2026-05-21" not in content
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    transitions = [event for event in events if event["event_type"] == "state_transition"]
+    assert len(transitions) == 2
+
+
 def test_done_recurring_task_reports_bad_rule_without_writes(tmp_path):
     work = tmp_path / "Work Tasks.md"
     original = """# Work
@@ -798,6 +844,190 @@ def test_restore_snapshots_is_atomic(tmp_path, monkeypatch):
 
     assert calls == [target], "restore must go through the atomic writer"
     assert target.read_text() == snapshot_content
+
+
+# --- U8a board mutation lock -------------------------------------------------
+
+
+def test_concurrent_complete_by_id_serializes_to_one_completion(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text("""# Work
+
+## 🔴 Q1
+- [ ] **Race task** task_id::tsk_race area:: Delivery
+""")
+    env = _env(tmp_path, work)
+    ready_dir = tmp_path / "ready"
+    ready_dir.mkdir()
+    env["RACE_READY_DIR"] = str(ready_dir)
+    scripts_dir = Path(__file__).resolve().parents[1] / "scripts"
+    worker = textwrap.dedent(f"""
+        import json
+        import os
+        import sys
+        import time
+        from pathlib import Path
+
+        sys.path.insert(0, {str(scripts_dir)!r})
+        ready_dir = Path(os.environ["RACE_READY_DIR"])
+        (ready_dir / f"{{os.getpid()}}.ready").write_text("ready", encoding="utf-8")
+        deadline = time.time() + 5
+        while len(list(ready_dir.glob("*.ready"))) < 2:
+            if time.time() > deadline:
+                print(json.dumps({{"ok": False, "error": {{"code": "barrier-timeout"}}}}))
+                sys.exit(3)
+            time.sleep(0.01)
+
+        import task_transitions
+        print(json.dumps(task_transitions.complete_by_id("tsk_race"), sort_keys=True))
+    """)
+
+    procs = [
+        subprocess.Popen(
+            ["python3", "-c", worker],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=Path(__file__).resolve().parents[1],
+            env=env,
+        )
+        for _ in range(2)
+    ]
+    payloads = []
+    for proc in procs:
+        stdout, stderr = proc.communicate(timeout=10)
+        assert proc.returncode == 0, stderr
+        payloads.append(json.loads(stdout))
+
+    assert sum(1 for payload in payloads if payload.get("ok") and not payload.get("noop")) == 1
+    assert sum(1 for payload in payloads if not payload.get("ok") and payload.get("noop")) == 1
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    transitions = [event for event in events if event["event_type"] == "state_transition"]
+    assert len(transitions) == 1
+    daily_text = "\n".join(path.read_text() for path in (tmp_path / "daily").glob("*.md"))
+    assert daily_text.count("✅ Race task") == 1
+    assert "Race task" not in work.read_text()
+
+
+def test_concurrent_complete_recurring_serializes_to_one_completion(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text("""# Work
+
+## 🔴 Q1
+- [ ] **Daily race task** task_id::tsk_daily_race recur::daily 🗓️2026-05-20
+""")
+    env = _env(tmp_path, work)
+    ready_dir = tmp_path / "ready"
+    ready_dir.mkdir()
+    env["RACE_READY_DIR"] = str(ready_dir)
+    scripts_dir = Path(__file__).resolve().parents[1] / "scripts"
+    worker = textwrap.dedent(f"""
+        import json
+        import os
+        import sys
+        from contextlib import contextmanager
+        from pathlib import Path
+
+        sys.path.insert(0, {str(scripts_dir)!r})
+        ready_dir = Path(os.environ["RACE_READY_DIR"])
+
+        import task_transitions
+        real_board_flock = task_transitions.board_flock
+
+        @contextmanager
+        def tracking_board_flock(path):
+            (ready_dir / f"{{os.getpid()}}.ready").write_text("ready", encoding="utf-8")
+            with real_board_flock(path):
+                yield
+
+        task_transitions.board_flock = tracking_board_flock
+        print(json.dumps(task_transitions.complete_by_id("tsk_daily_race"), sort_keys=True))
+    """)
+
+    with sidecar_flock(work):
+        procs = [
+            subprocess.Popen(
+                ["python3", "-c", worker],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=Path(__file__).resolve().parents[1],
+                env=env,
+            )
+            for _ in range(2)
+        ]
+        deadline = datetime.now().timestamp() + 10
+        while len(list(ready_dir.glob("*.ready"))) < 2:
+            assert datetime.now().timestamp() < deadline
+            for proc in procs:
+                assert proc.poll() is None
+            time.sleep(0.01)
+
+    payloads = []
+    for proc in procs:
+        stdout, stderr = proc.communicate(timeout=10)
+        assert proc.returncode == 0, stderr
+        payloads.append(json.loads(stdout))
+
+    assert sum(1 for payload in payloads if payload.get("ok") and not payload.get("noop")) == 1
+    assert sum(1 for payload in payloads if not payload.get("ok") and payload.get("noop")) == 1
+    noop = next(payload for payload in payloads if payload.get("noop"))
+    assert noop["reason"] == "already-done"
+
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    transitions = [event for event in events if event["event_type"] == "state_transition"]
+    assert len(transitions) == 1
+    daily_text = "\n".join(path.read_text() for path in (tmp_path / "daily").glob("*.md"))
+    assert daily_text.count("✅ Daily race task") == 1
+    content = work.read_text()
+    assert "Daily race task" in content
+    assert "🗓️2026-05-21" in content
+    assert "🗓️2026-05-22" not in content
+
+
+def test_reschedule_carry_drop_hold_board_lock_around_board_write(tmp_path, monkeypatch):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text("""# Work
+
+## 🔴 Q1
+- [ ] **Reschedule me** task_id::tsk_reschedule area:: Delivery 🗓️2026-06-01
+- [ ] **Carry me** task_id::tsk_carry area:: Delivery
+- [ ] **Drop me** task_id::tsk_drop area:: Delivery
+
+## 🅿️ Parking Lot
+""")
+    env = _env(tmp_path, work)
+    _apply_env(monkeypatch, env, work)
+
+    real_board_flock = task_transitions.board_flock
+    real_atomic_write = task_transitions._atomic_write
+    lock_depth = {"value": 0}
+    entered = []
+    board_writes = []
+
+    @contextmanager
+    def tracking_board_flock(path):
+        entered.append(Path(path))
+        lock_depth["value"] += 1
+        with real_board_flock(path):
+            yield
+        lock_depth["value"] -= 1
+
+    def checking_atomic_write(path_obj, content):
+        if Path(path_obj) == work:
+            assert lock_depth["value"] == 1
+            board_writes.append(content)
+        return real_atomic_write(path_obj, content)
+
+    monkeypatch.setattr(task_transitions, "board_flock", tracking_board_flock)
+    monkeypatch.setattr(task_transitions, "_atomic_write", checking_atomic_write)
+
+    assert task_transitions.reschedule_by_id("tsk_reschedule", "2026-06-08")["ok"] is True
+    assert task_transitions.carry_by_id("tsk_carry", carried_date="2026-06-30")["ok"] is True
+    assert task_transitions.drop_by_id("tsk_drop")["ok"] is True
+
+    assert entered == [work, work, work]
+    assert len(board_writes) == 3
 
 
 # --- U5 EOD disposition: carry_by_id + drop_by_id ----------------------------
