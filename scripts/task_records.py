@@ -12,7 +12,12 @@ from typing import Iterable
 from utils import get_tasks_file, parse_tasks
 
 TASK_ID_RE = re.compile(r"\btask_id::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$|[),.;!?])")
+REPAIR_HINT_RE = re.compile(r'^\s*<!-- repair: missing task_id:: for ".*" -->\s*$')
 LEGACY_ID_RE = re.compile(r"\bid::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$|[),.;!?])")
+
+
+def repair_hint(title: str) -> str:
+    return f'<!-- repair: missing task_id:: for "{title}" -->'
 
 
 @dataclass(frozen=True)

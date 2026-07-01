@@ -1,10 +1,13 @@
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
+from task_records import repair_hint  # noqa: E402
 
 
 def _env(tmp_path, work):
@@ -64,6 +67,146 @@ def test_identity_repair_apply_adds_task_id_and_ledger_event(tmp_path):
     assert " task_id::tsk_" in work.read_text()
     events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
     assert events[0]["event_type"] == "metadata_repair"
+
+
+def test_identity_repair_apply_removes_matching_repair_hint(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text(f"""# Work
+
+## 🔴 Q1
+- [ ] **Ship milestone** area:: Delivery
+{repair_hint("Ship milestone")}
+""")
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "identity-repair", "--apply"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_env(tmp_path, work),
+    )
+
+    assert proc.returncode == 0
+    updated = work.read_text()
+    assert "- [ ] **Ship milestone** area:: Delivery task_id::tsk_" in updated
+    assert repair_hint("Ship milestone") not in updated
+
+
+def test_identity_repair_preserves_hint_for_unrepaired_bare_line(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text(f"""# Work
+
+## 🔴 Q1
+- [ ] **Ship milestone** area:: Delivery
+{repair_hint("Ship milestone")}
+
+## ⚪ Backlog
+- [ ] **Someday task** area:: Ideas
+{repair_hint("Someday task")}
+""")
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "identity-repair", "--apply"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_env(tmp_path, work),
+    )
+
+    assert proc.returncode == 0
+    updated = work.read_text()
+    assert "- [ ] **Ship milestone** area:: Delivery task_id::tsk_" in updated
+    assert repair_hint("Ship milestone") not in updated
+    assert "- [ ] **Someday task** area:: Ideas\n" in updated
+    assert repair_hint("Someday task") in updated
+
+
+def test_identity_repair_removes_multiple_following_repair_hints_in_one_apply(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text(f"""# Work
+
+## 🔴 Q1
+- [ ] **First repair** area:: Ops
+{repair_hint("First repair")}
+- [ ] **Second repair** area:: Ops
+{repair_hint("Second repair")}
+Plain note between repairs
+- [ ] **Third repair** area:: Ops
+{repair_hint("Third repair")}
+- [ ] **Already stable** task_id::tsk_stable area:: Ops
+""")
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "identity-repair", "--apply"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_env(tmp_path, work),
+    )
+
+    assert proc.returncode == 0
+    payload = json.loads(proc.stdout)
+    assert payload["changed"] == 3
+    updated = work.read_text()
+    assert "<!-- repair:" not in updated
+    assert "- [ ] **First repair** area:: Ops task_id::tsk_" in updated
+    assert "- [ ] **Second repair** area:: Ops task_id::tsk_" in updated
+    assert "- [ ] **Third repair** area:: Ops task_id::tsk_" in updated
+    assert "Plain note between repairs\n- [ ] **Third repair**" in updated
+    assert "- [ ] **Already stable** task_id::tsk_stable area:: Ops" in updated
+
+
+def test_identity_repair_handles_end_of_file_task_without_adjacent_hint(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    original = "# Work\n\n## 🔴 Q1\n- [ ] **Lonely EOF task** area:: Ops"
+    work.write_text(original)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "identity-repair", "--apply"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_env(tmp_path, work),
+    )
+
+    assert proc.returncode == 0
+    updated = work.read_text()
+    assert updated.startswith("# Work\n\n## 🔴 Q1\n")
+    assert "- [ ] **Lonely EOF task** area:: Ops task_id::tsk_" in updated
+
+
+def test_rollover_repair_roundtrip_removes_stale_repair_hints(tmp_path):
+    from rollover import rollover_board
+
+    work = tmp_path / "Work Tasks.md"
+    initial = """# Weekly TODOs — 2026-W25
+
+## 🔴 Q1
+- [ ] **Needs id** area:: Ops
+- [ ] **Already has id** task_id::tsk_existing area:: Ops
+"""
+    rendered = rollover_board(initial, [], target_date="2026-06-29").content
+    assert repair_hint("Needs id") in rendered
+    work.write_text(rendered)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "identity-repair", "--apply"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_env(tmp_path, work),
+    )
+
+    assert proc.returncode == 0
+    repaired = work.read_text()
+    generated_id = re.search(r"Needs id\*\* area:: Ops task_id::(tsk_[a-f0-9]{16})", repaired)
+    assert generated_id
+    assert "task_id::tsk_existing" in repaired
+    assert "<!-- repair:" not in repaired
+    rerendered = rollover_board(repaired, [], target_date="2026-06-29").content
+    assert "<!-- repair:" not in rerendered
+    assert f"task_id::{generated_id.group(1)}" in rerendered
+    assert "task_id::tsk_existing" in rerendered
 
 
 def test_identity_repair_blocks_duplicate_titles_without_writes(tmp_path):
