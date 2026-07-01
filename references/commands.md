@@ -43,6 +43,17 @@ python3 scripts/tasks.py --personal done "tsk_personal"
 queries are blocked because duplicate titles and board reorder can mutate the
 wrong task.
 
+```bash
+python3 scripts/tasks.py remove "tsk_example"
+python3 scripts/tasks.py --personal remove "tsk_personal"
+```
+
+`remove` (the CLI verb for cancelling a task) records a *cancellation*, not a
+completion: it writes no `✅` daily-note line and is never counted in done or
+velocity. Like `done`, it requires a canonical `task_id::` — title queries are
+blocked. A cancelled task that later reappears on the board (e.g. via a sync
+conflict) is struck by the next rollover, since `cancelled` is a terminal state.
+
 ### Backlog workflows
 
 ```bash
