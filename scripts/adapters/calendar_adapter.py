@@ -228,7 +228,13 @@ def harvest(
     except json.JSONDecodeError:
         return [], False
     if not configs:
-        return [], False
+        error_envelope.log_degraded(
+            COMPONENT,
+            RuntimeError("calendar not configured"),
+            trigger=trigger,
+            check="calendar",
+        )
+        return [], True
     if error_envelope.breaker_open(COMPONENT):
         return [], True
 
