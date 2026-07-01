@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import task_transitions
 import task_records
+from rollover import rollover_board
 
 
 def _env(tmp_path, work):
@@ -50,6 +51,154 @@ def test_done_by_canonical_id_completes_one_task_and_writes_ledger(tmp_path):
     assert events[0]["source"] == "user_command"
 
 
+def test_cancel_by_canonical_id_removes_task_and_writes_cancelled_ledger(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    original = """# Work
+
+## 🔴 Q1
+- [ ] **Cancel this** task_id::tsk_cancel area:: Delivery
+- [ ] **Keep this** task_id::tsk_keep area:: Ops
+"""
+    work.write_text(original)
+    env = _env(tmp_path, work)
+
+    assert "Cancel this" in work.read_text()
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "remove", "tsk_cancel"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 0
+    payload = json.loads(proc.stdout)
+    assert payload["ok"] is True
+    content = work.read_text()
+    assert "Cancel this" not in content
+    assert "Keep this" in content
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    assert len(events) == 1
+    assert events[0]["event_type"] == "state_transition"
+    assert events[0]["previous_state"] == "active"
+    assert events[0]["next_state"] == "cancelled"
+    assert events[0]["next_state"] != "done"
+    assert events[0]["reason"] == "cancelled-by-id"
+    assert events[0]["metadata"]["raw_line"] == "- [ ] **Cancel this** task_id::tsk_cancel area:: Delivery"
+
+
+def test_remove_writes_no_completion_log_or_done_count(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text("""# Work
+
+## 🔴 Q1
+- [ ] **Cancel this** task_id::tsk_cancel area:: Delivery
+""")
+    env = _env(tmp_path, work)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "remove", "tsk_cancel"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 0
+    daily_notes = list((tmp_path / "daily").glob("*.md"))
+    assert daily_notes == []
+
+    done_proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "list", "--status", "done", "--completed-since", "7d"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert done_proc.returncode == 0
+    assert "Cancel this" not in done_proc.stdout
+    assert "✅" not in done_proc.stdout
+
+
+def test_cancel_recurring_task_does_not_spawn_next_occurrence(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    work.write_text("""# Work
+
+## 🔴 Q1
+- [ ] **Send weekly update** task_id::tsk_weekly recur::weekly 🗓️2026-05-20
+""")
+    env = _env(tmp_path, work)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "remove", "tsk_weekly"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 0
+    content = work.read_text()
+    assert content.count("Send weekly update") == 0
+    assert "🗓️2026-05-27" not in content
+
+
+def test_cancel_nonexistent_task_id_returns_error_without_writes(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    original = """# Work
+
+## 🔴 Q1
+- [ ] **Keep this** task_id::tsk_keep area:: Ops
+"""
+    work.write_text(original)
+    env = _env(tmp_path, work)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "remove", "tsk_missing"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 2
+    payload = json.loads(proc.stdout)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "canonical-id-resolution-failed"
+    assert "found 0" in payload["error"]["message"]
+    assert work.read_text() == original
+    assert not (tmp_path / "events.jsonl").exists()
+
+
+def test_cancel_duplicate_task_id_refuses_without_writes(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    original = """# Work
+
+## 🔴 Q1
+- [ ] **First copy** task_id::tsk_dup area:: Delivery
+- [ ] **Second copy** task_id::tsk_dup area:: Ops
+"""
+    work.write_text(original)
+    env = _env(tmp_path, work)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "remove", "tsk_dup"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 2
+    payload = json.loads(proc.stdout)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "canonical-id-resolution-failed"
+    assert "found 2" in payload["error"]["message"]
+    assert work.read_text() == original
+    assert not (tmp_path / "events.jsonl").exists()
+
+
 def test_done_by_title_is_blocked_without_writes(tmp_path):
     work = tmp_path / "Work Tasks.md"
     original = """# Work
@@ -73,6 +222,60 @@ def test_done_by_title_is_blocked_without_writes(tmp_path):
     assert payload["error"]["code"] == "unsafe-title-mutation-blocked"
     assert work.read_text() == original
     assert not (tmp_path / "events.jsonl").exists()
+
+
+def test_remove_by_title_is_blocked_without_writes(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    original = """# Work
+
+## 🔴 Q1
+- [ ] **Some Title With Spaces** task_id::tsk_remove area:: Delivery
+"""
+    work.write_text(original)
+    env = _env(tmp_path, work)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "remove", "Some Title With Spaces"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 2
+    payload = json.loads(proc.stdout)
+    assert payload["error"]["code"] == "unsafe-title-mutation-blocked"
+    assert work.read_text() == original
+    assert not (tmp_path / "events.jsonl").exists()
+
+
+def test_cancel_refuses_parking_lot_and_backlog_task_ids_without_writes(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    original = """# Work
+
+## 🅿️ Parking Lot
+- [ ] **Parked task** task_id::tsk_parked created::2026-01-01
+
+## ⚪ Backlog
+- [ ] **Backlog task** task_id::tsk_backlog area:: Ops
+"""
+    work.write_text(original)
+    env = _env(tmp_path, work)
+
+    for task_id in ("tsk_parked", "tsk_backlog"):
+        proc = subprocess.run(
+            ["python3", "scripts/tasks.py", "remove", task_id],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+
+        assert proc.returncode == 2
+        payload = json.loads(proc.stdout)
+        assert payload["error"]["code"] == "canonical-id-resolution-failed"
+        assert work.read_text() == original
+        assert not (tmp_path / "events.jsonl").exists()
 
 
 def test_done_restricts_canonical_resolution_to_active_sections(tmp_path):
@@ -176,6 +379,33 @@ def test_done_aborts_before_board_write_when_ledger_unwritable(tmp_path):
     assert work.read_text() == original
 
 
+def test_cancel_aborts_before_board_write_when_ledger_unwritable(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    original = """# Work
+
+## 🔴 Q1
+- [ ] **Cancel milestone** task_id::tsk_cancel area:: Delivery
+"""
+    work.write_text(original)
+    ledger_dir = tmp_path / "ledger-is-dir"
+    ledger_dir.mkdir()
+    env = _env(tmp_path, work)
+    env["TASK_TRACKER_LEDGER_FILE"] = str(ledger_dir)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "remove", "tsk_cancel"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 2
+    payload = json.loads(proc.stdout)
+    assert payload["error"]["code"] == "ledger-unwritable"
+    assert work.read_text() == original
+
+
 def test_done_reports_missing_tasks_file_as_json(tmp_path):
     missing = tmp_path / "Missing Tasks.md"
     env = _env(tmp_path, missing)
@@ -221,6 +451,33 @@ def test_done_restores_board_and_completion_log_when_ledger_append_fails(tmp_pat
     assert not list((tmp_path / "daily").glob("*.md"))
 
 
+def test_cancel_restores_board_when_ledger_append_fails(tmp_path):
+    if not os.path.exists("/dev/full"):
+        return
+    work = tmp_path / "Work Tasks.md"
+    original = """# Work
+
+## 🔴 Q1
+- [ ] **Cancel milestone** task_id::tsk_cancel area:: Delivery
+"""
+    work.write_text(original)
+    env = _env(tmp_path, work)
+    env["TASK_TRACKER_LEDGER_FILE"] = "/dev/full"
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "remove", "tsk_cancel"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 2
+    payload = json.loads(proc.stdout)
+    assert payload["error"]["code"] == "ledger-append-failed"
+    assert work.read_text() == original
+
+
 def test_done_restores_completion_log_when_board_write_fails(tmp_path, monkeypatch):
     work = tmp_path / "Work Tasks.md"
     original = """# Work
@@ -258,6 +515,40 @@ def test_done_restores_completion_log_when_board_write_fails(tmp_path, monkeypat
     assert result["error"]["code"] == "task-state-write-failed"
     assert work.read_text() == original
     assert not list((tmp_path / "daily").glob("*.md"))
+    assert (tmp_path / "events.jsonl").read_text() == ""
+
+
+def test_cancel_restores_board_when_board_write_fails(tmp_path, monkeypatch):
+    work = tmp_path / "Work Tasks.md"
+    original = """# Work
+
+## 🔴 Q1
+- [ ] **Cancel milestone** task_id::tsk_cancel area:: Delivery
+"""
+    work.write_text(original)
+    env = _env(tmp_path, work)
+    monkeypatch.setenv("TASK_TRACKER_WORK_FILE", env["TASK_TRACKER_WORK_FILE"])
+    monkeypatch.setenv("TASK_TRACKER_DAILY_NOTES_DIR", env["TASK_TRACKER_DAILY_NOTES_DIR"])
+    monkeypatch.setenv("TASK_TRACKER_DONE_LOG_DIR", env["TASK_TRACKER_DONE_LOG_DIR"])
+    monkeypatch.setenv("TASK_TRACKER_LEDGER_FILE", env["TASK_TRACKER_LEDGER_FILE"])
+    monkeypatch.setattr(task_records, "get_tasks_file", lambda personal=False: (work, "obsidian"))
+
+    real_atomic_write = task_transitions._atomic_write
+    state = {"forward_failed": False}
+
+    def fail_board_write(path_obj, content):
+        if Path(path_obj) == work and not state["forward_failed"]:
+            state["forward_failed"] = True
+            raise OSError("simulated board write failure")
+        return real_atomic_write(path_obj, content)
+
+    monkeypatch.setattr(task_transitions, "_atomic_write", fail_board_write)
+
+    result = task_transitions.cancel_by_id("tsk_cancel")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "task-state-write-failed"
+    assert work.read_text() == original
     assert (tmp_path / "events.jsonl").read_text() == ""
 
 
@@ -676,6 +967,35 @@ def test_drop_recurring_task_does_not_spawn_next_occurrence(tmp_path):
     assert content.count("Send weekly update") == 1
     assert content.index("Send weekly update") > content.index("Parking Lot")
     assert "🗓️2026-05-27" not in content
+
+
+def test_rollover_excludes_reintroduced_cancelled_task(tmp_path):
+    work = tmp_path / "Work Tasks.md"
+    original = """# Work
+
+## 🔴 Q1
+- [ ] **Cancelled relapse** task_id::tsk_cancel area:: Delivery
+- [ ] **Keep this** task_id::tsk_keep area:: Ops
+"""
+    work.write_text(original)
+    env = _env(tmp_path, work)
+
+    proc = subprocess.run(
+        ["python3", "scripts/tasks.py", "remove", "tsk_cancel"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert proc.returncode == 0
+
+    work.write_text(original)
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    result = rollover_board(work.read_text(), events, target_date="2026-06-29")
+
+    assert "Cancelled relapse" not in result.content
+    assert "Keep this" in result.content
+    assert result.excluded_closed == ("tsk_cancel",)
 
 
 def test_restore_snapshots_crash_mid_restore_leaves_target_intact(tmp_path, monkeypatch):

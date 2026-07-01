@@ -40,7 +40,7 @@ from task_identity import audit_payload, print_json as print_identity_json
 from task_audit import collect_task_audit, task_audit_summary
 from task_lines import remove_task_line
 from task_repair import repair_missing_ids
-from task_transitions import block_unsafe_query, complete_by_id, print_result
+from task_transitions import block_unsafe_query, cancel_by_id, complete_by_id, print_result
 from rollover import run_rollover
 from task_records import (
     active_records,
@@ -778,6 +778,19 @@ def done_task(args):
         sys.exit(2)
 
     result = complete_by_id(query, personal=args.personal, source="user_command")
+    print_result(result)
+    if not result.get("ok"):
+        sys.exit(2)
+
+
+def remove_task(args):
+    """Cancel/remove a task by canonical ID only."""
+    query = args.query.strip()
+    if not re.fullmatch(r"[A-Za-z0-9._:-]+", query):
+        print_result(block_unsafe_query(args.query))
+        sys.exit(2)
+
+    result = cancel_by_id(query, personal=args.personal, source="user_command")
     print_result(result)
     if not result.get("ok"):
         sys.exit(2)
@@ -1943,6 +1956,14 @@ def main():
     done_parser = subparsers.add_parser('done', help='Mark task as done by canonical task_id')
     done_parser.add_argument('query', help='Canonical task_id')
     done_parser.set_defaults(func=done_task)
+
+    # Remove/cancel command
+    remove_parser = subparsers.add_parser(
+        'remove',
+        help='Cancel/remove a task from the board by canonical task_id',
+    )
+    remove_parser.add_argument('query', help='Canonical task_id')
+    remove_parser.set_defaults(func=remove_task)
 
     rollover_parser = subparsers.add_parser('rollover', help='Regenerate the weekly board deterministically')
     rollover_parser.add_argument('--date', help='Target date for ISO week header (YYYY-MM-DD)')
